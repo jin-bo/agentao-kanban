@@ -1,0 +1,24 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# OS / local logs
+.DS_Store
+*.log
+
+# Agentao runtime state
+.agentao/
+
+# KanBan specific
+workspace/
+
+# Editor swap files
+*.swp
+*.swo
