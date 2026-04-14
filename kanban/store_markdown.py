@@ -442,9 +442,30 @@ class MarkdownBoardStore:
                 pass
 
     def write_result(self, result: ExecutionResultEnvelope) -> None:
+        """Persist an envelope write-once per claim.
+
+        Files are keyed by ``<card_id>-<claim_id>.json`` (not by attempt) so
+        a second process cannot overwrite a pending envelope for the same
+        claim. The write itself uses ``O_CREAT|O_EXCL`` to fail fast if
+        the file already exists — this is the storage half of the
+        single-writer trust boundary (the commit path verifies worker_id).
+        """
         self.results_dir.mkdir(parents=True, exist_ok=True)
-        path = self._result_path(result.card_id, result.attempt)
-        _atomic_write_json(path, _result_to_json(result))
+        path = self._result_path(result.card_id, result.claim_id)
+        payload = (
+            json.dumps(_result_to_json(result), ensure_ascii=False, sort_keys=True)
+            + "\n"
+        ).encode("utf-8")
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except FileExistsError as exc:
+            raise FileExistsError(
+                f"result envelope for claim {result.claim_id} already exists"
+            ) from exc
+        try:
+            os.write(fd, payload)
+        finally:
+            os.close(fd)
 
     def read_results(
         self, *, card_id: str | None = None
@@ -463,33 +484,28 @@ class MarkdownBoardStore:
                 _LOG.warning("Skipping unparseable result %s: %s", path.name, exc)
         return results
 
-    def delete_result(self, card_id: str, attempt: int) -> None:
+    def delete_result(self, card_id: str, claim_id: str) -> None:
         try:
-            self._result_path(card_id, attempt).unlink()
+            self._result_path(card_id, claim_id).unlink()
         except FileNotFoundError:
             pass
 
-    def quarantine_result(self, card_id: str, attempt: int) -> None:
+    def quarantine_result(self, card_id: str, claim_id: str) -> None:
         """Move an orphan result envelope into runtime/results/orphans/.
 
-        Used when the result's claim_id no longer matches the live claim
-        (the card was recovered / re-claimed). The envelope is preserved for
-        audit rather than applied or deleted.
+        Used when the result's claim_id no longer matches the live claim,
+        or the submitting worker_id does not match the claim owner. The
+        envelope is preserved for audit rather than applied or deleted.
         """
-        src = self._result_path(card_id, attempt)
+        src = self._result_path(card_id, claim_id)
         if not src.is_file():
             return
         dest_dir = self.results_dir / "orphans"
         dest_dir.mkdir(parents=True, exist_ok=True)
         dest = dest_dir / src.name
-        # Retain uniqueness if the same (card, attempt) has been quarantined
-        # before — append a short suffix from the claim_id inside the file.
         if dest.exists():
-            try:
-                data = json.loads(src.read_text(encoding="utf-8"))
-                suffix = str(data.get("claim_id", "x"))[:8]
-            except (OSError, json.JSONDecodeError):
-                suffix = "dup"
+            # Same claim quarantined before — keep a stamped copy.
+            suffix = utc_now().strftime("%Y%m%dT%H%M%S%fZ")
             dest = dest_dir / f"{src.stem}-{suffix}.json"
         os.replace(src, dest)
 
@@ -541,8 +557,8 @@ class MarkdownBoardStore:
     def _claim_path(self, card_id: str) -> Path:
         return self.claims_dir / f"{card_id}.json"
 
-    def _result_path(self, card_id: str, attempt: int) -> Path:
-        return self.results_dir / f"{card_id}-{attempt}.json"
+    def _result_path(self, card_id: str, claim_id: str) -> Path:
+        return self.results_dir / f"{card_id}-{claim_id}.json"
 
     def _worker_path(self, worker_id: str) -> Path:
         return self.workers_dir / f"{worker_id}.json"

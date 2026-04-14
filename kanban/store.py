@@ -104,8 +104,8 @@ class BoardStore(Protocol):
     def read_results(
         self, *, card_id: str | None = ...
     ) -> list[ExecutionResultEnvelope]: ...
-    def delete_result(self, card_id: str, attempt: int) -> None: ...
-    def quarantine_result(self, card_id: str, attempt: int) -> None: ...
+    def delete_result(self, card_id: str, claim_id: str) -> None: ...
+    def quarantine_result(self, card_id: str, claim_id: str) -> None: ...
     def list_orphan_results(self) -> list[ExecutionResultEnvelope]: ...
 
     def heartbeat_worker(self, presence: WorkerPresence) -> WorkerPresence: ...
@@ -328,12 +328,14 @@ class InMemoryBoardStore:
         return updated
 
     def write_result(self, result: ExecutionResultEnvelope) -> None:
-        # Replace any prior envelope for the same (card, attempt).
-        self._results = [
-            r
-            for r in self._results
-            if not (r.card_id == result.card_id and r.attempt == result.attempt)
-        ]
+        # Write-once per claim: refuse to overwrite a pending envelope for
+        # the same claim_id (a forger with the wrong claim_id simply creates
+        # a separate record that will be orphaned at commit time).
+        for r in self._results:
+            if r.card_id == result.card_id and r.claim_id == result.claim_id:
+                raise FileExistsError(
+                    f"result envelope for claim {result.claim_id} already exists"
+                )
         self._results.append(result)
 
     def read_results(
@@ -343,16 +345,16 @@ class InMemoryBoardStore:
             return list(self._results)
         return [r for r in self._results if r.card_id == card_id]
 
-    def delete_result(self, card_id: str, attempt: int) -> None:
+    def delete_result(self, card_id: str, claim_id: str) -> None:
         self._results = [
             r
             for r in self._results
-            if not (r.card_id == card_id and r.attempt == attempt)
+            if not (r.card_id == card_id and r.claim_id == claim_id)
         ]
 
-    def quarantine_result(self, card_id: str, attempt: int) -> None:
+    def quarantine_result(self, card_id: str, claim_id: str) -> None:
         for r in list(self._results):
-            if r.card_id == card_id and r.attempt == attempt:
+            if r.card_id == card_id and r.claim_id == claim_id:
                 self._results.remove(r)
                 self._orphans.append(r)
                 return

@@ -34,10 +34,15 @@ def _ready(store: MarkdownBoardStore, title: str = "t") -> Card:
 
 
 def _submit_failure(orch, claim, category: FailureCategory, reason: str = "boom"):
+    """Submit under the claim's owning worker_id so the commit path accepts
+    the envelope (worker_id mismatch would be quarantined as an orphan)."""
+    assert claim.worker_id is not None, (
+        "test must acquire the claim before submitting a result"
+    )
     orch.submit_result(
         claim,
         None,
-        worker_id="w-test",
+        worker_id=claim.worker_id,
         started_at=utc_now(),
         ok=False,
         failure_reason=reason,

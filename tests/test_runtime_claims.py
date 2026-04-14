@@ -232,7 +232,9 @@ def test_multiple_results_per_card_coexist(tmp_path: Path):
     assert sorted(r.attempt for r in results) == [1, 2, 3]
 
 
-def test_write_result_overwrites_same_attempt(tmp_path: Path):
+def test_write_result_is_write_once_per_claim(tmp_path: Path):
+    """A second write for the same claim must fail (FileExistsError) so a
+    forger with the right claim_id still can't replace a pending envelope."""
     store = MarkdownBoardStore(tmp_path)
     now = utc_now()
     base = ExecutionResultEnvelope(
@@ -249,9 +251,11 @@ def test_write_result_overwrites_same_attempt(tmp_path: Path):
     store.write_result(base)
     from dataclasses import replace
 
-    store.write_result(replace(base, ok=True, failure_reason=None))
+    with pytest.raises(FileExistsError):
+        store.write_result(replace(base, ok=True, failure_reason=None))
+    # Original pending envelope still intact.
     results = store.read_results(card_id="c")
-    assert len(results) == 1 and results[0].ok is True
+    assert len(results) == 1 and results[0].ok is False
 
 
 def test_delete_result_removes_file(tmp_path: Path):
@@ -269,7 +273,7 @@ def test_delete_result_removes_file(tmp_path: Path):
             ok=True,
         )
     )
-    store.delete_result("c", 1)
+    store.delete_result("c", "clm")
     assert store.read_results(card_id="c") == []
 
 

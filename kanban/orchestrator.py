@@ -71,14 +71,18 @@ class KanbanOrchestrator:
         self.store.update_card(card_id, blocked_reason=None)
         return self.store.move_card(card_id, target, f"Unblocked to {target.value}")
 
+    LEGACY_SERIAL_WORKER_ID = "local-serial"
+
     def tick(self) -> Card | None:
         """Legacy serial path: select → claim → execute → apply in one process.
 
         Preserved for `kanban daemon --role legacy-serial` and the existing
-        `kanban tick` / `kanban run` CLI commands. The v0.1.2 split uses
-        :meth:`select_and_claim` + :meth:`apply_claim_result` instead.
+        `kanban tick` / `kanban run` CLI commands. The claim is created with
+        an owner (``LEGACY_SERIAL_WORKER_ID``) so a parallel worker daemon
+        cannot steal it between claim and execute — only a split-topology
+        scheduler publishes unassigned claims.
         """
-        claim = self.select_and_claim(worker_id=None)
+        claim = self.select_and_claim(worker_id=self.LEGACY_SERIAL_WORKER_ID)
         if claim is None:
             return None
 
@@ -220,24 +224,44 @@ class KanbanOrchestrator:
     def commit_pending_results(self) -> int:
         """Scheduler/committer: apply any pending result envelopes.
 
-        For each envelope: verify it references the current live claim
-        (``claim_id`` match). On match — apply the result, retry on
-        retryable failure, or BLOCK on unretryable failure. On mismatch or
-        missing claim — quarantine as an orphan. Returns the number processed.
+        An envelope is accepted only when all three ownership checks pass:
+
+        1. the envelope's card has a live claim;
+        2. the live claim's ``claim_id`` matches the envelope;
+        3. the live claim has been acquired (``worker_id is not None``) AND
+           the envelope's ``worker_id`` equals the claim's owner.
+
+        Any failure quarantines the envelope as an orphan — a second worker
+        that forged a submission under the wrong identity cannot coerce the
+        committer into writing its result into the board. Returns the number
+        of envelopes processed (committed + quarantined).
         """
         processed = 0
         for env in self.store.read_results():
             claim = self.store.get_claim(env.card_id)
             if claim is None or claim.claim_id != env.claim_id:
-                self._emit_orphan(env, claim)
-                self.store.quarantine_result(env.card_id, env.attempt)
+                self._emit_orphan(env, claim, reason="claim_id mismatch")
+                self.store.quarantine_result(env.card_id, env.claim_id)
+                processed += 1
+                continue
+            if claim.worker_id is None or claim.worker_id != env.worker_id:
+                self._emit_orphan(
+                    env,
+                    claim,
+                    reason=(
+                        f"worker_id mismatch (envelope={env.worker_id!r}, "
+                        f"claim={claim.worker_id!r})"
+                    ),
+                )
+                self.store.quarantine_result(env.card_id, env.claim_id)
+                processed += 1
                 continue
             if env.ok and env.agent_result is not None:
                 self._apply_result(env.card_id, env.agent_result)
                 self.store.clear_claim(env.card_id, claim_id=env.claim_id)
             else:
                 self._handle_failed_envelope(env, claim)
-            self.store.delete_result(env.card_id, env.attempt)
+            self.store.delete_result(env.card_id, env.claim_id)
             processed += 1
         return processed
 
@@ -351,20 +375,25 @@ class KanbanOrchestrator:
         )
 
     def _emit_orphan(
-        self, env: ExecutionResultEnvelope, live_claim: ExecutionClaim | None
+        self,
+        env: ExecutionResultEnvelope,
+        live_claim: ExecutionClaim | None,
+        *,
+        reason: str,
     ) -> None:
         live_id = live_claim.claim_id if live_claim is not None else None
         self.store.append_runtime_event(
             env.card_id,
             event_type=ExecutionEventType.RESULT_ORPHANED.value,
             message=(
-                f"envelope for claim={env.claim_id} does not match live "
-                f"claim={live_id or '<none>'}"
+                f"envelope for claim={env.claim_id} rejected "
+                f"({reason}); live_claim={live_id or '<none>'}"
             ),
             role=env.role,
             claim_id=env.claim_id,
             worker_id=env.worker_id,
             attempt=env.attempt,
+            failure_reason=reason,
         )
 
     def run_until_idle(self, max_steps: int = 20) -> list[Card]:
