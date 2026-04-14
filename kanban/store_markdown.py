@@ -338,6 +338,47 @@ class MarkdownBoardStore:
         cutoff = now or utc_now()
         return [c for c in self.list_claims() if c.lease_expires_at < cutoff]
 
+    def try_acquire_claim(
+        self,
+        card_id: str,
+        *,
+        worker_id: str,
+        heartbeat_at: datetime | None = None,
+        lease_expires_at: datetime | None = None,
+    ) -> ExecutionClaim | None:
+        """Atomic compare-and-swap: assign worker_id to an unassigned claim.
+
+        Uses an `O_CREAT|O_EXCL` sentinel next to the claim file to serialize
+        concurrent workers attempting to take the same claim. Returns the
+        updated claim on success, or None if the claim is missing, already
+        assigned, or another worker won the CAS race.
+        """
+        sentinel = self.claims_dir / f"{card_id}.acquiring"
+        try:
+            fd = os.open(sentinel, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except FileExistsError:
+            return None
+        try:
+            current = self.get_claim(card_id)
+            if current is None or current.worker_id is not None:
+                return None
+            from dataclasses import replace
+
+            updated = replace(
+                current,
+                worker_id=worker_id,
+                heartbeat_at=heartbeat_at or utc_now(),
+                lease_expires_at=lease_expires_at or current.lease_expires_at,
+            )
+            _atomic_write_json(self._claim_path(card_id), _claim_to_json(updated))
+            return updated
+        finally:
+            os.close(fd)
+            try:
+                sentinel.unlink()
+            except FileNotFoundError:
+                pass
+
     def write_result(self, result: ExecutionResultEnvelope) -> None:
         self.results_dir.mkdir(parents=True, exist_ok=True)
         path = self._result_path(result.card_id, result.attempt)

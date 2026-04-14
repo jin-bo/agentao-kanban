@@ -6,9 +6,12 @@ import sys
 from pathlib import Path
 
 from .daemon import (
+    CombinedDaemon,
     DaemonConfig,
     DaemonLockError,
     KanbanDaemon,
+    SchedulerDaemon,
+    WorkerDaemon,
     assert_no_daemon,
     daemon_lock,
     detach_to_background,
@@ -221,6 +224,29 @@ def build_parser() -> argparse.ArgumentParser:
         "--poll-interval", type=float, default=2.0, help="Idle sleep in seconds (default 2.0)"
     )
     daemon.add_argument("--verbose", action="store_true", help="Enable DEBUG logging")
+    daemon.add_argument(
+        "--role",
+        choices=["all", "scheduler", "worker", "legacy-serial"],
+        default="all",
+        help=(
+            "Daemon role (default: all = scheduler+worker in one process). "
+            "`scheduler` creates claims and holds the board lock; `worker` "
+            "executes claimed cards and takes no board lock. `legacy-serial` "
+            "runs the pre-v0.1.2 tick path."
+        ),
+    )
+    daemon.add_argument(
+        "--worker-id",
+        dest="worker_id",
+        help="Stable worker identifier for `--role worker` (default: random).",
+    )
+    daemon.add_argument(
+        "--max-claims",
+        dest="max_claims",
+        type=int,
+        default=2,
+        help="Scheduler concurrency budget (default 2).",
+    )
 
     p.add_argument(
         "--force",
@@ -785,24 +811,47 @@ def cmd_daemon(args: argparse.Namespace) -> int:
         return 2
 
     board_dir = args.board
+    role = args.role
     if args.detach:
         detach_to_background(board_dir)
 
-    try:
-        with daemon_lock(board_dir):
-            _, orchestrator = _make_orchestrator(args)
-            config = DaemonConfig(
-                poll_interval=args.poll_interval,
-                max_idle_cycles=1 if args.once else None,
-            )
+    def _build_config() -> DaemonConfig:
+        cfg_kwargs: dict[str, object] = {
+            "poll_interval": args.poll_interval,
+            "max_idle_cycles": 1 if args.once else None,
+            "max_claims": args.max_claims,
+        }
+        if args.worker_id:
+            cfg_kwargs["worker_id"] = args.worker_id
+        return DaemonConfig(**cfg_kwargs)
+
+    # Workers do not hold the board lock — only scheduler/legacy/all do.
+    needs_board_lock = role in ("scheduler", "legacy-serial", "all")
+
+    def _run_daemon() -> int:
+        _, orchestrator = _make_orchestrator(args)
+        config = _build_config()
+        if role == "scheduler":
+            daemon = SchedulerDaemon(orchestrator, config=config)
+        elif role == "worker":
+            daemon = WorkerDaemon(orchestrator, config=config)
+        elif role == "legacy-serial":
             daemon = KanbanDaemon(orchestrator, config=config)
-            daemon.install_signal_handlers()
-            if args.once:
-                did = daemon.run_once()
-                if not did:
-                    print("Board is idle.")
-                return 0
-            return daemon.run()
+        else:  # all
+            daemon = CombinedDaemon(orchestrator, config=config)
+        daemon.install_signal_handlers()
+        if args.once:
+            did = daemon.run_once()
+            if not did:
+                print("Board is idle.")
+            return 0
+        return daemon.run()
+
+    try:
+        if needs_board_lock:
+            with daemon_lock(board_dir):
+                return _run_daemon()
+        return _run_daemon()
     except DaemonLockError as exc:
         print(str(exc), file=sys.stderr)
         return 2

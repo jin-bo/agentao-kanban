@@ -13,13 +13,17 @@ import json
 import logging
 import os
 import signal
+import socket
 import sys
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import timedelta
 from pathlib import Path
 from typing import Iterator
+from uuid import uuid4
 
+from .models import ExecutionClaim, WorkerPresence, utc_now
 from .orchestrator import KanbanOrchestrator
 
 
@@ -134,10 +138,18 @@ def assert_no_daemon(board_dir: Path) -> None:
 class DaemonConfig:
     poll_interval: float = 2.0
     max_idle_cycles: int | None = None  # None = run forever
+    # v0.1.2 role split knobs. Legacy (KanbanDaemon) ignores these.
+    max_claims: int = 2
+    worker_id: str = field(default_factory=lambda: f"worker-{uuid4().hex[:8]}")
 
 
 class KanbanDaemon:
-    """Run ``orchestrator.tick()`` in a loop until signaled to stop."""
+    """Legacy serial daemon: runs the full tick (select → execute → commit).
+
+    Retained as the `--role legacy-serial` fallback while the scheduler /
+    worker split matures. New code should use :class:`SchedulerDaemon` +
+    :class:`WorkerDaemon` or :class:`CombinedDaemon`.
+    """
 
     def __init__(
         self,
@@ -204,6 +216,223 @@ class KanbanDaemon:
             if remaining <= 0:
                 return
             time.sleep(min(remaining, 0.25))
+
+
+# ---------- v0.1.2 scheduler / worker split ----------
+
+
+class _RoleDaemonBase:
+    """Shared loop plumbing for scheduler/worker daemons."""
+
+    def __init__(self, config: DaemonConfig | None = None) -> None:
+        self.config = config or DaemonConfig()
+        self._stop = False
+        self._ticks = 0
+        self._idle_cycles = 0
+
+    def request_stop(self, signum: int | None = None, _frame=None) -> None:
+        name = signal.Signals(signum).name if signum else "request"
+        log.info("Shutdown requested (%s); will stop after current tick.", name)
+        self._stop = True
+
+    def install_signal_handlers(self) -> None:
+        signal.signal(signal.SIGINT, self.request_stop)
+        signal.signal(signal.SIGTERM, self.request_stop)
+
+    @property
+    def ticks_processed(self) -> int:
+        return self._ticks
+
+    def _sleep(self, seconds: float) -> None:
+        deadline = time.monotonic() + seconds
+        while not self._stop:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            time.sleep(min(remaining, 0.25))
+
+    def run_once(self) -> bool:  # pragma: no cover - overridden
+        raise NotImplementedError
+
+    def run(self) -> int:
+        log.info(
+            "%s started (pid=%d, poll=%.2fs)",
+            type(self).__name__,
+            os.getpid(),
+            self.config.poll_interval,
+        )
+        while not self._stop:
+            did_work = self.run_once()
+            if did_work:
+                self._idle_cycles = 0
+                continue
+            self._idle_cycles += 1
+            if (
+                self.config.max_idle_cycles is not None
+                and self._idle_cycles >= self.config.max_idle_cycles
+            ):
+                log.info("Idle for %d cycles; exiting.", self._idle_cycles)
+                break
+            self._sleep(self.config.poll_interval)
+        log.info(
+            "%s stopped after %d tick(s).", type(self).__name__, self._ticks
+        )
+        return 0
+
+
+class SchedulerDaemon(_RoleDaemonBase):
+    """Claim-creation loop. Holds the board ``.daemon.lock``; no execution.
+
+    Each tick scans the board, skips cards with a live claim, and creates
+    up to ``max_claims`` unassigned claims. Workers pick those up via
+    :meth:`BoardStore.try_acquire_claim`. The scheduler never runs the
+    executor or mutates card state after execution.
+    """
+
+    def __init__(
+        self, orchestrator: KanbanOrchestrator, config: DaemonConfig | None = None
+    ) -> None:
+        super().__init__(config)
+        self.orchestrator = orchestrator
+
+    def run_once(self) -> bool:
+        store = self.orchestrator.store
+        live = [c for c in store.list_claims()]
+        if len(live) >= self.config.max_claims:
+            return False
+
+        # Create unassigned claims up to the remaining budget.
+        created = False
+        budget = self.config.max_claims - len(live)
+        for _ in range(budget):
+            claim = self.orchestrator.select_and_claim(worker_id=None)
+            if claim is None:
+                break
+            self._ticks += 1
+            created = True
+            log.info(
+                "scheduler claimed %s → %s (role=%s, attempt=%d)",
+                claim.card_id[:8],
+                claim.status_at_claim.value,
+                claim.role.value,
+                claim.attempt,
+            )
+        return created
+
+
+class WorkerDaemon(_RoleDaemonBase):
+    """Execution loop. Takes no board lock; heartbeats as a WorkerPresence.
+
+    Each tick: (1) refresh own presence; (2) try to acquire any unassigned
+    claim via the store's CAS; (3) run the executor; (4) apply the result.
+    Claim acquisition failures are no-ops so many workers can share one board.
+    """
+
+    def __init__(
+        self, orchestrator: KanbanOrchestrator, config: DaemonConfig | None = None
+    ) -> None:
+        super().__init__(config)
+        self.orchestrator = orchestrator
+        self._started_at = utc_now()
+        self._host = socket.gethostname()
+
+    @property
+    def worker_id(self) -> str:
+        return self.config.worker_id
+
+    def _heartbeat(self) -> None:
+        now = utc_now()
+        self.orchestrator.store.heartbeat_worker(
+            WorkerPresence(
+                worker_id=self.worker_id,
+                pid=os.getpid(),
+                started_at=self._started_at,
+                heartbeat_at=now,
+                host=self._host,
+            )
+        )
+
+    def _acquire_any_claim(self) -> ExecutionClaim | None:
+        store = self.orchestrator.store
+        lease = self.orchestrator.lease_policy
+        now = utc_now()
+        lease_expires = now + timedelta(seconds=lease.lease_seconds)
+        for claim in store.list_claims():
+            if claim.worker_id is not None:
+                continue
+            acquired = store.try_acquire_claim(
+                claim.card_id,
+                worker_id=self.worker_id,
+                heartbeat_at=now,
+                lease_expires_at=lease_expires,
+            )
+            if acquired is not None:
+                return acquired
+        return None
+
+    def run_once(self) -> bool:
+        self._heartbeat()
+        claim = self._acquire_any_claim()
+        if claim is None:
+            return False
+
+        card = self.orchestrator.store.get_card(claim.card_id)
+        log.info(
+            "worker %s running %s (role=%s)",
+            self.worker_id,
+            claim.card_id[:8],
+            claim.role.value,
+        )
+        result = self.orchestrator.executor.run(claim.role, card)
+        self.orchestrator.apply_claim_result(claim, result)
+        self._ticks += 1
+        return True
+
+    def run(self) -> int:
+        self._heartbeat()
+        try:
+            return super().run()
+        finally:
+            try:
+                self.orchestrator.store.remove_worker(self.worker_id)
+            except Exception:  # pragma: no cover - best-effort cleanup
+                log.exception("failed to remove worker presence on shutdown")
+
+
+class CombinedDaemon(_RoleDaemonBase):
+    """One-process convenience: alternate scheduler + worker ticks.
+
+    Not a true concurrent topology — the two loops share a thread and the
+    scheduler simply refills claims between worker runs. Use for local dev;
+    use separate `SchedulerDaemon` + `WorkerDaemon` processes for real
+    parallelism.
+    """
+
+    def __init__(
+        self, orchestrator: KanbanOrchestrator, config: DaemonConfig | None = None
+    ) -> None:
+        super().__init__(config)
+        self.orchestrator = orchestrator
+        self._scheduler = SchedulerDaemon(orchestrator, self.config)
+        self._worker = WorkerDaemon(orchestrator, self.config)
+
+    def run_once(self) -> bool:
+        scheduled = self._scheduler.run_once()
+        worked = self._worker.run_once()
+        did = scheduled or worked
+        if did:
+            self._ticks += 1
+        return did
+
+    def run(self) -> int:
+        self._worker._heartbeat()
+        try:
+            return super().run()
+        finally:
+            try:
+                self.orchestrator.store.remove_worker(self._worker.worker_id)
+            except Exception:  # pragma: no cover
+                log.exception("failed to remove worker presence on shutdown")
 
 
 # ---------- detach ----------

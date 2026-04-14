@@ -76,6 +76,14 @@ class BoardStore(Protocol):
     def clear_claim(self, card_id: str, *, claim_id: str | None = ...) -> None: ...
     def list_claims(self) -> list[ExecutionClaim]: ...
     def list_stale_claims(self, *, now: datetime | None = ...) -> list[ExecutionClaim]: ...
+    def try_acquire_claim(
+        self,
+        card_id: str,
+        *,
+        worker_id: str,
+        heartbeat_at: datetime | None = ...,
+        lease_expires_at: datetime | None = ...,
+    ) -> ExecutionClaim | None: ...
 
     def write_result(self, result: ExecutionResultEnvelope) -> None: ...
     def read_results(
@@ -243,6 +251,28 @@ class InMemoryBoardStore:
     ) -> list[ExecutionClaim]:
         cutoff = now or utc_now()
         return [c for c in self._claims.values() if c.lease_expires_at < cutoff]
+
+    def try_acquire_claim(
+        self,
+        card_id: str,
+        *,
+        worker_id: str,
+        heartbeat_at: datetime | None = None,
+        lease_expires_at: datetime | None = None,
+    ) -> ExecutionClaim | None:
+        from dataclasses import replace
+
+        current = self._claims.get(card_id)
+        if current is None or current.worker_id is not None:
+            return None
+        updated = replace(
+            current,
+            worker_id=worker_id,
+            heartbeat_at=heartbeat_at or utc_now(),
+            lease_expires_at=lease_expires_at or current.lease_expires_at,
+        )
+        self._claims[card_id] = updated
+        return updated
 
     def write_result(self, result: ExecutionResultEnvelope) -> None:
         # Replace any prior envelope for the same (card, attempt).

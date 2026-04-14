@@ -292,3 +292,24 @@ class ClaimConflictError(RuntimeError):
 
 class ClaimMismatchError(RuntimeError):
     """Raised when `renew_claim` / `clear_claim` is called with the wrong claim_id."""
+
+
+@dataclass(slots=True)
+class LeasePolicy:
+    """Runtime lease parameters. Plan §Lease Semantics recommends these defaults."""
+
+    lease_seconds: int = 60
+    heartbeat_seconds: int = 15
+    # Role-specific timeouts (plan §Timeout Policy). Unused in PR2 but
+    # declared here so later PRs don't need a breaking change.
+    timeout_by_role: dict[str, int] = field(
+        default_factory=lambda: {
+            "planner": 120,
+            "worker": 1800,
+            "reviewer": 300,
+            "verifier": 300,
+        }
+    )
+
+    def timeout_for(self, role: "AgentRole") -> int:
+        return int(self.timeout_by_role.get(role.value, 1800))
