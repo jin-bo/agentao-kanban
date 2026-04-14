@@ -124,6 +124,22 @@ class AgentaoMultiAgentExecutor:
                     raw,
                 )
 
+            # Contract-downgrade guard: when a replan returns a NEW list,
+            # every criterion the card already carried that is NOT in the
+            # new list must be explicitly recorded under
+            # output.superseded[] with a non-empty reason. Otherwise the
+            # planner could silently drop an unmet criterion and the card
+            # could advance without anyone proving the original
+            # requirement was satisfied.
+            if normalized and card.acceptance_criteria:
+                drop_error = _validate_supersession(
+                    existing=list(card.acceptance_criteria),
+                    new=normalized,
+                    output=parsed.get("output"),
+                )
+                if drop_error is not None:
+                    return _blocked_result(role, drop_error, spec, elapsed_ms, raw)
+
         return _apply_parsed(role, card, parsed, spec, elapsed_ms, raw)
 
 
@@ -240,6 +256,54 @@ def _apply_parsed(
         duration_ms=duration_ms,
         raw_response=raw,
     )
+
+
+def _validate_supersession(
+    *,
+    existing: list[str],
+    new: list[str],
+    output: Any,
+) -> str | None:
+    """Return an error message if the replan drops prior criteria without
+    recording each in ``output.superseded``, else None.
+
+    Dropped means: present in ``existing`` (exact text match) but not in
+    ``new``. Every dropped criterion must appear as ``{criterion, reason}``
+    under ``output.superseded`` with a non-empty reason. Adding new
+    criteria never requires a supersession record.
+    """
+    new_set = set(new)
+    dropped = [c for c in existing if c not in new_set]
+    if not dropped:
+        return None
+
+    superseded_raw = output.get("superseded") if isinstance(output, dict) else None
+    if not isinstance(superseded_raw, list):
+        return (
+            "planner replan dropped "
+            f"{len(dropped)} prior acceptance_criteria without "
+            "`output.superseded`; silent contract downgrades are not allowed"
+        )
+
+    recorded: dict[str, str] = {}
+    for entry in superseded_raw:
+        if not isinstance(entry, dict):
+            continue
+        text = str(entry.get("criterion", "")).strip()
+        reason = str(entry.get("reason", "")).strip()
+        if text and reason:
+            recorded[text] = reason
+
+    missing = [c for c in dropped if c not in recorded]
+    if missing:
+        shown = ", ".join(repr(c) for c in missing[:3])
+        more = "" if len(missing) <= 3 else f" (+{len(missing) - 3} more)"
+        return (
+            f"planner replan dropped {len(missing)} prior acceptance_criteria "
+            f"without a matching `output.superseded` entry ({shown}{more}); "
+            "each dropped criterion needs an explicit reason"
+        )
+    return None
 
 
 def _blocked_result(
