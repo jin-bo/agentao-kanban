@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from datetime import datetime
 from typing import Protocol, runtime_checkable
 
 from .models import (
@@ -10,7 +11,10 @@ from .models import (
     CardEvent,
     CardStatus,
     ContextRef,
+    ExecutionClaim,
+    ExecutionResultEnvelope,
     TraceInfo,
+    WorkerPresence,
     utc_now,
 )
 
@@ -52,11 +56,45 @@ class BoardStore(Protocol):
     ) -> list[TraceInfo]: ...
     def board_snapshot(self) -> dict[str, list[str]]: ...
 
+    # ---------- v0.1.2 runtime surface ----------
+    #
+    # Optional: stores that do not persist runtime state (InMemoryBoardStore)
+    # may leave these as no-ops or raise NotImplementedError. The markdown
+    # store implements them over workspace/board/runtime/.
+
+    def create_claim(self, claim: ExecutionClaim) -> ExecutionClaim: ...
+    def get_claim(self, card_id: str) -> ExecutionClaim | None: ...
+    def renew_claim(
+        self,
+        card_id: str,
+        *,
+        claim_id: str,
+        heartbeat_at: datetime,
+        lease_expires_at: datetime,
+        worker_id: str | None = ...,
+    ) -> ExecutionClaim: ...
+    def clear_claim(self, card_id: str, *, claim_id: str | None = ...) -> None: ...
+    def list_claims(self) -> list[ExecutionClaim]: ...
+    def list_stale_claims(self, *, now: datetime | None = ...) -> list[ExecutionClaim]: ...
+
+    def write_result(self, result: ExecutionResultEnvelope) -> None: ...
+    def read_results(
+        self, *, card_id: str | None = ...
+    ) -> list[ExecutionResultEnvelope]: ...
+    def delete_result(self, card_id: str, attempt: int) -> None: ...
+
+    def heartbeat_worker(self, presence: WorkerPresence) -> WorkerPresence: ...
+    def list_workers(self) -> list[WorkerPresence]: ...
+    def remove_worker(self, worker_id: str) -> None: ...
+
 
 class InMemoryBoardStore:
     def __init__(self) -> None:
         self._cards: dict[str, Card] = {}
         self._events: list[CardEvent] = []
+        self._claims: dict[str, ExecutionClaim] = {}
+        self._results: list[ExecutionResultEnvelope] = []
+        self._workers: dict[str, WorkerPresence] = {}
 
     def add_card(self, card: Card) -> Card:
         self._cards[card.id] = card
@@ -139,3 +177,102 @@ class InMemoryBoardStore:
         for card in self.list_cards():
             grouped[card.status.value].append(card.title)
         return dict(grouped)
+
+    # ---------- runtime surface (in-memory) ----------
+
+    def create_claim(self, claim: ExecutionClaim) -> ExecutionClaim:
+        from .models import ClaimConflictError
+
+        if claim.card_id in self._claims:
+            raise ClaimConflictError(
+                f"claim already exists for card {claim.card_id}"
+            )
+        self._claims[claim.card_id] = claim
+        return claim
+
+    def get_claim(self, card_id: str) -> ExecutionClaim | None:
+        return self._claims.get(card_id)
+
+    def renew_claim(
+        self,
+        card_id: str,
+        *,
+        claim_id: str,
+        heartbeat_at: datetime,
+        lease_expires_at: datetime,
+        worker_id: str | None = None,
+    ) -> ExecutionClaim:
+        from .models import ClaimMismatchError
+        from dataclasses import replace
+
+        current = self._claims.get(card_id)
+        if current is None:
+            raise KeyError(f"no claim for card {card_id}")
+        if current.claim_id != claim_id:
+            raise ClaimMismatchError(
+                f"claim_id mismatch for {card_id}: "
+                f"expected {current.claim_id}, got {claim_id}"
+            )
+        updated = replace(
+            current,
+            heartbeat_at=heartbeat_at,
+            lease_expires_at=lease_expires_at,
+            worker_id=worker_id if worker_id is not None else current.worker_id,
+        )
+        self._claims[card_id] = updated
+        return updated
+
+    def clear_claim(self, card_id: str, *, claim_id: str | None = None) -> None:
+        from .models import ClaimMismatchError
+
+        current = self._claims.get(card_id)
+        if current is None:
+            return
+        if claim_id is not None and current.claim_id != claim_id:
+            raise ClaimMismatchError(
+                f"claim_id mismatch for {card_id}: "
+                f"expected {current.claim_id}, got {claim_id}"
+            )
+        del self._claims[card_id]
+
+    def list_claims(self) -> list[ExecutionClaim]:
+        return list(self._claims.values())
+
+    def list_stale_claims(
+        self, *, now: datetime | None = None
+    ) -> list[ExecutionClaim]:
+        cutoff = now or utc_now()
+        return [c for c in self._claims.values() if c.lease_expires_at < cutoff]
+
+    def write_result(self, result: ExecutionResultEnvelope) -> None:
+        # Replace any prior envelope for the same (card, attempt).
+        self._results = [
+            r
+            for r in self._results
+            if not (r.card_id == result.card_id and r.attempt == result.attempt)
+        ]
+        self._results.append(result)
+
+    def read_results(
+        self, *, card_id: str | None = None
+    ) -> list[ExecutionResultEnvelope]:
+        if card_id is None:
+            return list(self._results)
+        return [r for r in self._results if r.card_id == card_id]
+
+    def delete_result(self, card_id: str, attempt: int) -> None:
+        self._results = [
+            r
+            for r in self._results
+            if not (r.card_id == card_id and r.attempt == attempt)
+        ]
+
+    def heartbeat_worker(self, presence: WorkerPresence) -> WorkerPresence:
+        self._workers[presence.worker_id] = presence
+        return presence
+
+    def list_workers(self) -> list[WorkerPresence]:
+        return list(self._workers.values())
+
+    def remove_worker(self, worker_id: str) -> None:
+        self._workers.pop(worker_id, None)

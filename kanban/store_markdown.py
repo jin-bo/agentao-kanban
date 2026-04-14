@@ -19,8 +19,14 @@ from .models import (
     CardEvent,
     CardPriority,
     CardStatus,
+    ClaimConflictError,
+    ClaimMismatchError,
     ContextRef,
+    ExecutionClaim,
+    ExecutionResultEnvelope,
+    ResourceUsage,
     TraceInfo,
+    WorkerPresence,
     utc_now,
 )
 
@@ -58,6 +64,10 @@ class MarkdownBoardStore:
         self.root = Path(root)
         self.cards_dir = self.root / "cards"
         self.events_path = self.root / "events.log"
+        self.runtime_dir = self.root / "runtime"
+        self.claims_dir = self.runtime_dir / "claims"
+        self.results_dir = self.runtime_dir / "results"
+        self.workers_dir = self.runtime_dir / "workers"
         # Raw transcripts live beside the board dir by default (workspace/raw/
         # for a board at workspace/board/). workspace/ is already gitignored.
         self.raw_root = Path(raw_root) if raw_root else self.root.parent / "raw"
@@ -245,10 +255,156 @@ class MarkdownBoardStore:
             grouped[card.status.value].append(card.title)
         return dict(grouped)
 
+    # ---------- v0.1.2 runtime surface ----------
+
+    def create_claim(self, claim: ExecutionClaim) -> ExecutionClaim:
+        self.claims_dir.mkdir(parents=True, exist_ok=True)
+        path = self._claim_path(claim.card_id)
+        if path.exists():
+            raise ClaimConflictError(
+                f"claim already exists for card {claim.card_id}: {path}"
+            )
+        _atomic_write_json(path, _claim_to_json(claim))
+        return claim
+
+    def get_claim(self, card_id: str) -> ExecutionClaim | None:
+        path = self._claim_path(card_id)
+        if not path.is_file():
+            return None
+        try:
+            return _claim_from_json(json.loads(path.read_text(encoding="utf-8")))
+        except (json.JSONDecodeError, KeyError, ValueError) as exc:
+            _LOG.warning("Skipping unparseable claim %s: %s", path.name, exc)
+            return None
+
+    def renew_claim(
+        self,
+        card_id: str,
+        *,
+        claim_id: str,
+        heartbeat_at: datetime,
+        lease_expires_at: datetime,
+        worker_id: str | None = None,
+    ) -> ExecutionClaim:
+        current = self.get_claim(card_id)
+        if current is None:
+            raise KeyError(f"no claim for card {card_id}")
+        if current.claim_id != claim_id:
+            raise ClaimMismatchError(
+                f"claim_id mismatch for {card_id}: "
+                f"expected {current.claim_id}, got {claim_id}"
+            )
+        from dataclasses import replace
+
+        updated = replace(
+            current,
+            heartbeat_at=heartbeat_at,
+            lease_expires_at=lease_expires_at,
+            worker_id=worker_id if worker_id is not None else current.worker_id,
+        )
+        _atomic_write_json(self._claim_path(card_id), _claim_to_json(updated))
+        return updated
+
+    def clear_claim(self, card_id: str, *, claim_id: str | None = None) -> None:
+        current = self.get_claim(card_id)
+        if current is None:
+            return
+        if claim_id is not None and current.claim_id != claim_id:
+            raise ClaimMismatchError(
+                f"claim_id mismatch for {card_id}: "
+                f"expected {current.claim_id}, got {claim_id}"
+            )
+        try:
+            self._claim_path(card_id).unlink()
+        except FileNotFoundError:
+            pass
+
+    def list_claims(self) -> list[ExecutionClaim]:
+        if not self.claims_dir.is_dir():
+            return []
+        claims: list[ExecutionClaim] = []
+        for path in sorted(self.claims_dir.glob("*.json")):
+            try:
+                claims.append(
+                    _claim_from_json(json.loads(path.read_text(encoding="utf-8")))
+                )
+            except (json.JSONDecodeError, KeyError, ValueError) as exc:
+                _LOG.warning("Skipping unparseable claim %s: %s", path.name, exc)
+        return claims
+
+    def list_stale_claims(
+        self, *, now: datetime | None = None
+    ) -> list[ExecutionClaim]:
+        cutoff = now or utc_now()
+        return [c for c in self.list_claims() if c.lease_expires_at < cutoff]
+
+    def write_result(self, result: ExecutionResultEnvelope) -> None:
+        self.results_dir.mkdir(parents=True, exist_ok=True)
+        path = self._result_path(result.card_id, result.attempt)
+        _atomic_write_json(path, _result_to_json(result))
+
+    def read_results(
+        self, *, card_id: str | None = None
+    ) -> list[ExecutionResultEnvelope]:
+        if not self.results_dir.is_dir():
+            return []
+        results: list[ExecutionResultEnvelope] = []
+        for path in sorted(self.results_dir.glob("*.json")):
+            if card_id is not None and not path.name.startswith(f"{card_id}-"):
+                continue
+            try:
+                results.append(
+                    _result_from_json(json.loads(path.read_text(encoding="utf-8")))
+                )
+            except (json.JSONDecodeError, KeyError, ValueError) as exc:
+                _LOG.warning("Skipping unparseable result %s: %s", path.name, exc)
+        return results
+
+    def delete_result(self, card_id: str, attempt: int) -> None:
+        try:
+            self._result_path(card_id, attempt).unlink()
+        except FileNotFoundError:
+            pass
+
+    def heartbeat_worker(self, presence: WorkerPresence) -> WorkerPresence:
+        self.workers_dir.mkdir(parents=True, exist_ok=True)
+        _atomic_write_json(
+            self._worker_path(presence.worker_id), _worker_to_json(presence)
+        )
+        return presence
+
+    def list_workers(self) -> list[WorkerPresence]:
+        if not self.workers_dir.is_dir():
+            return []
+        workers: list[WorkerPresence] = []
+        for path in sorted(self.workers_dir.glob("*.json")):
+            try:
+                workers.append(
+                    _worker_from_json(json.loads(path.read_text(encoding="utf-8")))
+                )
+            except (json.JSONDecodeError, KeyError, ValueError) as exc:
+                _LOG.warning("Skipping unparseable worker %s: %s", path.name, exc)
+        return workers
+
+    def remove_worker(self, worker_id: str) -> None:
+        try:
+            self._worker_path(worker_id).unlink()
+        except FileNotFoundError:
+            pass
+
     # ---------- internals ----------
 
     def _card_path(self, card_id: str) -> Path:
         return self.cards_dir / f"{card_id}.md"
+
+    def _claim_path(self, card_id: str) -> Path:
+        return self.claims_dir / f"{card_id}.json"
+
+    def _result_path(self, card_id: str, attempt: int) -> Path:
+        return self.results_dir / f"{card_id}-{attempt}.json"
+
+    def _worker_path(self, worker_id: str) -> Path:
+        return self.workers_dir / f"{worker_id}.json"
 
     def _load(self) -> None:
         for path in sorted(self.cards_dir.glob("*.md")):
@@ -496,3 +652,173 @@ def _toml_string(value: str, *, inline: bool = False) -> str:
         .replace("\t", "\\t")
     )
     return f'"{escaped}"'
+
+
+# ---------- v0.1.2 runtime JSON (claims / results / workers) ----------
+
+
+def _atomic_write_json(path: Path, data: dict[str, Any]) -> None:
+    """Write JSON via tmp + os.replace so readers never see a torn file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(
+        json.dumps(data, ensure_ascii=False, sort_keys=True),
+        encoding="utf-8",
+    )
+    os.replace(tmp, path)
+
+
+def _iso(dt: datetime) -> str:
+    return dt.isoformat()
+
+
+def _parse_iso(raw: Any) -> datetime:
+    dt = datetime.fromisoformat(str(raw))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=_UTC)
+    return dt
+
+
+def _claim_to_json(claim: ExecutionClaim) -> dict[str, Any]:
+    return {
+        "card_id": claim.card_id,
+        "claim_id": claim.claim_id,
+        "worker_id": claim.worker_id,
+        "role": claim.role.value,
+        "status_at_claim": claim.status_at_claim.value,
+        "attempt": claim.attempt,
+        "retry_count": claim.retry_count,
+        "retry_of_claim_id": claim.retry_of_claim_id,
+        "claimed_at": _iso(claim.claimed_at),
+        "heartbeat_at": _iso(claim.heartbeat_at),
+        "lease_expires_at": _iso(claim.lease_expires_at),
+        "timeout_s": claim.timeout_s,
+    }
+
+
+def _claim_from_json(data: dict[str, Any]) -> ExecutionClaim:
+    return ExecutionClaim(
+        card_id=str(data["card_id"]),
+        claim_id=str(data["claim_id"]),
+        role=AgentRole(data["role"]),
+        status_at_claim=CardStatus(data["status_at_claim"]),
+        attempt=int(data["attempt"]),
+        claimed_at=_parse_iso(data["claimed_at"]),
+        heartbeat_at=_parse_iso(data["heartbeat_at"]),
+        lease_expires_at=_parse_iso(data["lease_expires_at"]),
+        timeout_s=int(data["timeout_s"]),
+        worker_id=data.get("worker_id"),
+        retry_count=int(data.get("retry_count", 0)),
+        retry_of_claim_id=data.get("retry_of_claim_id"),
+    )
+
+
+def _resource_to_json(usage: ResourceUsage) -> dict[str, Any]:
+    return {
+        "pid": usage.pid,
+        "rss_bytes": usage.rss_bytes,
+        "cpu_seconds": usage.cpu_seconds,
+        "workdir_size_bytes": usage.workdir_size_bytes,
+    }
+
+
+def _resource_from_json(data: dict[str, Any]) -> ResourceUsage:
+    return ResourceUsage(
+        pid=data.get("pid"),
+        rss_bytes=data.get("rss_bytes"),
+        cpu_seconds=data.get("cpu_seconds"),
+        workdir_size_bytes=data.get("workdir_size_bytes"),
+    )
+
+
+def _agent_result_to_json(result: AgentResult) -> dict[str, Any]:
+    # Normalized copy per open-questions decision — drop raw_response to keep
+    # envelopes small; raw text still lives under workspace/raw/.
+    return {
+        "role": result.role.value,
+        "summary": result.summary,
+        "next_status": result.next_status.value,
+        "updates": dict(result.updates),
+        "prompt_version": result.prompt_version,
+        "duration_ms": result.duration_ms,
+        "attempt": result.attempt,
+    }
+
+
+def _agent_result_from_json(data: dict[str, Any]) -> AgentResult:
+    return AgentResult(
+        role=AgentRole(data["role"]),
+        summary=str(data["summary"]),
+        next_status=CardStatus(data["next_status"]),
+        updates=dict(data.get("updates", {})),
+        prompt_version=str(data.get("prompt_version", "")),
+        duration_ms=int(data.get("duration_ms", 0)),
+        attempt=int(data.get("attempt", 1)),
+    )
+
+
+def _result_to_json(envelope: ExecutionResultEnvelope) -> dict[str, Any]:
+    out: dict[str, Any] = {
+        "card_id": envelope.card_id,
+        "claim_id": envelope.claim_id,
+        "worker_id": envelope.worker_id,
+        "role": envelope.role.value,
+        "attempt": envelope.attempt,
+        "started_at": _iso(envelope.started_at),
+        "finished_at": _iso(envelope.finished_at),
+        "duration_ms": envelope.duration_ms,
+        "ok": envelope.ok,
+        "failure_reason": envelope.failure_reason,
+    }
+    if envelope.agent_result is not None:
+        out["agent_result"] = _agent_result_to_json(envelope.agent_result)
+    if envelope.resource_usage is not None:
+        out["resource_usage"] = _resource_to_json(envelope.resource_usage)
+    return out
+
+
+def _result_from_json(data: dict[str, Any]) -> ExecutionResultEnvelope:
+    agent_result = (
+        _agent_result_from_json(data["agent_result"])
+        if data.get("agent_result") is not None
+        else None
+    )
+    resource_usage = (
+        _resource_from_json(data["resource_usage"])
+        if data.get("resource_usage") is not None
+        else None
+    )
+    return ExecutionResultEnvelope(
+        card_id=str(data["card_id"]),
+        claim_id=str(data["claim_id"]),
+        role=AgentRole(data["role"]),
+        attempt=int(data["attempt"]),
+        started_at=_parse_iso(data["started_at"]),
+        finished_at=_parse_iso(data["finished_at"]),
+        duration_ms=int(data["duration_ms"]),
+        ok=bool(data["ok"]),
+        agent_result=agent_result,
+        worker_id=data.get("worker_id"),
+        failure_reason=data.get("failure_reason"),
+        resource_usage=resource_usage,
+    )
+
+
+def _worker_to_json(presence: WorkerPresence) -> dict[str, Any]:
+    return {
+        "worker_id": presence.worker_id,
+        "pid": presence.pid,
+        "started_at": _iso(presence.started_at),
+        "heartbeat_at": _iso(presence.heartbeat_at),
+        "host": presence.host,
+    }
+
+
+def _worker_from_json(data: dict[str, Any]) -> WorkerPresence:
+    return WorkerPresence(
+        worker_id=str(data["worker_id"]),
+        pid=int(data["pid"]),
+        started_at=_parse_iso(data["started_at"]),
+        heartbeat_at=_parse_iso(data["heartbeat_at"]),
+        host=data.get("host"),
+    )

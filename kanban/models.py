@@ -194,3 +194,101 @@ class AgentResult:
     duration_ms: int = 0
     attempt: int = 1
     raw_response: str | None = None
+
+
+# ---------- v0.1.2 runtime concurrency kernel ----------
+#
+# Workflow status (Card.status) answers "where is this card in delivery?"
+# Claim / lease state answers "is there an in-flight execution right now?"
+# The two are intentionally separate: runtime state lives beside the board
+# under workspace/board/runtime/ and is advisory; card files remain the
+# source of truth for workflow transitions.
+
+
+class ExecutionEventType(StrEnum):
+    """Runtime lifecycle event names (plan §Event Model Upgrade)."""
+
+    CLAIMED = "execution.claimed"
+    STARTED = "execution.started"
+    HEARTBEAT = "execution.heartbeat"
+    FINISHED = "execution.finished"
+    FAILED = "execution.failed"
+    TIMED_OUT = "execution.timed_out"
+    RETRIED = "execution.retried"
+    CLAIM_RECOVERED = "execution.claim_recovered"
+    RESULT_ORPHANED = "execution.result_orphaned"
+    WORKER_STARTED = "worker.started"
+    WORKER_STOPPED = "worker.stopped"
+
+
+@dataclass(slots=True)
+class ResourceUsage:
+    """Lightweight local resource metrics. All fields optional."""
+
+    pid: int | None = None
+    rss_bytes: int | None = None
+    cpu_seconds: float | None = None
+    workdir_size_bytes: int | None = None
+
+
+@dataclass(slots=True)
+class ExecutionClaim:
+    """One live execution lease for a card.
+
+    `worker_id` is None when the scheduler creates an unassigned claim
+    (per open-questions decision). A worker sets it on first heartbeat
+    to record ownership.
+    """
+
+    card_id: str
+    claim_id: str
+    role: AgentRole
+    status_at_claim: CardStatus
+    attempt: int
+    claimed_at: datetime
+    lease_expires_at: datetime
+    heartbeat_at: datetime
+    timeout_s: int
+    worker_id: str | None = None
+    retry_count: int = 0
+    retry_of_claim_id: str | None = None
+
+    def is_expired(self, *, now: datetime | None = None) -> bool:
+        return self.lease_expires_at < (now or utc_now())
+
+
+@dataclass(slots=True)
+class ExecutionResultEnvelope:
+    """A worker's submitted outcome for one claim attempt."""
+
+    card_id: str
+    claim_id: str
+    role: AgentRole
+    attempt: int
+    started_at: datetime
+    finished_at: datetime
+    duration_ms: int
+    ok: bool
+    agent_result: AgentResult | None = None
+    worker_id: str | None = None
+    failure_reason: str | None = None
+    resource_usage: ResourceUsage | None = None
+
+
+@dataclass(slots=True)
+class WorkerPresence:
+    """Heartbeat record for an active worker process. Observability only."""
+
+    worker_id: str
+    pid: int
+    started_at: datetime
+    heartbeat_at: datetime
+    host: str | None = None
+
+
+class ClaimConflictError(RuntimeError):
+    """Raised when `create_claim` is called for a card that already has one."""
+
+
+class ClaimMismatchError(RuntimeError):
+    """Raised when `renew_claim` / `clear_claim` is called with the wrong claim_id."""
