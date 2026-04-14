@@ -50,6 +50,20 @@ uv run kanban daemon --detach                   # 后台运行,日志写到 <boa
 uv run kanban --executor agentao daemon         # 真正调用 sub-agent
 ```
 
+## CLI Guide
+
+README 保留概览和关键命令,完整的 CLI 使用指南放在
+[docs/kanban-cli-guide.md](docs/kanban-cli-guide.md)。
+
+如果你想快速掌握:
+
+- 建卡、补 context、维护 acceptance criteria
+- daemon 运行时如何安全操作
+- 多 worker 模式下如何看 claims / workers / events
+- blocked、超时、stale claim 时怎么恢复
+
+直接看这份指南。
+
 ## 运维命令(v0.1.1)
 
 所有写命令都遵守 `.daemon.lock`;加 `--force` 才能在守护进程运行期写入

@@ -309,7 +309,14 @@ def _make_orchestrator(args: argparse.Namespace) -> tuple[MarkdownBoardStore, Ka
 
 
 def _require_writable(args: argparse.Namespace) -> None:
-    """Refuse to mutate the board while a live daemon holds the lock."""
+    """Refuse to mutate the board while a live daemon holds the lock.
+
+    Note: ``.daemon.lock`` is held only by ``scheduler``, ``all``, and
+    ``legacy-serial`` roles. A ``--role worker`` process takes no board
+    lock, so this check alone does NOT guarantee safe mutation in the
+    split topology — per-card writers should also call
+    :func:`_require_card_writable` to refuse while a live claim exists.
+    """
     if getattr(args, "force", False):
         return
     try:
@@ -317,6 +324,36 @@ def _require_writable(args: argparse.Namespace) -> None:
     except DaemonLockError as exc:
         print(str(exc), file=sys.stderr)
         raise SystemExit(2)
+
+
+def _require_card_writable(args: argparse.Namespace, card_id: str) -> None:
+    """Board lock + per-card live-claim guard (v0.1.2 split topology).
+
+    Workers don't hold ``.daemon.lock``, but they do hold live claims on
+    specific cards while executing. Mutating a card with a live claim
+    races the worker's next envelope (operator edits can be overwritten
+    by a pending result, or the worker can step on the edit). Refuse
+    unless ``--force`` is set.
+    """
+    _require_writable(args)
+    if getattr(args, "force", False):
+        return
+    store = _make_store(args)
+    claim = store.get_claim(card_id)
+    if claim is None:
+        return
+    worker_tag = (
+        f"worker={claim.worker_id}" if claim.worker_id else "unassigned"
+    )
+    print(
+        f"Card {card_id[:8]} has a live execution claim {claim.claim_id} "
+        f"({worker_tag}); refuse to mutate. Run `kanban claims {card_id}` "
+        f"and `kanban workers` to check, stop the claimed worker (or wait "
+        f"for it to finish), then retry. Pass --force to override (may "
+        f"race with in-flight execution).",
+        file=sys.stderr,
+    )
+    raise SystemExit(2)
 
 
 def _print_card(card: Card) -> None:
@@ -345,7 +382,7 @@ def _print_card(card: Card) -> None:
 
 
 def cmd_card_edit(args: argparse.Namespace) -> int:
-    _require_writable(args)
+    _require_card_writable(args, args.card_id)
     store = _make_store(args)
     try:
         card = store.get_card(args.card_id)
@@ -461,7 +498,7 @@ def cmd_card_context_list(args: argparse.Namespace) -> int:
 
 
 def cmd_card_context_add(args: argparse.Namespace) -> int:
-    _require_writable(args)
+    _require_card_writable(args, args.card_id)
     store = _make_store(args)
     try:
         card = store.get_card(args.card_id)
@@ -495,7 +532,7 @@ def cmd_card_context_add(args: argparse.Namespace) -> int:
 
 
 def cmd_card_context_rm(args: argparse.Namespace) -> int:
-    _require_writable(args)
+    _require_card_writable(args, args.card_id)
     store = _make_store(args)
     try:
         card = store.get_card(args.card_id)
@@ -534,7 +571,7 @@ def cmd_card_acceptance_list(args: argparse.Namespace) -> int:
 
 
 def cmd_card_acceptance_add(args: argparse.Namespace) -> int:
-    _require_writable(args)
+    _require_card_writable(args, args.card_id)
     store = _make_store(args)
     try:
         card = store.get_card(args.card_id)
@@ -553,7 +590,7 @@ def cmd_card_acceptance_add(args: argparse.Namespace) -> int:
 
 
 def cmd_card_acceptance_rm(args: argparse.Namespace) -> int:
-    _require_writable(args)
+    _require_card_writable(args, args.card_id)
     store = _make_store(args)
     try:
         card = store.get_card(args.card_id)
@@ -580,7 +617,7 @@ def cmd_card_acceptance_rm(args: argparse.Namespace) -> int:
 
 
 def cmd_card_acceptance_clear(args: argparse.Namespace) -> int:
-    _require_writable(args)
+    _require_card_writable(args, args.card_id)
     store = _make_store(args)
     try:
         card = store.get_card(args.card_id)
@@ -644,7 +681,7 @@ def cmd_show(args: argparse.Namespace) -> int:
 
 
 def cmd_move(args: argparse.Namespace) -> int:
-    _require_writable(args)
+    _require_card_writable(args, args.card_id)
     store = _make_store(args)
     try:
         card = store.move_card(args.card_id, CardStatus(args.status), "Manual move via CLI")
@@ -656,7 +693,7 @@ def cmd_move(args: argparse.Namespace) -> int:
 
 
 def cmd_block(args: argparse.Namespace) -> int:
-    _require_writable(args)
+    _require_card_writable(args, args.card_id)
     store = _make_store(args)
     try:
         store.update_card(args.card_id, blocked_reason=args.reason)
@@ -669,7 +706,7 @@ def cmd_block(args: argparse.Namespace) -> int:
 
 
 def cmd_unblock(args: argparse.Namespace) -> int:
-    _require_writable(args)
+    _require_card_writable(args, args.card_id)
     store = _make_store(args)
     try:
         target = CardStatus(args.target)
@@ -949,7 +986,7 @@ def cmd_traces(args: argparse.Namespace) -> int:
 
 
 def cmd_requeue(args: argparse.Namespace) -> int:
-    _require_writable(args)
+    _require_card_writable(args, args.card_id)
     store = _make_store(args)
     try:
         card = store.get_card(args.card_id)
