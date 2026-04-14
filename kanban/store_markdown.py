@@ -24,6 +24,7 @@ from .models import (
     ContextRef,
     ExecutionClaim,
     ExecutionResultEnvelope,
+    FailureCategory,
     ResourceUsage,
     TraceInfo,
     WorkerPresence,
@@ -121,6 +122,63 @@ class MarkdownBoardStore:
         event = CardEvent(card_id=card_id, message=message)
         self._events.append(event)
         record = {"at": event.at.isoformat(), "card_id": card_id, "message": message}
+        self._write_event_line(record)
+
+    def append_runtime_event(
+        self,
+        card_id: str,
+        *,
+        event_type: str,
+        message: str,
+        role: AgentRole | None = None,
+        claim_id: str | None = None,
+        worker_id: str | None = None,
+        attempt: int | None = None,
+        duration_ms: int | None = None,
+        failure_reason: str | None = None,
+        failure_category: str | None = None,
+        retry_of_claim_id: str | None = None,
+    ) -> None:
+        """Emit a structured runtime lifecycle event (plan §Event Model Upgrade).
+
+        Separate from ``append_event`` so readers (``doctor``, ``events``
+        CLI) can filter by ``event_type`` without scraping messages.
+        """
+        at = utc_now()
+        event = CardEvent(
+            card_id=card_id,
+            message=message,
+            at=at,
+            role=role,
+            attempt=attempt,
+            duration_ms=duration_ms,
+            event_type=event_type,
+            claim_id=claim_id,
+            worker_id=worker_id,
+            failure_reason=failure_reason,
+            failure_category=failure_category,
+            retry_of_claim_id=retry_of_claim_id,
+        )
+        self._events.append(event)
+        record: dict[str, Any] = {
+            "at": at.isoformat(),
+            "card_id": card_id,
+            "message": message,
+            "event_type": event_type,
+        }
+        if role is not None:
+            record["role"] = role.value
+        for key, value in (
+            ("claim_id", claim_id),
+            ("worker_id", worker_id),
+            ("attempt", attempt),
+            ("duration_ms", duration_ms),
+            ("failure_reason", failure_reason),
+            ("failure_category", failure_category),
+            ("retry_of_claim_id", retry_of_claim_id),
+        ):
+            if value is not None:
+                record[key] = value
         self._write_event_line(record)
 
     def append_execution_event(self, card_id: str, result: AgentResult) -> None:
@@ -544,6 +602,12 @@ def _decode_event_line(line: str) -> CardEvent | None:
                 duration_ms=data.get("duration_ms"),
                 attempt=data.get("attempt"),
                 raw_path=data.get("raw_path"),
+                event_type=data.get("event_type"),
+                claim_id=data.get("claim_id"),
+                worker_id=data.get("worker_id"),
+                failure_reason=data.get("failure_reason"),
+                failure_category=data.get("failure_category"),
+                retry_of_claim_id=data.get("retry_of_claim_id"),
             )
         except (json.JSONDecodeError, KeyError, ValueError):
             return None
@@ -852,6 +916,11 @@ def _result_to_json(envelope: ExecutionResultEnvelope) -> dict[str, Any]:
         "duration_ms": envelope.duration_ms,
         "ok": envelope.ok,
         "failure_reason": envelope.failure_reason,
+        "failure_category": (
+            envelope.failure_category.value
+            if envelope.failure_category is not None
+            else None
+        ),
     }
     if envelope.agent_result is not None:
         out["agent_result"] = _agent_result_to_json(envelope.agent_result)
@@ -871,6 +940,8 @@ def _result_from_json(data: dict[str, Any]) -> ExecutionResultEnvelope:
         if data.get("resource_usage") is not None
         else None
     )
+    raw_cat = data.get("failure_category")
+    failure_category = FailureCategory(raw_cat) if raw_cat else None
     return ExecutionResultEnvelope(
         card_id=str(data["card_id"]),
         claim_id=str(data["claim_id"]),
@@ -883,6 +954,7 @@ def _result_from_json(data: dict[str, Any]) -> ExecutionResultEnvelope:
         agent_result=agent_result,
         worker_id=data.get("worker_id"),
         failure_reason=data.get("failure_reason"),
+        failure_category=failure_category,
         resource_usage=resource_usage,
     )
 

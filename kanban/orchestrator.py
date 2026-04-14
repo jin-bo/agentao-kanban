@@ -14,8 +14,10 @@ from .models import (
     ExecutionClaim,
     ExecutionEventType,
     ExecutionResultEnvelope,
+    FailureCategory,
     LeasePolicy,
     ResourceUsage,
+    RetryPolicy,
     utc_now,
 )
 from .store import BoardStore
@@ -36,11 +38,13 @@ class KanbanOrchestrator:
         executor: CardExecutor,
         wip_policy: WipPolicy | None = None,
         lease_policy: LeasePolicy | None = None,
+        retry_policy: RetryPolicy | None = None,
     ) -> None:
         self.store = store
         self.executor = executor
         self.wip_policy = wip_policy or WipPolicy()
         self.lease_policy = lease_policy or LeasePolicy()
+        self.retry_policy = retry_policy or RetryPolicy()
 
     def create_card(
         self,
@@ -163,6 +167,7 @@ class KanbanOrchestrator:
         finished_at=None,
         ok: bool = True,
         failure_reason: str | None = None,
+        failure_category: FailureCategory | None = None,
         resource_usage: ResourceUsage | None = None,
     ) -> ExecutionResultEnvelope:
         """Worker step: persist the executor outcome as an envelope.
@@ -185,17 +190,30 @@ class KanbanOrchestrator:
             agent_result=result,
             worker_id=worker_id,
             failure_reason=failure_reason,
+            failure_category=failure_category,
             resource_usage=resource_usage,
         )
         self.store.write_result(envelope)
-        outcome = (
+        event_type = (
             ExecutionEventType.FINISHED.value if ok else ExecutionEventType.FAILED.value
         )
-        self.store.append_event(
+        self.store.append_runtime_event(
             claim.card_id,
-            f"[{outcome}] claim={claim.claim_id} worker={worker_id} "
-            f"attempt={claim.attempt} duration_ms={duration_ms}"
-            + (f" reason={failure_reason}" if failure_reason else ""),
+            event_type=event_type,
+            message=(
+                failure_reason
+                if failure_reason
+                else (result.summary if result else "executor finished")
+            ),
+            role=claim.role,
+            claim_id=claim.claim_id,
+            worker_id=worker_id,
+            attempt=claim.attempt,
+            duration_ms=duration_ms,
+            failure_reason=failure_reason,
+            failure_category=(
+                failure_category.value if failure_category is not None else None
+            ),
         )
         return envelope
 
@@ -203,11 +221,11 @@ class KanbanOrchestrator:
         """Scheduler/committer: apply any pending result envelopes.
 
         For each envelope: verify it references the current live claim
-        (``claim_id`` match). On match — apply the result and clear the
-        claim. On mismatch or missing claim — quarantine as an orphan and
-        emit ``execution.result_orphaned``. Returns the number committed.
+        (``claim_id`` match). On match — apply the result, retry on
+        retryable failure, or BLOCK on unretryable failure. On mismatch or
+        missing claim — quarantine as an orphan. Returns the number processed.
         """
-        committed = 0
+        processed = 0
         for env in self.store.read_results():
             claim = self.store.get_claim(env.card_id)
             if claim is None or claim.claim_id != env.claim_id:
@@ -216,51 +234,137 @@ class KanbanOrchestrator:
                 continue
             if env.ok and env.agent_result is not None:
                 self._apply_result(env.card_id, env.agent_result)
+                self.store.clear_claim(env.card_id, claim_id=env.claim_id)
             else:
-                reason = env.failure_reason or "executor reported failure"
-                self.store.update_card(env.card_id, blocked_reason=reason)
-                self.store.move_card(
-                    env.card_id, CardStatus.BLOCKED, f"Blocked: {reason}"
-                )
-            self.store.clear_claim(env.card_id, claim_id=env.claim_id)
+                self._handle_failed_envelope(env, claim)
             self.store.delete_result(env.card_id, env.attempt)
-            committed += 1
-        return committed
+            processed += 1
+        return processed
 
     def recover_stale_claims(self, *, now=None) -> int:
-        """Scheduler: move cards with expired leases to BLOCKED and clear claims.
-
-        PR4 will add retries; here we deterministically block so the operator
-        can requeue. Returns the number of claims recovered.
-        """
+        """Scheduler: handle claims whose lease has expired (plan §Stuck Task
+        Recovery). Categorized as ``lease_expiry``; consults the retry matrix
+        to either create a linked replacement claim or block the card."""
         stale = self.store.list_stale_claims(now=now or utc_now())
         for claim in stale:
             reason = (
                 f"runtime lease expired on attempt {claim.attempt} "
                 f"(role={claim.role.value}, claim={claim.claim_id})"
             )
-            self.store.update_card(claim.card_id, blocked_reason=reason)
-            self.store.move_card(
-                claim.card_id, CardStatus.BLOCKED, f"Blocked: {reason}"
+            self.store.append_runtime_event(
+                claim.card_id,
+                event_type=ExecutionEventType.CLAIM_RECOVERED.value,
+                message=reason,
+                role=claim.role,
+                claim_id=claim.claim_id,
+                worker_id=claim.worker_id,
+                attempt=claim.attempt,
+                failure_category=FailureCategory.LEASE_EXPIRY.value,
+                failure_reason=reason,
             )
             self.store.clear_claim(claim.card_id, claim_id=claim.claim_id)
-            self.store.append_event(
-                claim.card_id,
-                f"[{ExecutionEventType.CLAIM_RECOVERED.value}] "
-                f"claim={claim.claim_id} role={claim.role.value} "
-                f"attempt={claim.attempt}",
+            self._retry_or_block(
+                claim, FailureCategory.LEASE_EXPIRY, reason, original_status=None
             )
         return len(stale)
+
+    # ---------- retry matrix ----------
+
+    def retry_claim(
+        self,
+        previous: ExecutionClaim,
+        *,
+        reason: str,
+        category: FailureCategory,
+    ) -> ExecutionClaim:
+        """Create a linked replacement claim with ``attempt+1``.
+
+        Leaves card status unchanged; the next worker picks up the new claim
+        in the same status as the failed attempt. Emits ``execution.retried``.
+        """
+        from uuid import uuid4
+
+        now = utc_now()
+        lease_expires = now + timedelta(seconds=self.lease_policy.lease_seconds)
+        new_claim = ExecutionClaim(
+            card_id=previous.card_id,
+            claim_id=f"clm-{uuid4().hex[:12]}",
+            role=previous.role,
+            status_at_claim=previous.status_at_claim,
+            attempt=previous.attempt + 1,
+            claimed_at=now,
+            heartbeat_at=now,
+            lease_expires_at=lease_expires,
+            timeout_s=previous.timeout_s,
+            worker_id=None,
+            retry_count=previous.retry_count + 1,
+            retry_of_claim_id=previous.claim_id,
+        )
+        self.store.create_claim(new_claim)
+        self.store.append_runtime_event(
+            new_claim.card_id,
+            event_type=ExecutionEventType.RETRIED.value,
+            message=f"retry attempt {new_claim.attempt} after {category.value}: {reason}",
+            role=new_claim.role,
+            claim_id=new_claim.claim_id,
+            attempt=new_claim.attempt,
+            failure_category=category.value,
+            failure_reason=reason,
+            retry_of_claim_id=previous.claim_id,
+        )
+        return new_claim
+
+    def _handle_failed_envelope(
+        self, env: ExecutionResultEnvelope, claim: ExecutionClaim
+    ) -> None:
+        category = env.failure_category or FailureCategory.INFRASTRUCTURE
+        reason = env.failure_reason or "executor reported failure"
+        # Always clear the old claim first; retry creates a fresh one so a
+        # duplicate-create conflict can't hit us.
+        self.store.clear_claim(env.card_id, claim_id=env.claim_id)
+        self._retry_or_block(claim, category, reason, original_status=None)
+
+    def _retry_or_block(
+        self,
+        failed_claim: ExecutionClaim,
+        category: FailureCategory,
+        reason: str,
+        *,
+        original_status: CardStatus | None,
+    ) -> None:
+        """Apply retry matrix: either link a new claim or BLOCK the card."""
+        budget = self.retry_policy.budget_for(category)
+        retries_used = failed_claim.retry_count
+        if retries_used < budget:
+            self.retry_claim(failed_claim, reason=reason, category=category)
+            return
+
+        # Exhausted — move to BLOCKED with a runtime reason that names the
+        # failure class (plan: "blocking reason should include the last
+        # runtime failure class, not just a human summary").
+        block_reason = (
+            f"{reason} [category={category.value} attempts={failed_claim.attempt}]"
+        )
+        self.store.update_card(failed_claim.card_id, blocked_reason=block_reason)
+        self.store.move_card(
+            failed_claim.card_id, CardStatus.BLOCKED, f"Blocked: {block_reason}"
+        )
 
     def _emit_orphan(
         self, env: ExecutionResultEnvelope, live_claim: ExecutionClaim | None
     ) -> None:
-        live_id = live_claim.claim_id if live_claim is not None else "<none>"
-        self.store.append_event(
+        live_id = live_claim.claim_id if live_claim is not None else None
+        self.store.append_runtime_event(
             env.card_id,
-            f"[{ExecutionEventType.RESULT_ORPHANED.value}] "
-            f"envelope_claim={env.claim_id} live_claim={live_id} "
-            f"attempt={env.attempt} worker={env.worker_id}",
+            event_type=ExecutionEventType.RESULT_ORPHANED.value,
+            message=(
+                f"envelope for claim={env.claim_id} does not match live "
+                f"claim={live_id or '<none>'}"
+            ),
+            role=env.role,
+            claim_id=env.claim_id,
+            worker_id=env.worker_id,
+            attempt=env.attempt,
         )
 
     def run_until_idle(self, max_steps: int = 20) -> list[Card]:

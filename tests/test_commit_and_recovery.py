@@ -12,6 +12,7 @@ from kanban.models import (
     Card,
     ExecutionClaim,
     ExecutionResultEnvelope,
+    FailureCategory,
     utc_now,
 )
 from kanban.store_markdown import MarkdownBoardStore
@@ -67,7 +68,8 @@ def test_worker_submit_then_scheduler_commit_applies_result(tmp_path: Path):
     assert store.get_card(card.id).status == CardStatus.REVIEW
 
 
-def test_worker_failed_envelope_blocks_card(tmp_path: Path):
+def test_worker_failed_envelope_blocks_card_when_unretryable(tmp_path: Path):
+    """Functional rejection has zero retry budget → BLOCKED on first failure."""
     store, orch = _make(tmp_path)
     card = _ready_card(store)
     claim = orch.select_and_claim(worker_id=None)
@@ -82,13 +84,15 @@ def test_worker_failed_envelope_blocks_card(tmp_path: Path):
         worker_id="w1",
         started_at=utc_now(),
         ok=False,
-        failure_reason="boom",
+        failure_reason="rejected",
+        failure_category=FailureCategory.FUNCTIONAL,
     )
     orch.commit_pending_results()
 
     got = store.get_card(card.id)
     assert got.status == CardStatus.BLOCKED
-    assert got.blocked_reason == "boom"
+    assert got.blocked_reason is not None and "rejected" in got.blocked_reason
+    assert "functional" in got.blocked_reason
 
 
 def test_commit_survives_scheduler_restart(tmp_path: Path):
@@ -180,28 +184,31 @@ def test_envelope_with_no_live_claim_is_quarantined(tmp_path: Path):
 # ---------- stale claim recovery ----------
 
 
-def test_stale_claim_moves_card_to_blocked_and_clears_claim(tmp_path: Path):
+def test_stale_claim_on_final_retry_moves_card_to_blocked(tmp_path: Path):
+    """Lease expiry has retry budget 1; a claim whose retry_count already
+    equals the budget blocks the card on the next stale recovery pass."""
     store, orch = _make(tmp_path)
     card = _ready_card(store)
     claim = orch.select_and_claim(worker_id=None)
     assert claim is not None
-    # Force the lease expired by rewriting the claim file.
     from dataclasses import replace
 
-    expired = replace(
+    exhausted = replace(
         claim,
         lease_expires_at=utc_now() - timedelta(seconds=30),
         worker_id="w-dead",
+        retry_count=1,  # budget used up
+        attempt=2,
     )
-    # rewrite (clear then create) to bypass conflict.
     store.clear_claim(card.id)
-    store.create_claim(expired)
+    store.create_claim(exhausted)
 
     recovered = orch.recover_stale_claims()
     assert recovered == 1
     got = store.get_card(card.id)
     assert got.status == CardStatus.BLOCKED
-    assert got.blocked_reason and "lease expired" in got.blocked_reason
+    assert got.blocked_reason is not None
+    assert "lease_expiry" in got.blocked_reason
     assert store.get_claim(card.id) is None
 
 
@@ -222,7 +229,7 @@ def test_scheduler_daemon_tick_commits_and_recovers(tmp_path: Path):
     result = orch.executor.run(live_good.role, store.get_card(good.id))
     orch.submit_result(live_good, result, worker_id="w1", started_at=utc_now())
 
-    # Expire the stuck one.
+    # Expire the stuck one with retry budget already exhausted so it blocks.
     from dataclasses import replace
 
     store.clear_claim(stuck.id)
@@ -231,15 +238,15 @@ def test_scheduler_daemon_tick_commits_and_recovers(tmp_path: Path):
             claim_stuck,
             lease_expires_at=utc_now() - timedelta(seconds=30),
             worker_id="w-dead",
+            retry_count=1,
+            attempt=2,
         )
     )
 
     sched = SchedulerDaemon(orch, config=DaemonConfig(max_claims=2, max_idle_cycles=1))
     assert sched.run_once() is True
 
-    # Envelope applied; stuck card blocked. Good advanced to REVIEW and the
-    # scheduler may have refilled a new claim for it (that's fine — this test
-    # only checks that commit+recover ran, not the refill).
+    # Envelope applied; stuck card blocked.
     assert store.read_results() == []
     assert store.get_card(good.id).status == CardStatus.REVIEW
     assert store.get_card(stuck.id).status == CardStatus.BLOCKED

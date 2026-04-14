@@ -167,10 +167,23 @@ class CardEvent:
     duration_ms: int | None = None
     attempt: int | None = None
     raw_path: str | None = None
+    # v0.1.2 runtime lifecycle fields (PR4/M3). Present on events emitted
+    # by the runtime layer (claimed, finished, failed, timed_out, retried,
+    # claim_recovered, result_orphaned). None on legacy plain events.
+    event_type: str | None = None
+    claim_id: str | None = None
+    worker_id: str | None = None
+    failure_reason: str | None = None
+    failure_category: str | None = None
+    retry_of_claim_id: str | None = None
 
     @property
     def is_execution(self) -> bool:
         return self.role is not None
+
+    @property
+    def is_runtime(self) -> bool:
+        return self.event_type is not None
 
 
 @dataclass(slots=True)
@@ -257,6 +270,44 @@ class ExecutionClaim:
         return self.lease_expires_at < (now or utc_now())
 
 
+class FailureCategory(StrEnum):
+    """Why an executor attempt failed. Drives the retry matrix in PR4/M3.
+
+    - ``infrastructure``: executor raised or transport layer failed (LLM 5xx,
+      network, disk). Retryable up to ``RetryPolicy.infrastructure`` times.
+    - ``malformed``: agent returned but the response could not be parsed.
+      Not retried — the task-quality issue will recur.
+    - ``functional``: agent ran successfully and declined the card
+      (reviewer/verifier rejection). Not retried; goes straight to BLOCKED.
+    - ``lease_expiry``: scheduler detected an expired lease without an
+      envelope. Retryable once.
+    - ``timeout``: worker exceeded its role-specific timeout. Same retry
+      budget as ``lease_expiry`` in PR4.
+    """
+
+    INFRASTRUCTURE = "infrastructure"
+    MALFORMED = "malformed"
+    FUNCTIONAL = "functional"
+    LEASE_EXPIRY = "lease_expiry"
+    TIMEOUT = "timeout"
+
+
+@dataclass(slots=True)
+class RetryPolicy:
+    """Per-category retry budgets (plan §Retry Policy)."""
+
+    infrastructure: int = 2
+    lease_expiry: int = 1
+    timeout: int = 1
+    malformed: int = 0
+    functional: int = 0
+
+    def budget_for(self, category: "FailureCategory | None") -> int:
+        if category is None:
+            return 0
+        return int(getattr(self, category.value, 0))
+
+
 @dataclass(slots=True)
 class ExecutionResultEnvelope:
     """A worker's submitted outcome for one claim attempt."""
@@ -272,6 +323,7 @@ class ExecutionResultEnvelope:
     agent_result: AgentResult | None = None
     worker_id: str | None = None
     failure_reason: str | None = None
+    failure_category: FailureCategory | None = None
     resource_usage: ResourceUsage | None = None
 
 

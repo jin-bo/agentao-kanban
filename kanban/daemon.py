@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Iterator
 from uuid import uuid4
 
-from .models import ExecutionClaim, WorkerPresence, utc_now
+from .models import ExecutionClaim, FailureCategory, WorkerPresence, utc_now
 from .orchestrator import KanbanOrchestrator
 
 
@@ -359,12 +359,14 @@ class WorkerDaemon(_RoleDaemonBase):
 
     def _acquire_any_claim(self) -> ExecutionClaim | None:
         store = self.orchestrator.store
-        lease = self.orchestrator.lease_policy
         now = utc_now()
-        lease_expires = now + timedelta(seconds=lease.lease_seconds)
         for claim in store.list_claims():
             if claim.worker_id is not None:
                 continue
+            # Initial lease == role timeout, so a lease expiry is also the
+            # enforceable runtime timeout. The scheduler's stale recovery
+            # pass treats it as ``lease_expiry``.
+            lease_expires = now + timedelta(seconds=claim.timeout_s)
             acquired = store.try_acquire_claim(
                 claim.card_id,
                 worker_id=self.worker_id,
@@ -402,6 +404,7 @@ class WorkerDaemon(_RoleDaemonBase):
                 started_at=started_at,
                 ok=False,
                 failure_reason=f"executor raised {type(exc).__name__}: {exc}",
+                failure_category=FailureCategory.INFRASTRUCTURE,
             )
         else:
             self.orchestrator.submit_result(

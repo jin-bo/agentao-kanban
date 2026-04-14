@@ -38,6 +38,21 @@ class BoardStore(Protocol):
     def update_card(self, card_id: str, **updates: object) -> Card: ...
     def append_event(self, card_id: str, message: str) -> None: ...
     def append_execution_event(self, card_id: str, result: AgentResult) -> None: ...
+    def append_runtime_event(
+        self,
+        card_id: str,
+        *,
+        event_type: str,
+        message: str,
+        role: AgentRole | None = ...,
+        claim_id: str | None = ...,
+        worker_id: str | None = ...,
+        attempt: int | None = ...,
+        duration_ms: int | None = ...,
+        failure_reason: str | None = ...,
+        failure_category: str | None = ...,
+        retry_of_claim_id: str | None = ...,
+    ) -> None: ...
     def events_for_card(self, card_id: str) -> list[CardEvent]: ...
     def list_events(self, *, limit: int | None = ...) -> list[CardEvent]: ...
     def list_execution_events(
@@ -144,6 +159,37 @@ class InMemoryBoardStore:
 
     def append_event(self, card_id: str, message: str) -> None:
         self._events.append(CardEvent(card_id=card_id, message=message))
+
+    def append_runtime_event(
+        self,
+        card_id: str,
+        *,
+        event_type: str,
+        message: str,
+        role: "AgentRole | None" = None,
+        claim_id: str | None = None,
+        worker_id: str | None = None,
+        attempt: int | None = None,
+        duration_ms: int | None = None,
+        failure_reason: str | None = None,
+        failure_category: str | None = None,
+        retry_of_claim_id: str | None = None,
+    ) -> None:
+        self._events.append(
+            CardEvent(
+                card_id=card_id,
+                message=message,
+                role=role,
+                attempt=attempt,
+                duration_ms=duration_ms,
+                event_type=event_type,
+                claim_id=claim_id,
+                worker_id=worker_id,
+                failure_reason=failure_reason,
+                failure_category=failure_category,
+                retry_of_claim_id=retry_of_claim_id,
+            )
+        )
 
     def append_execution_event(self, card_id: str, result: AgentResult) -> None:
         self._events.append(
