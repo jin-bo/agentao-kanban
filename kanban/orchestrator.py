@@ -115,17 +115,12 @@ class KanbanOrchestrator:
 
         role = self._role_for(card)
 
-        # Transition ready → doing at claim time so scheduler owns all
-        # workflow-status transitions into executable states. Post-execution
-        # transitions stay in apply_claim_result (PR3 moves that into a
-        # dedicated committer).
-        if card.status == CardStatus.READY:
-            self.store.move_card(
-                card.id, CardStatus.DOING, "Dispatcher moved card to doing"
-            )
-            status_at_claim = CardStatus.DOING
-        else:
-            status_at_claim = card.status
+        # Status-at-claim reflects where the worker will see the card.
+        # READY → DOING at claim time so scheduler owns all workflow-status
+        # transitions into executable states.
+        status_at_claim = (
+            CardStatus.DOING if card.status == CardStatus.READY else card.status
+        )
 
         now = utc_now()
         lease_expires = now + timedelta(seconds=self.lease_policy.lease_seconds)
@@ -141,7 +136,25 @@ class KanbanOrchestrator:
             timeout_s=self.lease_policy.timeout_for(role),
             worker_id=worker_id,
         )
+
+        # Persist the claim BEFORE moving status. If create_claim raises
+        # (stale sentinel, fs error, duplicate), the card stays in READY —
+        # the scheduler will simply retry on the next tick. Only after the
+        # claim is safely on disk do we advance the card, so we can never
+        # leave a DOING card without a live claim.
         self.store.create_claim(claim)
+        if card.status == CardStatus.READY:
+            try:
+                self.store.move_card(
+                    card.id, CardStatus.DOING, "Dispatcher moved card to doing"
+                )
+            except Exception:
+                # Roll back the claim so the next tick can retry cleanly.
+                try:
+                    self.store.clear_claim(card.id, claim_id=claim.claim_id)
+                except Exception:  # noqa: BLE001 — best-effort rollback
+                    pass
+                raise
         return claim
 
     def apply_claim_result(

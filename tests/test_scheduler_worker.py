@@ -194,6 +194,26 @@ def test_scheduler_daemon_fills_up_to_max_claims(tmp_path: Path):
     assert len(store.list_claims()) == 2
 
 
+def test_scheduler_daemon_refreshes_external_unblock(tmp_path: Path):
+    store, orch = _make(tmp_path)
+    card = store.add_card(Card(title="t", goal="g"))
+    store.update_card(card.id, blocked_reason="waiting")
+    store.move_card(card.id, CardStatus.BLOCKED, "Blocked: waiting")
+
+    sched = SchedulerDaemon(orch, config=DaemonConfig(max_claims=1, max_idle_cycles=1))
+
+    external = MarkdownBoardStore(tmp_path)
+    external.update_card(card.id, blocked_reason=None)
+    external.move_card(card.id, CardStatus.READY, "Unblocked to ready")
+
+    assert sched.run_once() is True
+
+    fresh = MarkdownBoardStore(tmp_path)
+    claim = fresh.get_claim(card.id)
+    assert claim is not None
+    assert fresh.get_card(card.id).status == CardStatus.DOING
+
+
 def test_combined_daemon_runs_cards_to_completion(tmp_path: Path):
     store, orch = _make(tmp_path)
     card = store.add_card(

@@ -80,6 +80,13 @@ class MarkdownBoardStore:
         self._unparseable: list[str] = []
         self._load()
 
+    def refresh(self) -> None:
+        """Reload cards/events so long-running daemons observe external edits."""
+        self._cards = {}
+        self._events = []
+        self._unparseable = []
+        self._load()
+
     def add_card(self, card: Card) -> Card:
         self._cards[card.id] = card
         self._write_card(card)

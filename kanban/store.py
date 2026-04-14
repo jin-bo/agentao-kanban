@@ -30,6 +30,7 @@ def _tail(items: list, limit: int | None) -> list:
 
 @runtime_checkable
 class BoardStore(Protocol):
+    def refresh(self) -> None: ...
     def add_card(self, card: Card) -> Card: ...
     def get_card(self, card_id: str) -> Card: ...
     def list_cards(self) -> list[Card]: ...
@@ -121,6 +122,9 @@ class InMemoryBoardStore:
         self._results: list[ExecutionResultEnvelope] = []
         self._orphans: list[ExecutionResultEnvelope] = []
         self._workers: dict[str, WorkerPresence] = {}
+
+    def refresh(self) -> None:
+        return None
 
     def add_card(self, card: Card) -> Card:
         self._cards[card.id] = card

@@ -15,6 +15,7 @@ import os
 import signal
 import socket
 import sys
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -38,6 +39,13 @@ log = logging.getLogger("kanban.daemon")
 
 class DaemonLockError(RuntimeError):
     """Raised when another live process already holds the board lock."""
+
+
+def _refresh_store(store) -> None:
+    """Best-effort board refresh so daemon loops see external CLI edits."""
+    refresh = getattr(store, "refresh", None)
+    if callable(refresh):
+        refresh()
 
 
 def lock_path(board_dir: Path) -> Path:
@@ -178,6 +186,7 @@ class KanbanDaemon:
 
     def run_once(self) -> bool:
         """Run a single tick. Returns True if a card was processed."""
+        _refresh_store(self.orchestrator.store)
         card = self.orchestrator.tick()
         if card is None:
             return False
@@ -296,6 +305,7 @@ class SchedulerDaemon(_RoleDaemonBase):
         self.orchestrator = orchestrator
 
     def run_once(self) -> bool:
+        _refresh_store(self.orchestrator.store)
         # Commit any envelopes workers have submitted since last tick, then
         # recover any leases that expired during that window — both must run
         # before creating new claims so stale cards don't block new work.
@@ -359,14 +369,17 @@ class WorkerDaemon(_RoleDaemonBase):
 
     def _acquire_any_claim(self) -> ExecutionClaim | None:
         store = self.orchestrator.store
+        lease = self.orchestrator.lease_policy
         now = utc_now()
         for claim in store.list_claims():
             if claim.worker_id is not None:
                 continue
-            # Initial lease == role timeout, so a lease expiry is also the
-            # enforceable runtime timeout. The scheduler's stale recovery
-            # pass treats it as ``lease_expiry``.
-            lease_expires = now + timedelta(seconds=claim.timeout_s)
+            # Short lease (~lease_seconds). A background heartbeat thread
+            # renews it while executor.run() is running; see
+            # ``_heartbeat_claim``. If the worker crashes or hangs, renewal
+            # stops and the scheduler's stale recovery fires within
+            # lease_seconds — not ``timeout_s`` minutes later.
+            lease_expires = now + timedelta(seconds=lease.lease_seconds)
             acquired = store.try_acquire_claim(
                 claim.card_id,
                 worker_id=self.worker_id,
@@ -377,7 +390,69 @@ class WorkerDaemon(_RoleDaemonBase):
                 return acquired
         return None
 
+    @contextmanager
+    def _heartbeat_claim(self, claim: ExecutionClaim) -> Iterator[None]:
+        """Keep the claim's lease fresh while the body runs.
+
+        A daemon thread calls ``store.renew_claim`` every
+        ``lease_policy.heartbeat_seconds`` and pushes ``lease_expires_at``
+        forward by ``lease_seconds``. It stops renewing once elapsed time
+        exceeds ``claim.timeout_s`` — that is the runtime timeout, and the
+        scheduler's stale recovery path handles it as ``TIMEOUT``. It also
+        stops on any renew_claim failure (claim was cleared externally).
+
+        On exit we signal the thread, wait briefly for it to drain, and
+        leave. We don't bubble heartbeat errors — the worst case is a
+        premature stale recovery, which the runtime already handles.
+        """
+        lease = self.orchestrator.lease_policy
+        stop = threading.Event()
+        started = utc_now()
+
+        def loop() -> None:
+            while not stop.wait(lease.heartbeat_seconds):
+                now = utc_now()
+                elapsed = (now - started).total_seconds()
+                if elapsed >= claim.timeout_s:
+                    log.warning(
+                        "worker %s: claim %s exceeded timeout_s=%d; "
+                        "stopping heartbeat so scheduler can recover",
+                        self.worker_id,
+                        claim.claim_id,
+                        claim.timeout_s,
+                    )
+                    return
+                try:
+                    self.orchestrator.store.renew_claim(
+                        claim.card_id,
+                        claim_id=claim.claim_id,
+                        heartbeat_at=now,
+                        lease_expires_at=now
+                        + timedelta(seconds=lease.lease_seconds),
+                        worker_id=self.worker_id,
+                    )
+                except Exception:  # noqa: BLE001 — claim gone or fs error
+                    log.debug(
+                        "worker %s: heartbeat for %s failed; stopping",
+                        self.worker_id,
+                        claim.claim_id,
+                    )
+                    return
+
+        thread = threading.Thread(
+            target=loop,
+            name=f"kanban-heartbeat-{claim.claim_id}",
+            daemon=True,
+        )
+        thread.start()
+        try:
+            yield
+        finally:
+            stop.set()
+            thread.join(timeout=2.0)
+
     def run_once(self) -> bool:
+        _refresh_store(self.orchestrator.store)
         self._heartbeat()
         claim = self._acquire_any_claim()
         if claim is None:
@@ -391,29 +466,34 @@ class WorkerDaemon(_RoleDaemonBase):
             claim.role.value,
         )
         started_at = utc_now()
-        try:
-            result = self.orchestrator.executor.run(claim.role, card)
-        except Exception as exc:  # noqa: BLE001 — worker must never crash the loop
-            log.exception(
-                "worker %s executor raised on %s", self.worker_id, claim.card_id[:8]
-            )
-            self.orchestrator.submit_result(
-                claim,
-                None,
-                worker_id=self.worker_id,
-                started_at=started_at,
-                ok=False,
-                failure_reason=f"executor raised {type(exc).__name__}: {exc}",
-                failure_category=FailureCategory.INFRASTRUCTURE,
-            )
-        else:
-            self.orchestrator.submit_result(
-                claim,
-                result,
-                worker_id=self.worker_id,
-                started_at=started_at,
-                ok=True,
-            )
+        # Run executor under a heartbeat-renewed lease so a legitimate
+        # long run is not declared stale mid-flight.
+        with self._heartbeat_claim(claim):
+            try:
+                result = self.orchestrator.executor.run(claim.role, card)
+            except Exception as exc:  # noqa: BLE001 — worker must never crash loop
+                log.exception(
+                    "worker %s executor raised on %s",
+                    self.worker_id,
+                    claim.card_id[:8],
+                )
+                self.orchestrator.submit_result(
+                    claim,
+                    None,
+                    worker_id=self.worker_id,
+                    started_at=started_at,
+                    ok=False,
+                    failure_reason=f"executor raised {type(exc).__name__}: {exc}",
+                    failure_category=FailureCategory.INFRASTRUCTURE,
+                )
+            else:
+                self.orchestrator.submit_result(
+                    claim,
+                    result,
+                    worker_id=self.worker_id,
+                    started_at=started_at,
+                    ok=True,
+                )
         self._ticks += 1
         return True
 

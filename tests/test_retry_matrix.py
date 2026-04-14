@@ -188,27 +188,28 @@ def test_custom_retry_policy_zero_infra_blocks_first_failure(tmp_path: Path):
     assert store.get_card(card.id).status == CardStatus.BLOCKED
 
 
-# ---------- worker lease == timeout ----------
+# ---------- worker acquires with short lease (heartbeat renews) ----------
 
 
-def test_worker_acquire_sets_lease_to_role_timeout(tmp_path: Path):
+def test_worker_acquire_uses_short_lease_not_timeout(tmp_path: Path):
+    """Acquire should set a short lease (= lease_seconds). The heartbeat
+    thread in ``_heartbeat_claim`` pushes it forward; the role timeout is
+    enforced by total elapsed, not the initial lease window."""
     from kanban.daemon import DaemonConfig, WorkerDaemon
 
     store, orch = _make(tmp_path)
     _ready(store)
     claim = orch.select_and_claim(worker_id=None)
     assert claim is not None
-    # Default LeasePolicy: worker timeout is 1800s.
     worker_timeout = orch.lease_policy.timeout_for(AgentRole.WORKER)
-    assert claim.timeout_s == worker_timeout
+    assert claim.timeout_s == worker_timeout  # stored for heartbeat logic
 
-    # Acquire via the daemon helper. We don't run executor — only check the
-    # lease window was set to the timeout.
     worker = WorkerDaemon(orch, config=DaemonConfig(worker_id="wx"))
     acquired = worker._acquire_any_claim()
     assert acquired is not None
     lease_delta = (acquired.lease_expires_at - acquired.heartbeat_at).total_seconds()
-    assert abs(lease_delta - worker_timeout) < 5  # allow small clock skew
+    assert abs(lease_delta - orch.lease_policy.lease_seconds) < 5
+    assert lease_delta < worker_timeout  # must be much shorter than timeout
 
 
 # ---------- structured runtime events ----------
