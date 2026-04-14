@@ -69,6 +69,7 @@ class AgentaoMultiAgentExecutor:
         return spec
 
     def run(self, role: AgentRole, card: Card) -> AgentResult:
+        # Missing agent definition is a config error — not retryable.
         try:
             spec = self.spec_for(role)
         except FileNotFoundError as exc:
@@ -80,14 +81,48 @@ class AgentaoMultiAgentExecutor:
             agent = self.agent_factory(spec, self.working_directory)  # type: ignore[misc]
             raw = agent.chat(prompt, max_iterations=spec.max_turns)
         except Exception as exc:  # noqa: BLE001 — boundary to external harness
-            elapsed = int((time.monotonic() - t0) * 1000)
-            return _blocked_result(role, f"agentao call failed: {exc}", spec, elapsed, None)
+            # Let the infrastructure error surface. WorkerDaemon catches it
+            # and submits ok=False with FailureCategory.INFRASTRUCTURE, which
+            # the retry matrix honors (2 retries before BLOCKED). Treating
+            # a transient LLM 5xx / network blip as terminal here would turn
+            # every flake into a manual unblock.
+            raise RuntimeError(
+                f"agentao call failed ({role.value}): {exc}"
+            ) from exc
 
         elapsed_ms = int((time.monotonic() - t0) * 1000)
         parsed = _parse_response(raw)
+        # Agent self-declared failure = functional rejection. The matrix
+        # treats this as unretryable (agent ran fine, said no).
         if parsed.get("ok") is False:
             reason = str(parsed.get("blocked_reason") or "Agent reported failure")
             return _blocked_result(role, reason, spec, elapsed_ms, raw)
+
+        if role == AgentRole.PLANNER:
+            if not parsed.get("_structured"):
+                # Format drift (no ```json``` fence). Raise so the retry
+                # matrix can recover — a transient LLM formatting miss
+                # should not require manual recovery.
+                raise RuntimeError(
+                    "planner returned unstructured response "
+                    "(no ```json``` fence); retrying via infrastructure path"
+                )
+            criteria = parsed.get("acceptance_criteria")
+            normalized: list[str] = []
+            if isinstance(criteria, list):
+                normalized = [str(c).strip() for c in criteria if str(c).strip()]
+            # Only require fresh criteria when the card has none. Replans
+            # for a card that already has valid acceptance_criteria may
+            # legitimately omit the list — _apply_parsed preserves the
+            # existing criteria in that case.
+            if not normalized and not card.acceptance_criteria:
+                return _blocked_result(
+                    role,
+                    "planner must return 2-5 non-empty acceptance_criteria",
+                    spec,
+                    elapsed_ms,
+                    raw,
+                )
 
         return _apply_parsed(role, card, parsed, spec, elapsed_ms, raw)
 
@@ -156,9 +191,11 @@ def _parse_response(raw: str) -> dict[str, Any]:
         if isinstance(obj, dict):
             last_obj = obj
     if last_obj is not None:
+        last_obj["_structured"] = True
         return last_obj
     first_line = raw.strip().splitlines()[0] if raw.strip() else ""
     return {
+        "_structured": False,
         "ok": True,
         "summary": first_line[:120] or "Agent produced unstructured output.",
         "output": raw.strip(),
@@ -179,12 +216,11 @@ def _apply_parsed(
 
     if role == AgentRole.PLANNER:
         criteria = parsed.get("acceptance_criteria")
-        if isinstance(criteria, list) and criteria:
-            updates["acceptance_criteria"] = [str(c) for c in criteria]
-        elif not card.acceptance_criteria:
-            updates["acceptance_criteria"] = [
-                output if isinstance(output, str) and output else "Acceptance criteria TBD"
-            ]
+        normalized = []
+        if isinstance(criteria, list):
+            normalized = [str(c).strip() for c in criteria if str(c).strip()]
+        if normalized:
+            updates["acceptance_criteria"] = normalized
         if output is not None:
             outputs = dict(card.outputs)
             outputs[_OUTPUT_KEY[AgentRole.PLANNER]] = output

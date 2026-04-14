@@ -119,7 +119,13 @@ def test_verifier_rejection_blocks_card():
     assert "criterion 2" in result.updates["blocked_reason"]
 
 
-def test_agent_exception_blocks_card():
+def test_agent_exception_is_retryable_not_terminal():
+    """LLM-layer failures (``agent.chat`` raising) must surface as an
+    exception so the WorkerDaemon retry matrix treats them as
+    ``FailureCategory.INFRASTRUCTURE`` and retries — not as a terminal
+    BLOCKED that needs manual recovery."""
+    import pytest as _p
+
     class Boom:
         def chat(self, *a, **kw):
             raise RuntimeError("llm offline")
@@ -127,9 +133,10 @@ def test_agent_exception_blocks_card():
     ex = AgentaoMultiAgentExecutor(
         agents_dir=REPO_AGENTS_DIR, agent_factory=lambda spec, wd: Boom()
     )
-    result = ex.run(AgentRole.WORKER, Card(title="t", goal="g"))
-    assert result.next_status == CardStatus.BLOCKED
-    assert "llm offline" in result.updates["blocked_reason"]
+    with _p.raises(RuntimeError) as exc:
+        ex.run(AgentRole.WORKER, Card(title="t", goal="g"))
+    assert "agentao call failed" in str(exc.value)
+    assert "llm offline" in str(exc.value)
 
 
 def test_missing_definition_blocks_card(tmp_path: Path):
@@ -140,6 +147,49 @@ def test_missing_definition_blocks_card(tmp_path: Path):
     result = ex.run(AgentRole.PLANNER, Card(title="t", goal="g"))
     assert result.next_status == CardStatus.BLOCKED
     assert "agent definition missing" in result.updates["blocked_reason"]
+
+
+def test_planner_unstructured_response_is_retryable_not_terminal():
+    """A planner response without a ```json``` fence is format drift, not
+    a terminal failure. The executor raises so the retry matrix can
+    recover; manual unblock is only needed after the retry budget is
+    exhausted (infrastructure = 2 retries by default)."""
+    import pytest as _p
+
+    ex, _, _ = _executor_with("Just some free-form text, no JSON here.")
+    with _p.raises(RuntimeError) as exc:
+        ex.run(AgentRole.PLANNER, Card(title="t", goal="g"))
+    assert "unstructured response" in str(exc.value)
+
+
+def test_planner_without_acceptance_criteria_blocks_fresh_card():
+    """For a fresh card (no existing criteria), the planner still must
+    return criteria — otherwise downstream roles have nothing to verify."""
+    ex, _, _ = _executor_with('```json\n{"ok": true, "summary": "planned"}\n```')
+    result = ex.run(AgentRole.PLANNER, Card(title="t", goal="g"))
+    assert result.next_status == CardStatus.BLOCKED
+    assert "non-empty acceptance_criteria" in result.updates["blocked_reason"]
+
+
+def test_planner_replan_preserves_existing_acceptance_criteria():
+    """A card bouncing back to INBOX for replan already has usable
+    criteria. The planner is allowed to omit ``acceptance_criteria`` and
+    only refine the decision/output; the existing criteria survive."""
+    ex, _, _ = _executor_with(
+        '```json\n{"ok": true, "summary": "replanned", '
+        '"output": "keep scope"}\n```'
+    )
+    card = Card(
+        title="t",
+        goal="g",
+        acceptance_criteria=["existing crit 1", "existing crit 2"],
+    )
+    result = ex.run(AgentRole.PLANNER, card)
+    # Not BLOCKED — the card progresses to the planner's next state.
+    assert result.next_status != CardStatus.BLOCKED
+    # Existing criteria were NOT replaced (no acceptance_criteria field in
+    # updates → Card retains its prior list).
+    assert "acceptance_criteria" not in result.updates
 
 
 def test_unstructured_response_still_progresses():
