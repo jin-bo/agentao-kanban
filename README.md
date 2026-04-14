@@ -188,7 +188,76 @@ mkdir -p .agentao/agents
 cp docs/agent-definitions/*.md .agentao/agents/
 ```
 
-## 下一步
+## v0.1.2 并发内核
 
-- 每卡锁(`workspace/board/cards/<id>.lock`)与多卡并发
-- ACP 远端 worker、持久队列、可观测性(Phase 2)
+`v0.1.2` 把单进程串行 dispatcher 拆成 scheduler / worker 两种角色,允许多
+worker 在同一 board 上并发执行不同卡,同时保留「只有调度器写状态」这条
+核心不变式。完整设计:`docs/v0.1.2-concurrency-plan.md`。
+
+### Daemon 角色
+
+```bash
+uv run kanban daemon                              # = --role all(scheduler + 1 worker 同进程)
+uv run kanban daemon --role scheduler --max-claims 4
+uv run kanban daemon --role worker --worker-id worker-1
+uv run kanban daemon --role legacy-serial         # v0.1.1 的串行路径,兼容用
+```
+
+- `scheduler` 持 `.daemon.lock`,负责建 claim、commit 结果、回收过期 lease;
+  全板只能有一个。
+- `worker` 不持板锁,可开多个进程/机器;通过 `runtime/claims/<card>.json`
+  的原子 `O_EXCL` sentinel CAS 互斥地抢 claim,执行后只写
+  `runtime/results/<card>-<attempt>.json` envelope,**不再直接改卡状态**。
+- `all` 是本地便利模式(同进程里跑一个 scheduler + 一个 worker),真并行
+  请跑独立进程。
+
+### 运行时布局
+
+```text
+workspace/board/
+  cards/                          # 看板权威(不变)
+  events.log                      # 追加 runtime 生命周期事件
+  runtime/
+    claims/<card>.json            # 单个 card 同时最多一条活 claim
+    results/<card>-<attempt>.json # worker 提交的 envelope,等调度器 commit
+    results/orphans/              # claim_id 不匹配的孤儿 envelope(保留审计)
+    workers/<worker-id>.json      # worker 心跳存在文件
+```
+
+### 重试矩阵
+
+失败按 `FailureCategory` 分类(worker / scheduler 在 envelope 上打标),
+命中矩阵就重试,耗尽预算就 BLOCKED(原因带 `[category=... attempts=...]`):
+
+| 类别 | 默认预算 | 语义 |
+|---|---|---|
+| `infrastructure` | 2 | executor 抛异常 / LLM 5xx |
+| `lease_expiry` | 1 | scheduler 检到租约过期 |
+| `timeout` | 1 | 同上(lease 即 timeout) |
+| `malformed` | 0 | 响应无法解析,立即 BLOCKED |
+| `functional` | 0 | reviewer/verifier 业务驳回,立即 BLOCKED |
+
+重试时新建 claim(attempt+1 + `retry_of_claim_id` 指回上次),
+`execution.retried` 事件带整条链路。改默认:传
+`KanbanOrchestrator(retry_policy=RetryPolicy(infrastructure=0))`。
+
+### 运行时观测 CLI
+
+```bash
+uv run kanban claims                     # 所有活 claim: lease 剩余 / 心跳年龄 / 归属 worker
+uv run kanban claims <card_id>           # 单卡过滤
+uv run kanban claims --json              # 机读
+uv run kanban workers                    # 活跃 worker: pid / uptime / 最近心跳
+uv run kanban recover --stale            # 一次性跑过期 claim 恢复,输出每卡处置(retried / blocked)
+uv run kanban events <id>                # 事件行按 event_type 分组打标([execution.retried] 等)
+uv run kanban events <id> --json         # 带 claim_id / worker_id / failure_category / retry_of_claim_id 等字段
+```
+
+`claims` 里 `*EXPIRED*` 表示租约已过但 scheduler 还没跑到恢复步(下一次
+`daemon --role scheduler` 或 `recover --stale` 就会处理)。
+
+### 下一步 (Phase 2)
+
+- ACP 远端 worker、跨机部署
+- 持久队列(替代 `runtime/` 文件集),事件流化
+- 观测面板、重试链时间线、资源占用曲线
