@@ -148,14 +148,28 @@ def test_two_workers_process_two_cards_concurrently(tmp_path: Path):
         orch2, config=DaemonConfig(max_idle_cycles=1, worker_id="worker-2")
     )
 
-    # Each worker runs exactly one tick.
+    # Each worker runs exactly one tick → each writes a result envelope.
     r1 = w1.run_once()
     r2 = w2.run_once()
     assert r1 and r2
 
-    # Both claims cleared post-execution.
+    # Envelopes are pending commit; claims are still live (assigned to each worker).
+    pending = MarkdownBoardStore(tmp_path).read_results()
+    assert {e.card_id for e in pending} == {a.id, b.id}
+    live_claims = MarkdownBoardStore(tmp_path).list_claims()
+    assert {c.worker_id for c in live_claims} == {"worker-1", "worker-2"}
+
+    # Scheduler commits both envelopes.
+    committer_store = MarkdownBoardStore(tmp_path)
+    committer = KanbanOrchestrator(
+        store=committer_store, executor=MockAgentaoExecutor()
+    )
+    assert committer.commit_pending_results() == 2
+
+    # Now claims and envelopes are cleared.
     fresh = MarkdownBoardStore(tmp_path)
     assert fresh.list_claims() == []
+    assert fresh.read_results() == []
     # And both workers left presence records.
     worker_ids = {p.worker_id for p in fresh.list_workers()}
     assert worker_ids == {"worker-1", "worker-2"}

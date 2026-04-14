@@ -12,7 +12,10 @@ from .models import (
     CardPriority,
     CardStatus,
     ExecutionClaim,
+    ExecutionEventType,
+    ExecutionResultEnvelope,
     LeasePolicy,
+    ResourceUsage,
     utc_now,
 )
 from .store import BoardStore
@@ -136,18 +139,129 @@ class KanbanOrchestrator:
     def apply_claim_result(
         self, claim: ExecutionClaim, result: AgentResult
     ) -> Card:
-        """Worker step: commit an executor result and clear the claim.
+        """Legacy single-process commit path (used by ``tick()`` and
+        ``--role legacy-serial``).
 
-        This is the single path that persists an executor outcome. PR3 will
-        promote it into a dedicated committer with claim_id/attempt validation;
-        for now it is a straight wrapper around the legacy ``_apply_result``.
+        In the PR2/PR3 split topology, workers call :meth:`submit_result`
+        instead and the scheduler/committer picks the envelope up via
+        :meth:`commit_pending_results`. This method remains so the serial
+        path does not incur the envelope round-trip.
         """
         self._apply_result(claim.card_id, result)
-        # Clear the claim unconditionally (claim_id check happens at the
-        # call sites that hold the claim_id). Scheduler is the only other
-        # writer and won't replace a live claim.
         self.store.clear_claim(claim.card_id, claim_id=claim.claim_id)
         return self.store.get_card(claim.card_id)
+
+    # ---------- v0.1.2 commit path (PR3/M2) ----------
+
+    def submit_result(
+        self,
+        claim: ExecutionClaim,
+        result: AgentResult | None,
+        *,
+        worker_id: str,
+        started_at,
+        finished_at=None,
+        ok: bool = True,
+        failure_reason: str | None = None,
+        resource_usage: ResourceUsage | None = None,
+    ) -> ExecutionResultEnvelope:
+        """Worker step: persist the executor outcome as an envelope.
+
+        The worker MUST NOT move the card or clear the claim after calling
+        this; :meth:`commit_pending_results` (scheduler-side) is the sole
+        writer of post-execution workflow status transitions.
+        """
+        finished = finished_at or utc_now()
+        duration_ms = int((finished - started_at).total_seconds() * 1000)
+        envelope = ExecutionResultEnvelope(
+            card_id=claim.card_id,
+            claim_id=claim.claim_id,
+            role=claim.role,
+            attempt=claim.attempt,
+            started_at=started_at,
+            finished_at=finished,
+            duration_ms=duration_ms,
+            ok=ok,
+            agent_result=result,
+            worker_id=worker_id,
+            failure_reason=failure_reason,
+            resource_usage=resource_usage,
+        )
+        self.store.write_result(envelope)
+        outcome = (
+            ExecutionEventType.FINISHED.value if ok else ExecutionEventType.FAILED.value
+        )
+        self.store.append_event(
+            claim.card_id,
+            f"[{outcome}] claim={claim.claim_id} worker={worker_id} "
+            f"attempt={claim.attempt} duration_ms={duration_ms}"
+            + (f" reason={failure_reason}" if failure_reason else ""),
+        )
+        return envelope
+
+    def commit_pending_results(self) -> int:
+        """Scheduler/committer: apply any pending result envelopes.
+
+        For each envelope: verify it references the current live claim
+        (``claim_id`` match). On match — apply the result and clear the
+        claim. On mismatch or missing claim — quarantine as an orphan and
+        emit ``execution.result_orphaned``. Returns the number committed.
+        """
+        committed = 0
+        for env in self.store.read_results():
+            claim = self.store.get_claim(env.card_id)
+            if claim is None or claim.claim_id != env.claim_id:
+                self._emit_orphan(env, claim)
+                self.store.quarantine_result(env.card_id, env.attempt)
+                continue
+            if env.ok and env.agent_result is not None:
+                self._apply_result(env.card_id, env.agent_result)
+            else:
+                reason = env.failure_reason or "executor reported failure"
+                self.store.update_card(env.card_id, blocked_reason=reason)
+                self.store.move_card(
+                    env.card_id, CardStatus.BLOCKED, f"Blocked: {reason}"
+                )
+            self.store.clear_claim(env.card_id, claim_id=env.claim_id)
+            self.store.delete_result(env.card_id, env.attempt)
+            committed += 1
+        return committed
+
+    def recover_stale_claims(self, *, now=None) -> int:
+        """Scheduler: move cards with expired leases to BLOCKED and clear claims.
+
+        PR4 will add retries; here we deterministically block so the operator
+        can requeue. Returns the number of claims recovered.
+        """
+        stale = self.store.list_stale_claims(now=now or utc_now())
+        for claim in stale:
+            reason = (
+                f"runtime lease expired on attempt {claim.attempt} "
+                f"(role={claim.role.value}, claim={claim.claim_id})"
+            )
+            self.store.update_card(claim.card_id, blocked_reason=reason)
+            self.store.move_card(
+                claim.card_id, CardStatus.BLOCKED, f"Blocked: {reason}"
+            )
+            self.store.clear_claim(claim.card_id, claim_id=claim.claim_id)
+            self.store.append_event(
+                claim.card_id,
+                f"[{ExecutionEventType.CLAIM_RECOVERED.value}] "
+                f"claim={claim.claim_id} role={claim.role.value} "
+                f"attempt={claim.attempt}",
+            )
+        return len(stale)
+
+    def _emit_orphan(
+        self, env: ExecutionResultEnvelope, live_claim: ExecutionClaim | None
+    ) -> None:
+        live_id = live_claim.claim_id if live_claim is not None else "<none>"
+        self.store.append_event(
+            env.card_id,
+            f"[{ExecutionEventType.RESULT_ORPHANED.value}] "
+            f"envelope_claim={env.claim_id} live_claim={live_id} "
+            f"attempt={env.attempt} worker={env.worker_id}",
+        )
 
     def run_until_idle(self, max_steps: int = 20) -> list[Card]:
         processed: list[Card] = []

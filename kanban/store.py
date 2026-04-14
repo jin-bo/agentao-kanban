@@ -90,6 +90,8 @@ class BoardStore(Protocol):
         self, *, card_id: str | None = ...
     ) -> list[ExecutionResultEnvelope]: ...
     def delete_result(self, card_id: str, attempt: int) -> None: ...
+    def quarantine_result(self, card_id: str, attempt: int) -> None: ...
+    def list_orphan_results(self) -> list[ExecutionResultEnvelope]: ...
 
     def heartbeat_worker(self, presence: WorkerPresence) -> WorkerPresence: ...
     def list_workers(self) -> list[WorkerPresence]: ...
@@ -102,6 +104,7 @@ class InMemoryBoardStore:
         self._events: list[CardEvent] = []
         self._claims: dict[str, ExecutionClaim] = {}
         self._results: list[ExecutionResultEnvelope] = []
+        self._orphans: list[ExecutionResultEnvelope] = []
         self._workers: dict[str, WorkerPresence] = {}
 
     def add_card(self, card: Card) -> Card:
@@ -131,6 +134,10 @@ class InMemoryBoardStore:
         for key, value in updates.items():
             if key == "context_refs":
                 value = [ContextRef.coerce(v) for v in value]  # type: ignore[arg-type]
+            elif key == "owner_role" and isinstance(value, str):
+                value = AgentRole(value)
+            elif key == "status" and isinstance(value, str):
+                value = CardStatus(value)
             setattr(card, key, value)
         card.updated_at = utc_now()
         return card
@@ -296,6 +303,16 @@ class InMemoryBoardStore:
             for r in self._results
             if not (r.card_id == card_id and r.attempt == attempt)
         ]
+
+    def quarantine_result(self, card_id: str, attempt: int) -> None:
+        for r in list(self._results):
+            if r.card_id == card_id and r.attempt == attempt:
+                self._results.remove(r)
+                self._orphans.append(r)
+                return
+
+    def list_orphan_results(self) -> list[ExecutionResultEnvelope]:
+        return list(self._orphans)
 
     def heartbeat_worker(self, presence: WorkerPresence) -> WorkerPresence:
         self._workers[presence.worker_id] = presence

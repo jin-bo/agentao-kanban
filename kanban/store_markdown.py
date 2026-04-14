@@ -108,6 +108,10 @@ class MarkdownBoardStore:
         for key, value in updates.items():
             if key == "context_refs":
                 value = [ContextRef.coerce(v) for v in value]  # type: ignore[arg-type]
+            elif key == "owner_role" and isinstance(value, str):
+                value = AgentRole(value)
+            elif key == "status" and isinstance(value, str):
+                value = CardStatus(value)
             setattr(card, key, value)
         card.updated_at = utc_now()
         self._write_card(card)
@@ -406,6 +410,44 @@ class MarkdownBoardStore:
             self._result_path(card_id, attempt).unlink()
         except FileNotFoundError:
             pass
+
+    def quarantine_result(self, card_id: str, attempt: int) -> None:
+        """Move an orphan result envelope into runtime/results/orphans/.
+
+        Used when the result's claim_id no longer matches the live claim
+        (the card was recovered / re-claimed). The envelope is preserved for
+        audit rather than applied or deleted.
+        """
+        src = self._result_path(card_id, attempt)
+        if not src.is_file():
+            return
+        dest_dir = self.results_dir / "orphans"
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest = dest_dir / src.name
+        # Retain uniqueness if the same (card, attempt) has been quarantined
+        # before — append a short suffix from the claim_id inside the file.
+        if dest.exists():
+            try:
+                data = json.loads(src.read_text(encoding="utf-8"))
+                suffix = str(data.get("claim_id", "x"))[:8]
+            except (OSError, json.JSONDecodeError):
+                suffix = "dup"
+            dest = dest_dir / f"{src.stem}-{suffix}.json"
+        os.replace(src, dest)
+
+    def list_orphan_results(self) -> list[ExecutionResultEnvelope]:
+        orphan_dir = self.results_dir / "orphans"
+        if not orphan_dir.is_dir():
+            return []
+        out: list[ExecutionResultEnvelope] = []
+        for path in sorted(orphan_dir.glob("*.json")):
+            try:
+                out.append(
+                    _result_from_json(json.loads(path.read_text(encoding="utf-8")))
+                )
+            except (json.JSONDecodeError, KeyError, ValueError) as exc:
+                _LOG.warning("Skipping unparseable orphan %s: %s", path.name, exc)
+        return out
 
     def heartbeat_worker(self, presence: WorkerPresence) -> WorkerPresence:
         self.workers_dir.mkdir(parents=True, exist_ok=True)

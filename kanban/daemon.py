@@ -296,12 +296,17 @@ class SchedulerDaemon(_RoleDaemonBase):
         self.orchestrator = orchestrator
 
     def run_once(self) -> bool:
-        store = self.orchestrator.store
-        live = [c for c in store.list_claims()]
-        if len(live) >= self.config.max_claims:
-            return False
+        # Commit any envelopes workers have submitted since last tick, then
+        # recover any leases that expired during that window — both must run
+        # before creating new claims so stale cards don't block new work.
+        committed = self.orchestrator.commit_pending_results()
+        recovered = self.orchestrator.recover_stale_claims()
 
-        # Create unassigned claims up to the remaining budget.
+        store = self.orchestrator.store
+        live = store.list_claims()
+        if len(live) >= self.config.max_claims:
+            return bool(committed or recovered)
+
         created = False
         budget = self.config.max_claims - len(live)
         for _ in range(budget):
@@ -317,7 +322,7 @@ class SchedulerDaemon(_RoleDaemonBase):
                 claim.role.value,
                 claim.attempt,
             )
-        return created
+        return bool(created or committed or recovered)
 
 
 class WorkerDaemon(_RoleDaemonBase):
@@ -383,8 +388,29 @@ class WorkerDaemon(_RoleDaemonBase):
             claim.card_id[:8],
             claim.role.value,
         )
-        result = self.orchestrator.executor.run(claim.role, card)
-        self.orchestrator.apply_claim_result(claim, result)
+        started_at = utc_now()
+        try:
+            result = self.orchestrator.executor.run(claim.role, card)
+        except Exception as exc:  # noqa: BLE001 — worker must never crash the loop
+            log.exception(
+                "worker %s executor raised on %s", self.worker_id, claim.card_id[:8]
+            )
+            self.orchestrator.submit_result(
+                claim,
+                None,
+                worker_id=self.worker_id,
+                started_at=started_at,
+                ok=False,
+                failure_reason=f"executor raised {type(exc).__name__}: {exc}",
+            )
+        else:
+            self.orchestrator.submit_result(
+                claim,
+                result,
+                worker_id=self.worker_id,
+                started_at=started_at,
+                ok=True,
+            )
         self._ticks += 1
         return True
 
