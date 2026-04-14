@@ -102,15 +102,18 @@ class KanbanOrchestrator:
         serial path passes `worker_id="local"` so the returned claim is
         immediately owned.
 
-        Returns None if no card is actionable or if creating a new claim
-        would exceed `wip_policy.doing_limit`.
+        Walks actionable cards in priority order and skips any that
+        already have a live claim — one claimed front card must not
+        prevent the scheduler from filling remaining ``max_claims``
+        capacity behind it. Returns ``None`` only when *every* actionable
+        card is already claimed or there is no actionable card at all.
         """
-        card = self._next_actionable_card()
+        card: Card | None = None
+        for candidate in self._iter_actionable_cards():
+            if self.store.get_claim(candidate.id) is None:
+                card = candidate
+                break
         if card is None:
-            return None
-        # Skip any card that already has a live claim (scheduler-only writer
-        # to the claim namespace, so this is sufficient without fcntl).
-        if self.store.get_claim(card.id) is not None:
             return None
 
         role = self._role_for(card)
@@ -281,7 +284,14 @@ class KanbanOrchestrator:
     def recover_stale_claims(self, *, now=None) -> int:
         """Scheduler: handle claims whose lease has expired (plan §Stuck Task
         Recovery). Categorized as ``lease_expiry``; consults the retry matrix
-        to either create a linked replacement claim or block the card."""
+        to either create a linked replacement claim or block the card.
+
+        The actual claim-clear + replacement runs under the transactional
+        guarantees of :meth:`_retry_or_block`: the stale claim is only
+        dropped once the replacement state (retry claim OR BLOCKED) is
+        durably established, so a mid-recovery failure can't strand the
+        card in an execution status without a claim.
+        """
         stale = self.store.list_stale_claims(now=now or utc_now())
         for claim in stale:
             reason = (
@@ -299,10 +309,7 @@ class KanbanOrchestrator:
                 failure_category=FailureCategory.LEASE_EXPIRY.value,
                 failure_reason=reason,
             )
-            self.store.clear_claim(claim.card_id, claim_id=claim.claim_id)
-            self._retry_or_block(
-                claim, FailureCategory.LEASE_EXPIRY, reason, original_status=None
-            )
+            self._retry_or_block(claim, FailureCategory.LEASE_EXPIRY, reason)
         return len(stale)
 
     # ---------- retry matrix ----------
@@ -316,8 +323,11 @@ class KanbanOrchestrator:
     ) -> ExecutionClaim:
         """Create a linked replacement claim with ``attempt+1``.
 
-        Leaves card status unchanged; the next worker picks up the new claim
-        in the same status as the failed attempt. Emits ``execution.retried``.
+        Transactional rollback: the old claim is cleared first so the
+        store-level uniqueness check accepts the new claim. If
+        ``create_claim`` then raises, we restore the original claim so the
+        card never ends up in an execution status without a live claim.
+        Emits ``execution.retried`` on success.
         """
         from uuid import uuid4
 
@@ -337,7 +347,18 @@ class KanbanOrchestrator:
             retry_count=previous.retry_count + 1,
             retry_of_claim_id=previous.claim_id,
         )
-        self.store.create_claim(new_claim)
+
+        self.store.clear_claim(previous.card_id, claim_id=previous.claim_id)
+        try:
+            self.store.create_claim(new_claim)
+        except Exception:
+            # Rollback: restore the old claim so the card isn't stranded.
+            try:
+                self.store.create_claim(previous)
+            except Exception:  # noqa: BLE001 — best-effort rollback
+                pass
+            raise
+
         self.store.append_runtime_event(
             new_claim.card_id,
             event_type=ExecutionEventType.RETRIED.value,
@@ -356,35 +377,46 @@ class KanbanOrchestrator:
     ) -> None:
         category = env.failure_category or FailureCategory.INFRASTRUCTURE
         reason = env.failure_reason or "executor reported failure"
-        # Always clear the old claim first; retry creates a fresh one so a
-        # duplicate-create conflict can't hit us.
-        self.store.clear_claim(env.card_id, claim_id=env.claim_id)
-        self._retry_or_block(claim, category, reason, original_status=None)
+        # ``_retry_or_block`` owns the clear-old-claim step; it keeps the
+        # claim alive until the replacement state is durable.
+        self._retry_or_block(claim, category, reason)
 
     def _retry_or_block(
         self,
         failed_claim: ExecutionClaim,
         category: FailureCategory,
         reason: str,
-        *,
-        original_status: CardStatus | None,
     ) -> None:
-        """Apply retry matrix: either link a new claim or BLOCK the card."""
+        """Apply retry matrix: either link a new claim or BLOCK the card.
+
+        Invariant: a card is never left in an execution status (DOING /
+        REVIEW / VERIFY) without either a live claim or a completed
+        terminal transition to BLOCKED. Both paths below enforce this:
+
+        - Retry: :meth:`retry_claim` clears → creates with rollback on
+          failure (old claim restored).
+        - Block: move the card to BLOCKED *first*, then clear the claim.
+          If ``update_card`` or ``move_card`` raises, the claim is still
+          live and the next scheduler tick can redo the recovery.
+        """
         budget = self.retry_policy.budget_for(category)
         retries_used = failed_claim.retry_count
         if retries_used < budget:
             self.retry_claim(failed_claim, reason=reason, category=category)
             return
 
-        # Exhausted — move to BLOCKED with a runtime reason that names the
-        # failure class (plan: "blocking reason should include the last
-        # runtime failure class, not just a human summary").
+        # Exhausted — terminal BLOCKED transition FIRST (card status moves
+        # out of any execution state), THEN clear the claim. If the move
+        # fails, the old claim is preserved so recovery can retry.
         block_reason = (
             f"{reason} [category={category.value} attempts={failed_claim.attempt}]"
         )
         self.store.update_card(failed_claim.card_id, blocked_reason=block_reason)
         self.store.move_card(
             failed_claim.card_id, CardStatus.BLOCKED, f"Blocked: {block_reason}"
+        )
+        self.store.clear_claim(
+            failed_claim.card_id, claim_id=failed_claim.claim_id
         )
 
     def _emit_orphan(
@@ -431,27 +463,37 @@ class KanbanOrchestrator:
                 return False
         return True
 
-    def _first_ready(self, status: CardStatus) -> Card | None:
+    def _ready_cards(self, status: CardStatus):
+        """Yield all dependency-satisfied cards in ``status`` (priority order)."""
         for card in self.store.list_by_status(status):
             if self._deps_satisfied(card):
-                return card
-        return None
+                yield card
+
+    def _first_ready(self, status: CardStatus) -> Card | None:
+        return next(iter(self._ready_cards(status)), None)
 
     def _next_actionable_card(self) -> Card | None:
-        # Work already in the pipeline first (finish what you started).
+        return next(iter(self._iter_actionable_cards()), None)
+
+    def _iter_actionable_cards(self):
+        """Yield every actionable card in scheduler priority order.
+
+        Order:
+          1. Finish-what-you-started: VERIFY, then REVIEW.
+          2. If WIP budget allows, READY (pulled into DOING on claim).
+          3. Planning: INBOX (does not count against WIP).
+
+        ``select_and_claim`` iterates this generator and skips candidates
+        that already have a live claim, so one claimed front card cannot
+        starve the scheduler's remaining capacity.
+        """
         for status in (CardStatus.VERIFY, CardStatus.REVIEW):
-            card = self._first_ready(status)
-            if card is not None:
-                return card
+            yield from self._ready_cards(status)
 
-        wip_count = self._wip_count()
-        if wip_count < self.wip_policy.doing_limit:
-            ready = self._first_ready(CardStatus.READY)
-            if ready is not None:
-                return ready
+        if self._wip_count() < self.wip_policy.doing_limit:
+            yield from self._ready_cards(CardStatus.READY)
 
-        # Planning (INBOX) does not count against WIP — only executing work does.
-        return self._first_ready(CardStatus.INBOX)
+        yield from self._ready_cards(CardStatus.INBOX)
 
     def _role_for(self, card: Card) -> AgentRole:
         mapping = {
