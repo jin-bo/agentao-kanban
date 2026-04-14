@@ -477,25 +477,64 @@ class WorkerDaemon(_RoleDaemonBase):
                     self.worker_id,
                     claim.card_id[:8],
                 )
-                self.orchestrator.submit_result(
+                self._submit_safe(
                     claim,
                     None,
-                    worker_id=self.worker_id,
                     started_at=started_at,
                     ok=False,
                     failure_reason=f"executor raised {type(exc).__name__}: {exc}",
                     failure_category=FailureCategory.INFRASTRUCTURE,
                 )
             else:
-                self.orchestrator.submit_result(
+                self._submit_safe(
                     claim,
                     result,
-                    worker_id=self.worker_id,
                     started_at=started_at,
                     ok=True,
                 )
         self._ticks += 1
         return True
+
+    def _submit_safe(
+        self,
+        claim: ExecutionClaim,
+        result,
+        *,
+        started_at,
+        ok: bool = True,
+        failure_reason: str | None = None,
+        failure_category: FailureCategory | None = None,
+    ) -> None:
+        """Persist the envelope, but never let a persistence error crash
+        the worker loop.
+
+        If ``write_result`` raises (``FileExistsError`` for a duplicate
+        submission, disk full, corrupt runtime dir, …), we log loudly and
+        return. The claim is still live; its lease will expire, the
+        scheduler will recover it via the stale-claim path, and the
+        retry matrix handles the rest. The alternative — crashing — would
+        leave the claim holding a slot with nothing coming, until lease
+        expiry anyway, with the added damage of killing the worker.
+        """
+        try:
+            self.orchestrator.submit_result(
+                claim,
+                result,
+                worker_id=self.worker_id,
+                started_at=started_at,
+                ok=ok,
+                failure_reason=failure_reason,
+                failure_category=failure_category,
+            )
+        except Exception:  # noqa: BLE001 — worker must never crash loop
+            log.exception(
+                "worker %s failed to persist result envelope for claim %s "
+                "(card %s). Claim kept live; scheduler will recover on "
+                "lease expiry.",
+                self.worker_id,
+                claim.claim_id,
+                claim.card_id[:8],
+            )
 
     def run(self) -> int:
         self._heartbeat()

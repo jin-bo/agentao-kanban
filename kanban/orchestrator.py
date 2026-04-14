@@ -192,9 +192,17 @@ class KanbanOrchestrator:
     ) -> ExecutionResultEnvelope:
         """Worker step: persist the executor outcome as an envelope.
 
+        Emits **no** runtime events. An envelope's authenticity cannot be
+        verified until :meth:`commit_pending_results` (scheduler-side)
+        validates the claim_id + worker_id match. Authoritative
+        ``execution.finished`` / ``execution.failed`` events are emitted
+        there, after ownership checks pass. A forged envelope is
+        quarantined and logged as ``execution.result_orphaned`` — it
+        cannot leave a success/failure entry in the trusted audit trail.
+
         The worker MUST NOT move the card or clear the claim after calling
-        this; :meth:`commit_pending_results` (scheduler-side) is the sole
-        writer of post-execution workflow status transitions.
+        this; the committer is the sole writer of post-execution
+        workflow status transitions.
         """
         finished = finished_at or utc_now()
         duration_ms = int((finished - started_at).total_seconds() * 1000)
@@ -214,27 +222,6 @@ class KanbanOrchestrator:
             resource_usage=resource_usage,
         )
         self.store.write_result(envelope)
-        event_type = (
-            ExecutionEventType.FINISHED.value if ok else ExecutionEventType.FAILED.value
-        )
-        self.store.append_runtime_event(
-            claim.card_id,
-            event_type=event_type,
-            message=(
-                failure_reason
-                if failure_reason
-                else (result.summary if result else "executor finished")
-            ),
-            role=claim.role,
-            claim_id=claim.claim_id,
-            worker_id=worker_id,
-            attempt=claim.attempt,
-            duration_ms=duration_ms,
-            failure_reason=failure_reason,
-            failure_category=(
-                failure_category.value if failure_category is not None else None
-            ),
-        )
         return envelope
 
     def commit_pending_results(self) -> int:
@@ -272,6 +259,38 @@ class KanbanOrchestrator:
                 self.store.quarantine_result(env.card_id, env.claim_id)
                 processed += 1
                 continue
+            # Ownership verified — emit the authoritative lifecycle event
+            # BEFORE applying side effects so the audit trail reflects the
+            # trusted outcome even if apply/block transitions fail later.
+            event_type = (
+                ExecutionEventType.FINISHED.value
+                if env.ok
+                else ExecutionEventType.FAILED.value
+            )
+            self.store.append_runtime_event(
+                env.card_id,
+                event_type=event_type,
+                message=(
+                    env.failure_reason
+                    if env.failure_reason
+                    else (
+                        env.agent_result.summary
+                        if env.agent_result is not None
+                        else "executor finished"
+                    )
+                ),
+                role=env.role,
+                claim_id=env.claim_id,
+                worker_id=env.worker_id,
+                attempt=env.attempt,
+                duration_ms=env.duration_ms,
+                failure_reason=env.failure_reason,
+                failure_category=(
+                    env.failure_category.value
+                    if env.failure_category is not None
+                    else None
+                ),
+            )
             if env.ok and env.agent_result is not None:
                 self._apply_result(env.card_id, env.agent_result)
                 self.store.clear_claim(env.card_id, claim_id=env.claim_id)
