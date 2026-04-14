@@ -213,6 +213,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     requeue.add_argument("--note", default="", help="Recovery note appended to history")
 
+    claims = sub.add_parser("claims", help="List active execution claims (v0.1.2 runtime)")
+    claims.add_argument("card_id", nargs="?", help="Filter to one card")
+    claims.add_argument("--json", dest="as_json", action="store_true")
+
+    workers = sub.add_parser(
+        "workers", help="List live worker presences (v0.1.2 runtime)"
+    )
+    workers.add_argument("--json", dest="as_json", action="store_true")
+
+    recover = sub.add_parser(
+        "recover", help="Run one-shot runtime recovery (v0.1.2)"
+    )
+    recover.add_argument(
+        "--stale",
+        action="store_true",
+        help="Recover stale claims (lease expired). Required for now.",
+    )
+    recover.add_argument("--json", dest="as_json", action="store_true")
+
     sub.add_parser("tick", help="Run a single orchestrator step")
     run = sub.add_parser("run", help="Run orchestrator until idle")
     run.add_argument("--max-steps", type=int, default=100)
@@ -676,13 +695,43 @@ def _event_to_json(e: CardEvent) -> dict[str, object]:
         record["attempt"] = e.attempt
         if e.raw_path is not None:
             record["raw_path"] = e.raw_path
+    # Runtime lifecycle fields (PR4/M3). Present on claimed / finished /
+    # failed / retried / claim_recovered / result_orphaned events.
+    for key, value in (
+        ("event_type", e.event_type),
+        ("claim_id", e.claim_id),
+        ("worker_id", e.worker_id),
+        ("failure_reason", e.failure_reason),
+        ("failure_category", e.failure_category),
+        ("retry_of_claim_id", e.retry_of_claim_id),
+    ):
+        if value is not None:
+            record[key] = value
     return record
 
 
 def _format_event_line(e: CardEvent) -> str:
     stamp = e.at.strftime("%Y-%m-%dT%H:%M:%SZ") if e.at.tzinfo else e.at.isoformat()
-    role_tag = f"[{e.role.value}]" if e.role else "[system]"
-    return f"{stamp}  {e.card_id[:8]}  {role_tag}  {e.message}"
+    # Runtime events lead with [event_type]; execution events with [role];
+    # plain events with [system]. Operators scanning the log should be able
+    # to tell the three apart at a glance.
+    if e.event_type is not None:
+        tag = f"[{e.event_type}]"
+    elif e.role is not None:
+        tag = f"[{e.role.value}]"
+    else:
+        tag = "[system]"
+    extras: list[str] = []
+    if e.claim_id:
+        extras.append(f"claim={e.claim_id}")
+    if e.worker_id:
+        extras.append(f"worker={e.worker_id}")
+    if e.attempt is not None and e.event_type is not None:
+        extras.append(f"attempt={e.attempt}")
+    if e.retry_of_claim_id:
+        extras.append(f"retry_of={e.retry_of_claim_id}")
+    suffix = ("  " + " ".join(extras)) if extras else ""
+    return f"{stamp}  {e.card_id[:8]}  {tag}  {e.message}{suffix}"
 
 
 def cmd_events(args: argparse.Namespace) -> int:
@@ -707,6 +756,149 @@ def cmd_events(args: argparse.Namespace) -> int:
             return 0
         for e in records:
             print(_format_event_line(e))
+    return 0
+
+
+def _format_age(delta_seconds: float) -> str:
+    """Short human age: 3s / 42s / 5m12s / 2h03m / 3d04h."""
+    s = int(delta_seconds)
+    sign = "-" if s < 0 else ""
+    s = abs(s)
+    if s < 60:
+        return f"{sign}{s}s"
+    if s < 3600:
+        return f"{sign}{s // 60}m{s % 60:02d}s"
+    if s < 86400:
+        return f"{sign}{s // 3600}h{(s % 3600) // 60:02d}m"
+    return f"{sign}{s // 86400}d{(s % 86400) // 3600:02d}h"
+
+
+def cmd_claims(args: argparse.Namespace) -> int:
+    store = _make_store(args)
+    from datetime import datetime, timezone as _tz
+
+    now = datetime.now(_tz.utc)
+    claims = store.list_claims()
+    if args.card_id is not None:
+        claims = [c for c in claims if c.card_id == args.card_id]
+    claims.sort(key=lambda c: (c.claimed_at, c.card_id))
+
+    if args.as_json:
+        payload = [
+            {
+                "card_id": c.card_id,
+                "claim_id": c.claim_id,
+                "role": c.role.value,
+                "status_at_claim": c.status_at_claim.value,
+                "worker_id": c.worker_id,
+                "attempt": c.attempt,
+                "retry_count": c.retry_count,
+                "retry_of_claim_id": c.retry_of_claim_id,
+                "claimed_at": c.claimed_at.isoformat(),
+                "heartbeat_at": c.heartbeat_at.isoformat(),
+                "lease_expires_at": c.lease_expires_at.isoformat(),
+                "timeout_s": c.timeout_s,
+                "heartbeat_age_s": (now - c.heartbeat_at).total_seconds(),
+                "lease_remaining_s": (c.lease_expires_at - now).total_seconds(),
+                "expired": c.is_expired(now=now),
+            }
+            for c in claims
+        ]
+        print(_json.dumps(payload, ensure_ascii=False))
+        return 0
+
+    if not claims:
+        print("(no active claims)")
+        return 0
+    print(f"{'card':10}  {'role':8}  {'attempt':>7}  {'worker':14}  {'hb_age':>8}  {'lease_rem':>10}  claim_id")
+    for c in claims:
+        hb_age = _format_age((now - c.heartbeat_at).total_seconds())
+        remaining = _format_age((c.lease_expires_at - now).total_seconds())
+        expired_tag = " *EXPIRED*" if c.is_expired(now=now) else ""
+        print(
+            f"{c.card_id[:8]:10}  {c.role.value:8}  {c.attempt:>7}  "
+            f"{(c.worker_id or '-')[:14]:14}  {hb_age:>8}  {remaining:>10}  "
+            f"{c.claim_id}{expired_tag}"
+        )
+    return 0
+
+
+def cmd_workers(args: argparse.Namespace) -> int:
+    store = _make_store(args)
+    from datetime import datetime, timezone as _tz
+
+    now = datetime.now(_tz.utc)
+    workers = store.list_workers()
+    workers.sort(key=lambda w: w.started_at)
+
+    if args.as_json:
+        payload = [
+            {
+                "worker_id": w.worker_id,
+                "pid": w.pid,
+                "host": w.host,
+                "started_at": w.started_at.isoformat(),
+                "heartbeat_at": w.heartbeat_at.isoformat(),
+                "heartbeat_age_s": (now - w.heartbeat_at).total_seconds(),
+            }
+            for w in workers
+        ]
+        print(_json.dumps(payload, ensure_ascii=False))
+        return 0
+
+    if not workers:
+        print("(no live workers)")
+        return 0
+    print(f"{'worker_id':24}  {'pid':>7}  {'uptime':>8}  {'hb_age':>8}  host")
+    for w in workers:
+        uptime = _format_age((now - w.started_at).total_seconds())
+        hb_age = _format_age((now - w.heartbeat_at).total_seconds())
+        print(
+            f"{w.worker_id[:24]:24}  {w.pid:>7}  {uptime:>8}  {hb_age:>8}  "
+            f"{w.host or '-'}"
+        )
+    return 0
+
+
+def cmd_recover(args: argparse.Namespace) -> int:
+    if not args.stale:
+        print(
+            "recover requires --stale (only stale-claim recovery is implemented).",
+            file=sys.stderr,
+        )
+        return 2
+    _require_writable(args)
+    store = _make_store(args)
+    # Capture the list *before* recovery so we can report per-card outcomes.
+    stale_before = store.list_stale_claims()
+    orchestrator = KanbanOrchestrator(store=store, executor=MockAgentaoExecutor())
+    count = orchestrator.recover_stale_claims()
+
+    if args.as_json:
+        payload = {
+            "recovered": count,
+            "cards": [
+                {
+                    "card_id": c.card_id,
+                    "claim_id": c.claim_id,
+                    "role": c.role.value,
+                    "attempt": c.attempt,
+                    "retry_count": c.retry_count,
+                }
+                for c in stale_before
+            ],
+        }
+        print(_json.dumps(payload, ensure_ascii=False))
+        return 0
+
+    for c in stale_before:
+        fresh = store.get_card(c.card_id)
+        disposition = "retried" if fresh.status != CardStatus.BLOCKED else "blocked"
+        print(
+            f"{c.card_id[:8]}  [{c.role.value}]  attempt={c.attempt}  "
+            f"retry_count={c.retry_count}  → {disposition}"
+        )
+    print(f"recovered {count} stale claim(s).")
     return 0
 
 
@@ -895,6 +1087,9 @@ def main(argv: list[str] | None = None) -> int:
         "events": cmd_events,
         "traces": cmd_traces,
         "doctor": cmd_doctor,
+        "claims": cmd_claims,
+        "workers": cmd_workers,
+        "recover": cmd_recover,
         "tick": cmd_tick,
         "run": cmd_run,
         "daemon": cmd_daemon,
