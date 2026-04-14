@@ -7,7 +7,7 @@ import pytest
 from kanban import CardStatus, InMemoryBoardStore, KanbanOrchestrator
 from kanban.agents import AgentSpec, ROLE_AGENTS, load_spec
 from kanban.executors.agentao_multi import AgentaoMultiAgentExecutor
-from kanban.models import AgentRole, Card
+from kanban.models import AgentRole, Card, ContextRef
 
 
 REPO_AGENTS_DIR = Path(__file__).resolve().parent.parent / "docs" / "agent-definitions"
@@ -191,6 +191,61 @@ def test_end_to_end_one_card_through_all_four_roles():
         "review": "lgtm",
         "verification": "verified",
     }
+
+
+# ---------- context refs in prompt ----------
+
+
+def test_context_refs_appear_in_prompt():
+    ex, agent, _ = _executor_with(
+        '```json\n{"ok": true, "summary": "w", "output": "impl"}\n```'
+    )
+    card = Card(
+        title="t",
+        goal="g",
+        context_refs=[
+            ContextRef(path="docs/api.md", kind="required", note="api contract"),
+            ContextRef(path="workspace/data/x.jsonl", kind="optional"),
+        ],
+    )
+    ex.run(AgentRole.WORKER, card)
+    prompt = agent.prompts[-1]
+    assert "REQUIRED CONTEXT" in prompt
+    assert "docs/api.md" in prompt
+    assert "api contract" in prompt
+    assert "OPTIONAL CONTEXT" in prompt
+    assert "workspace/data/x.jsonl" in prompt
+
+
+def test_no_context_section_when_refs_empty():
+    ex, agent, _ = _executor_with(
+        '```json\n{"ok": true, "summary": "w", "output": "impl"}\n```'
+    )
+    ex.run(AgentRole.WORKER, Card(title="t", goal="g"))
+    prompt = agent.prompts[-1]
+    assert "REQUIRED CONTEXT" not in prompt
+    assert "OPTIONAL CONTEXT" not in prompt
+
+
+# ---------- planner output ----------
+
+
+def test_planner_output_merged_into_outputs():
+    ex, _, _ = _executor_with(
+        '```json\n{"ok": true, "summary": "p", '
+        '"acceptance_criteria": ["a"], '
+        '"output": {"decision": "focus on reports/"}}\n```'
+    )
+    result = ex.run(AgentRole.PLANNER, Card(title="t", goal="g"))
+    assert result.updates["outputs"]["planner"] == {"decision": "focus on reports/"}
+
+
+def test_planner_without_output_does_not_touch_outputs():
+    ex, _, _ = _executor_with(
+        '```json\n{"ok": true, "summary": "p", "acceptance_criteria": ["a"]}\n```'
+    )
+    result = ex.run(AgentRole.PLANNER, Card(title="t", goal="g"))
+    assert "outputs" not in result.updates
 
 
 # ---------- load_spec frontmatter ----------

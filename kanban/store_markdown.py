@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
+import re
 import tomllib
 from collections import defaultdict
 from dataclasses import fields
-from datetime import datetime
+from datetime import datetime, timezone as _tz
+_UTC = _tz.utc
 from pathlib import Path
 from typing import Any
 
@@ -16,11 +19,25 @@ from .models import (
     CardEvent,
     CardPriority,
     CardStatus,
+    ContextRef,
+    TraceInfo,
     utc_now,
 )
 
 FRONT_MATTER_DELIM = "+++"
 DEFAULT_RAW_RETENTION = 5
+
+_BARE_KEY_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+_LOG = logging.getLogger(__name__)
+
+
+def _tail(items: list[Any], limit: int | None) -> list[Any]:
+    """Return the last `limit` items. `None` → all; `<=0` → none."""
+    if limit is None:
+        return items
+    if limit <= 0:
+        return []
+    return items[-limit:]
 
 
 class MarkdownBoardStore:
@@ -49,6 +66,7 @@ class MarkdownBoardStore:
 
         self._cards: dict[str, Card] = {}
         self._events: list[CardEvent] = []
+        self._unparseable: list[str] = []
         self._load()
 
     def add_card(self, card: Card) -> Card:
@@ -70,7 +88,7 @@ class MarkdownBoardStore:
     def move_card(self, card_id: str, status: CardStatus, note: str) -> Card:
         card = self.get_card(card_id)
         card.status = status
-        card.add_history(note)
+        card.add_history(note, role="system")
         self._write_card(card)
         self.append_event(card_id, note)
         return card
@@ -78,6 +96,8 @@ class MarkdownBoardStore:
     def update_card(self, card_id: str, **updates: object) -> Card:
         card = self.get_card(card_id)
         for key, value in updates.items():
+            if key == "context_refs":
+                value = [ContextRef.coerce(v) for v in value]  # type: ignore[arg-type]
             setattr(card, key, value)
         card.updated_at = utc_now()
         self._write_card(card)
@@ -90,12 +110,30 @@ class MarkdownBoardStore:
         self._write_event_line(record)
 
     def append_execution_event(self, card_id: str, result: AgentResult) -> None:
+        at = utc_now()
+        raw_path_str: str | None = None
+        if result.raw_response is not None:
+            raw_path = self._write_raw_transcript(
+                card_id, result.role, at, result.raw_response
+            )
+            if raw_path is not None:
+                try:
+                    raw_path_str = str(raw_path.relative_to(self.root.parent))
+                except ValueError:
+                    raw_path_str = str(raw_path)
         event = CardEvent(
-            card_id=card_id, message=f"{result.role.value}: {result.summary}"
+            card_id=card_id,
+            message=result.summary,
+            at=at,
+            role=result.role,
+            prompt_version=result.prompt_version,
+            duration_ms=result.duration_ms,
+            attempt=result.attempt,
+            raw_path=raw_path_str,
         )
         self._events.append(event)
         record: dict[str, Any] = {
-            "at": event.at.isoformat(),
+            "at": at.isoformat(),
             "card_id": card_id,
             "role": result.role.value,
             "prompt_version": result.prompt_version,
@@ -103,16 +141,67 @@ class MarkdownBoardStore:
             "attempt": result.attempt,
             "message": result.summary,
         }
-        if result.raw_response is not None:
-            raw_path = self._write_raw_transcript(
-                card_id, result.role, event.at, result.raw_response
-            )
-            if raw_path is not None:
-                try:
-                    record["raw_path"] = str(raw_path.relative_to(self.root.parent))
-                except ValueError:
-                    record["raw_path"] = str(raw_path)
+        if raw_path_str is not None:
+            record["raw_path"] = raw_path_str
         self._write_event_line(record)
+
+    def list_events(self, *, limit: int | None = None) -> list[CardEvent]:
+        return _tail(list(self._events), limit)
+
+    def list_execution_events(
+        self,
+        *,
+        card_id: str | None = None,
+        role: AgentRole | None = None,
+        limit: int | None = None,
+    ) -> list[CardEvent]:
+        events = [e for e in self._events if e.is_execution]
+        if card_id is not None:
+            events = [e for e in events if e.card_id == card_id]
+        if role is not None:
+            events = [e for e in events if e.role == role]
+        return _tail(events, limit)
+
+    def list_traces(
+        self,
+        card_id: str,
+        *,
+        role: AgentRole | None = None,
+        latest: bool = False,
+    ) -> list[TraceInfo]:
+        card_dir = self.raw_root / card_id
+        if not card_dir.exists():
+            return []
+        traces: list[TraceInfo] = []
+        for path in sorted(card_dir.glob("*.md")):
+            role_str, sep, stamp_with_ext = path.name.partition("-")
+            if not sep or not stamp_with_ext.endswith(".md"):
+                continue
+            try:
+                this_role = AgentRole(role_str)
+            except ValueError:
+                continue
+            if role is not None and this_role != role:
+                continue
+            stamp_str = stamp_with_ext[:-3]
+            try:
+                at = datetime.strptime(stamp_str, "%Y%m%dT%H%M%S%fZ").replace(
+                    tzinfo=_UTC
+                )
+            except ValueError:
+                at = datetime.fromtimestamp(path.stat().st_mtime, tz=_UTC)
+            traces.append(
+                TraceInfo(
+                    card_id=card_id,
+                    role=this_role,
+                    at=at,
+                    path=str(path),
+                    size=path.stat().st_size,
+                )
+            )
+        if latest and traces:
+            return [max(traces, key=lambda t: t.at)]
+        return traces
 
     def _write_event_line(self, record: dict[str, Any]) -> None:
         # O_APPEND writes are atomic for < PIPE_BUF on POSIX, so concurrent
@@ -163,10 +252,22 @@ class MarkdownBoardStore:
 
     def _load(self) -> None:
         for path in sorted(self.cards_dir.glob("*.md")):
-            card = _read_card(path)
+            # Valid TOML can still miss fields the Card constructor requires
+            # (TypeError) or reject a value type (KeyError/ValueError). Treat
+            # any failure in this reader path as an unparseable card rather
+            # than letting a single bad file break the whole board.
+            try:
+                card = _read_card(path)
+            except (tomllib.TOMLDecodeError, TypeError, KeyError, ValueError) as exc:
+                _LOG.warning("Skipping unparseable card %s: %s", path.name, exc)
+                self._unparseable.append(path.name)
+                continue
             self._cards[card.id] = card
         if self.events_path.exists():
             self._load_events()
+
+    def unparseable_cards(self) -> list[str]:
+        return list(self._unparseable)
 
     def _load_events(self) -> None:
         with self.events_path.open("r", encoding="utf-8") as f:
@@ -193,10 +294,17 @@ def _decode_event_line(line: str) -> CardEvent | None:
     if line.startswith("{"):
         try:
             data = json.loads(line)
+            role_str = data.get("role")
+            role = AgentRole(role_str) if role_str else None
             return CardEvent(
                 card_id=str(data["card_id"]),
                 message=str(data["message"]),
                 at=datetime.fromisoformat(str(data["at"])),
+                role=role,
+                prompt_version=data.get("prompt_version"),
+                duration_ms=data.get("duration_ms"),
+                attempt=data.get("attempt"),
+                raw_path=data.get("raw_path"),
             )
         except (json.JSONDecodeError, KeyError, ValueError):
             return None
@@ -231,7 +339,9 @@ def _card_to_toml_dict(card: Card) -> dict[str, Any]:
         "priority": int(card.priority),
         "goal": card.goal,
         "acceptance_criteria": list(card.acceptance_criteria),
-        "context_refs": list(card.context_refs),
+        "context_refs": [
+            {"path": r.path, "kind": r.kind, "note": r.note} for r in card.context_refs
+        ],
         "depends_on": list(card.depends_on),
         "history": list(card.history),
         "created_at": card.created_at,
@@ -251,6 +361,12 @@ def _render_body(card: Card) -> str:
     if card.acceptance_criteria:
         lines += ["## Acceptance Criteria", ""]
         lines += [f"- {item}" for item in card.acceptance_criteria]
+        lines.append("")
+    if card.context_refs:
+        lines += ["## Context", ""]
+        for ref in card.context_refs:
+            suffix = f" — {ref.note}" if ref.note else ""
+            lines.append(f"- [{ref.kind}] `{ref.path}`{suffix}")
         lines.append("")
     if card.outputs:
         lines += ["## Outputs", ""]
@@ -291,6 +407,19 @@ def _card_from_toml_dict(data: dict[str, Any]) -> Card:
             kwargs[key] = CardPriority(int(value))
         elif key == "owner_role":
             kwargs[key] = AgentRole(value) if value is not None else None
+        elif key == "context_refs":
+            coerced: list[ContextRef] = []
+            for raw in value:
+                ref = ContextRef.try_coerce(raw)
+                if ref is None:
+                    _LOG.warning(
+                        "Dropping malformed context_ref in card %s: %r",
+                        data.get("id", "<unknown>"),
+                        raw,
+                    )
+                    continue
+                coerced.append(ref)
+            kwargs[key] = coerced
         else:
             kwargs[key] = value
     return Card(**kwargs)
@@ -306,18 +435,30 @@ def _dump_toml(data: dict[str, Any]) -> str:
         if isinstance(value, dict):
             tables.append((key, value))
         else:
-            top.append(f"{key} = {_toml_value(value)}")
+            top.append(f"{_toml_key(key)} = {_toml_value(value)}")
     out = "\n".join(top)
     if out:
         out += "\n"
     for name, table in tables:
-        out += f"\n[{name}]\n"
+        out += f"\n[{_toml_key(name)}]\n"
         for k, v in table.items():
-            out += f"{k} = {_toml_value(v)}\n"
+            out += f"{_toml_key(k)} = {_toml_value(v)}\n"
     return out
 
 
-def _toml_value(value: Any) -> str:
+def _toml_key(name: str) -> str:
+    """Return a TOML-safe key: bare if it matches [A-Za-z0-9_-]+, quoted otherwise.
+
+    Agent-supplied outputs can carry dict keys with dots, unicode, or spaces
+    (e.g. filenames like "test_report.xlsx"), which break bare-key syntax and
+    create dotted-key nesting. Quoting keeps round-trip stable.
+    """
+    if _BARE_KEY_RE.match(name):
+        return name
+    return _toml_string(name, inline=True)
+
+
+def _toml_value(value: Any, *, inline: bool = False) -> str:
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, int):
@@ -326,15 +467,25 @@ def _toml_value(value: Any) -> str:
         return repr(value)
     if isinstance(value, datetime):
         return value.isoformat()
+    if isinstance(value, dict):
+        # Inline tables must stay single-line per TOML 1.0.
+        return _toml_inline_table(value)
     if isinstance(value, list):
-        return "[" + ", ".join(_toml_value(item) for item in value) + "]"
+        return "[" + ", ".join(_toml_value(item, inline=inline) for item in value) + "]"
     if isinstance(value, str):
-        return _toml_string(value)
-    return _toml_string(str(value))
+        return _toml_string(value, inline=inline)
+    return _toml_string(str(value), inline=inline)
 
 
-def _toml_string(value: str) -> str:
-    if "\n" in value:
+def _toml_inline_table(data: dict[str, Any]) -> str:
+    parts = [
+        f"{_toml_key(k)} = {_toml_value(v, inline=True)}" for k, v in data.items()
+    ]
+    return "{ " + ", ".join(parts) + " }"
+
+
+def _toml_string(value: str, *, inline: bool = False) -> str:
+    if "\n" in value and not inline:
         escaped = value.replace("\\", "\\\\").replace('"""', '\\"\\"\\"')
         return f'"""\n{escaped}"""'
     escaped = (

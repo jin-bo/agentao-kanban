@@ -34,10 +34,12 @@ else, and clean up any scaffolding you create before returning.
 
 Output contract:
 
-End your response with EXACTLY ONE fenced JSON block:
+End your response with EXACTLY ONE fenced JSON block. `output.status` is
+`"verified"` or `"failed"`; `checklist` is one entry per acceptance
+criterion describing how you checked it:
 
 ```json
-{"ok": true, "summary": "one sentence", "output": "per-criterion verification: for each criterion, how you checked it and the result"}
+{"ok": true, "summary": "one sentence", "output": {"status": "verified", "checklist": [{"criterion": "<text>", "result": "pass", "evidence": "how you checked"}]}}
 ```
 
 If any criterion fails:

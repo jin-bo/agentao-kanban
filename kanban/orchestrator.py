@@ -119,7 +119,7 @@ class KanbanOrchestrator:
 
     def _apply_result(self, card_id: str, result: AgentResult) -> None:
         card = self.store.update_card(card_id, **result.updates)
-        card.add_history(f"{result.role.value}: {result.summary}")
+        card.add_history(result.summary, role=result.role)
         self.store.append_execution_event(card_id, result)
         self.store.move_card(
             card_id,

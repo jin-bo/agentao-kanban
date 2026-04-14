@@ -28,12 +28,21 @@ All durable work lives under `workspace/`:
 Whenever a criterion involves a file the worker will produce, specify the
 path under `workspace/` explicitly so the verifier can check it mechanically.
 
+## Context refs
+
+The prompt may include `REQUIRED CONTEXT` and `OPTIONAL CONTEXT` sections
+listing files the planner curated for this card. Read the required ones
+before writing criteria. When proposing new acceptance criteria that depend
+on an external resource, name its path explicitly.
+
 Output contract:
 
-End your response with EXACTLY ONE fenced JSON block:
+End your response with EXACTLY ONE fenced JSON block. `output.decision` is
+a one-sentence scope note (what is in/out of scope) that downstream agents
+will see as `prior_outputs.planner.decision`.
 
 ```json
-{"ok": true, "summary": "one sentence", "acceptance_criteria": ["criterion 1", "criterion 2"]}
+{"ok": true, "summary": "one sentence", "acceptance_criteria": ["criterion 1", "criterion 2"], "output": {"decision": "focus on reports/, skip scripts/"}}
 ```
 
 On failure:

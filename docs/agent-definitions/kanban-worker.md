@@ -41,12 +41,19 @@ Rules of thumb:
 - Edit files in the main source tree (outside `workspace/`) only when the
   goal explicitly asks for code changes to that tree.
 
+## Context refs
+
+The prompt may include `REQUIRED CONTEXT` and `OPTIONAL CONTEXT` sections.
+Read every required path before editing. Reach for optional paths when
+they plausibly affect your decisions.
+
 Output contract:
 
-End your response with EXACTLY ONE fenced JSON block:
+End your response with EXACTLY ONE fenced JSON block. `output` must be an
+object so the reviewer can address deliverables by path:
 
 ```json
-{"ok": true, "summary": "one sentence describing what you changed", "output": "concrete description of the diff you produced - file paths, key functions, test results"}
+{"ok": true, "summary": "one sentence describing what you changed", "output": {"deliverable_path": "workspace/reports/<card-id>-<slug>.md", "summary": "what is in the deliverable", "status": "ready_for_review"}}
 ```
 
 On failure:

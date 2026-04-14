@@ -50,6 +50,88 @@ uv run kanban daemon --detach                   # 后台运行,日志写到 <boa
 uv run kanban --executor agentao daemon         # 真正调用 sub-agent
 ```
 
+## 运维命令(v0.1.1)
+
+所有写命令都遵守 `.daemon.lock`;加 `--force` 才能在守护进程运行期写入
+(仅用于应急恢复)。CLI 写入的 history 条目统一带 `[system]` 前缀,与
+自动状态迁移保持一致。
+
+### 编辑卡片
+
+```bash
+uv run kanban card edit <id> --title "新标题"
+uv run kanban card edit <id> --goal "新目标" --priority HIGH
+uv run kanban card edit <id> --set-status blocked --blocked-reason "缺数据"
+uv run kanban card edit <id> --clear-blocked-reason
+```
+
+`--set-status` 是操作员覆盖,仅允许 `inbox/ready/blocked/done`(有 owner
+期望的 `doing/review/verify` 不可直接设,用 `requeue`)。设为 `blocked`
+时必须同时提供 `--blocked-reason`。
+
+### 管理 context_refs
+
+```bash
+uv run kanban card context list <id>
+uv run kanban card context add <id> --path docs/api.md --kind required --note "API 合约"
+uv run kanban card context rm  <id> --path docs/api.md
+```
+
+`--kind` 只接受 `required` 或 `optional`。同一 `path` 再次 `add` 走
+upsert。
+
+### 调整 acceptance criteria
+
+```bash
+uv run kanban card acceptance list  <id>
+uv run kanban card acceptance add   <id> --item "生成 workspace/reports/summary.md"
+uv run kanban card acceptance rm    <id> --index 2   # 1-based
+uv run kanban card acceptance clear <id>
+```
+
+### 从 BLOCKED 恢复
+
+```bash
+uv run kanban requeue <id>                      # 默认 → inbox,清空 blocked_reason
+uv run kanban requeue <id> --to ready
+uv run kanban requeue <id> --to ready --note "已补充数据集"
+```
+
+### 查看事件与 transcript
+
+```bash
+uv run kanban events                            # 最近 50 条(跨卡)
+uv run kanban events <id>                       # 过滤到一张卡
+uv run kanban events <id> --role worker         # 只看执行事件(排除系统事件)
+uv run kanban events --limit 20 --json          # 机读 JSONL
+
+uv run kanban traces <id>                       # 列出保留的原始 transcript
+uv run kanban traces <id> --role worker
+uv run kanban traces <id> --latest
+```
+
+`--role` 过滤期间,系统事件(状态迁移、手工编辑等)不会出现——要同时看
+就不要加 `--role`。
+
+### 健康体检
+
+```bash
+uv run kanban doctor                            # 人类可读报表
+uv run kanban doctor --json                     # 机读报表
+```
+
+退出码:`0` = 健康,`1` = 只有 warning,`2` = 至少一条 error。
+
+JSON 输出字段冻结:`checks[].{severity, rule, card_id, message}`。当前
+规则:
+
+- `dep-missing` (error) — `depends_on` 指向不存在的卡
+- `blocked-no-reason` (warning) — 卡在 `blocked` 但 `blocked_reason` 为空(防御性)
+- `done-no-verification` (warning) — `done` 卡 `outputs.verification` 为空
+- `stage-missing-upstream` (error) — `review`/`verify` 卡缺上游产出
+- `invalid-context-kind` (warning) — `context_refs[].kind` 不在 `{required, optional}`
+- `unparseable-card` (error) — 卡文件加载时被跳过
+
 CLI 默认把状态持久化到 `workspace/board/`(每张卡一个 `.md` 文件,事件写
 JSONL 到 `events.log`)。用 `--board DIR` 可切换目录。daemon 运行时持有
 `workspace/board/.daemon.lock`;其他写命令会被拒绝,加 `--force` 才强制

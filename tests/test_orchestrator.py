@@ -9,7 +9,23 @@ from kanban import (
     KanbanOrchestrator,
 )
 from kanban.executors import MockAgentaoExecutor
+from kanban.models import Card, ContextRef
 from kanban.orchestrator import WipPolicy
+
+
+def test_in_memory_update_card_coerces_legacy_context_refs():
+    store = InMemoryBoardStore()
+    card = store.add_card(Card(title="u", goal="g"))
+    store.update_card(
+        card.id,
+        context_refs=["a.md", {"path": "b.md", "kind": "required", "note": "n"}],
+    )
+    got = store.get_card(card.id)
+    assert all(isinstance(r, ContextRef) for r in got.context_refs)
+    assert got.context_refs == [
+        ContextRef(path="a.md", kind="optional", note=""),
+        ContextRef(path="b.md", kind="required", note="n"),
+    ]
 
 
 def _make(wip: int = 2) -> KanbanOrchestrator:

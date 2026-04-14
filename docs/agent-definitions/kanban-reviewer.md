@@ -31,10 +31,12 @@ it in the review `output` field.
 
 Output contract:
 
-End your response with EXACTLY ONE fenced JSON block:
+End your response with EXACTLY ONE fenced JSON block. `output.status` is
+`"approved"` or `"changes_requested"`; `notes` captures anything the
+worker should know:
 
 ```json
-{"ok": true, "summary": "one sentence", "output": "your review: what you checked, what looked good, any non-blocking notes"}
+{"ok": true, "summary": "one sentence", "output": {"status": "approved", "notes": "what you checked and any non-blocking observations"}}
 ```
 
 On rejection:

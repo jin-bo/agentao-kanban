@@ -27,6 +27,7 @@ _NEXT_STATUS: dict[AgentRole, CardStatus] = {
 }
 
 _OUTPUT_KEY: dict[AgentRole, str] = {
+    AgentRole.PLANNER: "planner",
     AgentRole.WORKER: "implementation",
     AgentRole.REVIEWER: "review",
     AgentRole.VERIFIER: "verification",
@@ -103,12 +104,42 @@ def _build_prompt(role: AgentRole, card: Card) -> str:
         "acceptance_criteria": list(card.acceptance_criteria),
         "prior_outputs": dict(card.outputs),
     }
-    return (
-        f"You have been dispatched as the {role.value.upper()} for this card.\n\n"
-        f"CARD:\n{json.dumps(header, indent=2, ensure_ascii=False)}\n\n"
+    parts = [
+        f"You have been dispatched as the {role.value.upper()} for this card.",
+        "",
+        f"CARD:\n{json.dumps(header, indent=2, ensure_ascii=False)}",
+    ]
+    context_block = _render_context_block(card)
+    if context_block:
+        parts += ["", context_block]
+    parts += [
+        "",
         "Follow your role's system instructions. End with the required "
-        "```json``` fenced block."
-    )
+        "```json``` fenced block.",
+    ]
+    return "\n".join(parts)
+
+
+def _render_context_block(card: Card) -> str:
+    if not card.context_refs:
+        return ""
+    required = [r for r in card.context_refs if r.kind == "required"]
+    optional = [r for r in card.context_refs if r.kind != "required"]
+    sections: list[str] = []
+    if required:
+        sections.append("REQUIRED CONTEXT (must read before acting):")
+        sections += [_format_ref(r) for r in required]
+    if optional:
+        if sections:
+            sections.append("")
+        sections.append("OPTIONAL CONTEXT (read if relevant):")
+        sections += [_format_ref(r) for r in optional]
+    return "\n".join(sections)
+
+
+def _format_ref(ref: "Any") -> str:
+    suffix = f" — {ref.note}" if ref.note else ""
+    return f"- {ref.path}{suffix}"
 
 
 _JSON_FENCE_START = re.compile(r"```json\s*", re.IGNORECASE)
@@ -151,7 +182,13 @@ def _apply_parsed(
         if isinstance(criteria, list) and criteria:
             updates["acceptance_criteria"] = [str(c) for c in criteria]
         elif not card.acceptance_criteria:
-            updates["acceptance_criteria"] = [output or "Acceptance criteria TBD"]
+            updates["acceptance_criteria"] = [
+                output if isinstance(output, str) and output else "Acceptance criteria TBD"
+            ]
+        if output is not None:
+            outputs = dict(card.outputs)
+            outputs[_OUTPUT_KEY[AgentRole.PLANNER]] = output
+            updates["outputs"] = outputs
     else:
         key = _OUTPUT_KEY[role]
         outputs = dict(card.outputs)
