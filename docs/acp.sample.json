@@ -1,0 +1,44 @@
+{
+  "servers": {
+    "gemini-worker": {
+      "command": "npx",
+      "args": [
+        "@google/gemini-cli@latest",
+        "--acp"
+      ],
+      "env": {
+        "GEMINI_API_KEY": "$GEMINI_API_KEY"
+      },
+      "cwd": ".",
+      "description": "Gemini CLI coding worker",
+      "autoStart": false,
+      "requestTimeoutMs": 900000,
+      "startupTimeoutMs": 20000,
+      "capabilities": {
+        "role": "worker",
+        "provider": "gemini-cli"
+      },
+      "nonInteractivePolicy": "accept_all"
+    },
+    "gemini-reviewer": {
+      "command": "npx",
+      "args": [
+        "@google/gemini-cli@latest",
+        "--acp"
+      ],
+      "env": {
+        "GEMINI_API_KEY": "$GEMINI_API_KEY"
+      },
+      "cwd": ".",
+      "description": "Gemini CLI reviewer",
+      "autoStart": false,
+      "requestTimeoutMs": 900000,
+      "startupTimeoutMs": 20000,
+      "capabilities": {
+        "role": "reviewer",
+        "provider": "gemini-cli"
+      },
+      "nonInteractivePolicy": "accept_all"
+    }
+  }
+}

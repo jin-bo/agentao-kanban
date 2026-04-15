@@ -65,6 +65,16 @@ holds the lock (recovery only).
   fence (`{ok, summary, output[, acceptance_criteria][, blocked_reason]}`). On any
   exception the card is moved to `BLOCKED`. Each result carries `prompt_version`,
   `duration_ms`, and the full raw response for audit.
+- `MultiBackendExecutor` (`--executor multi-backend`): profile-aware executor that
+  routes each role through an `agent_profiles.yaml` profile and a pluggable
+  backend (`subagent` / `acp`). Config is resolved as `<cwd>/.kanban/agent_profiles.yaml`
+  with a shipped fallback at `docs/agent_profiles.sample.yaml`. Before the backend
+  runs, a `RouterPolicy` may ask the `kanban-router` agent to pick a profile
+  from the role's candidates; the router never overrides a card pin or planner
+  recommendation, and any failure (disabled, spec missing, parse error,
+  timeout, ...) falls through to the role default. Disable at runtime with
+  `KANBAN_ROUTER=off`; per-role enablement lives in the top-level `router:`
+  section of the config file.
 
 ## Daemon
 

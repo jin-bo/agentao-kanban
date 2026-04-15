@@ -10,7 +10,7 @@ from kanban.executors.agentao_multi import AgentaoMultiAgentExecutor
 from kanban.models import AgentRole, Card, ContextRef
 
 
-REPO_AGENTS_DIR = Path(__file__).resolve().parent.parent / "docs" / "agent-definitions"
+REPO_AGENTS_DIR = Path(__file__).resolve().parent.parent / "kanban" / "defaults"
 
 
 # ---------- fixtures ----------
@@ -139,8 +139,14 @@ def test_agent_exception_is_retryable_not_terminal():
     assert "llm offline" in str(exc.value)
 
 
-def test_missing_definition_blocks_card(tmp_path: Path):
-    # No .md files — load_spec must raise and executor must return BLOCKED.
+def test_missing_definition_blocks_card(tmp_path: Path, monkeypatch):
+    # No .md files anywhere on the search path — load_spec must raise and
+    # the executor must return BLOCKED. We force the search path down to
+    # a single empty directory so the new per-file fallback into
+    # ``kanban/defaults`` doesn't silently satisfy the request.
+    from kanban import agents as _agents
+
+    monkeypatch.setattr(_agents, "_spec_search_path", lambda _ad: [tmp_path])
     ex = AgentaoMultiAgentExecutor(
         agents_dir=tmp_path, agent_factory=lambda spec, wd: _FakeAgent("")
     )
@@ -306,3 +312,29 @@ def test_load_spec_rejects_file_without_frontmatter(tmp_path: Path):
     bad.write_text("no frontmatter here", encoding="utf-8")
     with pytest.raises(ValueError, match="Missing YAML frontmatter"):
         load_spec(AgentRole.PLANNER, tmp_path)
+
+
+def test_load_spec_by_name_falls_through_to_packaged_default(tmp_path: Path):
+    """Regression: pointing at a local ``.agentao/agents`` that overrides
+    only one subagent must not disable the others — they should load
+    from the packaged defaults instead of raising."""
+    from kanban.agents import load_spec_by_name
+
+    # Project overrides kanban-worker only; the other specs are absent.
+    override = tmp_path / ".agentao" / "agents"
+    override.mkdir(parents=True)
+    worker_override = override / "kanban-worker.md"
+    worker_override.write_text(
+        "---\nname: kanban-worker\nversion: local\nmax_turns: 1\n---\nlocal override\n",
+        encoding="utf-8",
+    )
+
+    # Override wins for the customized name.
+    spec = load_spec_by_name("kanban-worker", override)
+    assert spec.version == "local"
+    assert spec.source_path == worker_override
+
+    # Non-overridden names fall through to the packaged default.
+    planner = load_spec_by_name("kanban-planner", override)
+    assert planner.source_path.parent.name == "defaults"
+    assert planner.name == "kanban-planner"

@@ -17,7 +17,7 @@ from pathlib import Path
 from kanban.executors.agentao_multi import AgentaoMultiAgentExecutor
 from kanban.models import AgentRole, Card, CardStatus
 
-REPO_AGENTS_DIR = Path(__file__).resolve().parent.parent / "docs" / "agent-definitions"
+REPO_AGENTS_DIR = Path(__file__).resolve().parent.parent / "kanban" / "defaults"
 
 
 class _FakeAgent:

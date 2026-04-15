@@ -1,0 +1,96 @@
+# Sample agent-profile routing config for kanban.
+#
+# This file is a human-readable reference copy. The actual load path is:
+#   1. <cwd>/.kanban/agent_profiles.yaml        (operator override)
+#   2. <install>/kanban/defaults/agent_profiles.yaml (packaged default,
+#      kept in sync with this file)
+# Copy this into `.kanban/agent_profiles.yaml` to customize for a project.
+#
+# Each role maps to a default profile. Each profile binds a role to a backend
+# (subagent or acp). ACP backends name a target defined in .agentao/acp.json;
+# this file never holds server commands or secrets.
+#
+# The optional top-level `router:` section controls the router-agent profile
+# selection layer (see docs/agent-router-design.md). When absent, routing
+# falls back to the built-in default (worker-only). The router never
+# overrides a card pin or planner recommendation; it only competes with the
+# role default.
+
+roles:
+  planner:
+    default_profile: default-planner
+  worker:
+    default_profile: default-worker
+  reviewer:
+    default_profile: default-reviewer
+  verifier:
+    default_profile: default-verifier
+
+router:
+  # Roles for which the router is invoked. Other roles go directly to their
+  # role default. Rollout order: worker first, then reviewer / verifier /
+  # planner.
+  enabled_roles: [worker]
+  # Per-invocation timeout for the router agent call. Does not affect the
+  # selected profile's own execution budget.
+  timeout_s: 10
+
+profiles:
+  default-planner:
+    role: planner
+    backend:
+      type: subagent
+      target: kanban-planner
+    description: >-
+      Built-in planner. Produces acceptance_criteria and an execution plan
+      from the card goal. Safe default for any planning task.
+
+  default-worker:
+    role: worker
+    backend:
+      type: subagent
+      target: kanban-worker
+    description: >-
+      Built-in worker. General-purpose implementer that edits the repo and
+      reports back a structured result. Safe default for any coding task.
+
+  gemini-worker:
+    role: worker
+    backend:
+      type: acp
+      target: gemini-worker
+    fallback: default-worker
+    capabilities: [code, repo-edit, shell]
+    description: >-
+      Gemini-backed worker. Strong on code edits and shell-driven workflows;
+      prefer for tasks that need multi-file changes, terminal exploration,
+      or larger-context coding work.
+
+  default-reviewer:
+    role: reviewer
+    backend:
+      type: subagent
+      target: kanban-reviewer
+    description: >-
+      Built-in reviewer. Reads the worker output and acceptance criteria and
+      decides pass/fail with a short rationale. Safe default for any review.
+
+  gemini-reviewer:
+    role: reviewer
+    backend:
+      type: acp
+      target: gemini-reviewer
+    fallback: default-reviewer
+    capabilities: [review, diff-analysis]
+    description: >-
+      Gemini-backed reviewer. Prefer for diff-heavy reviews or cards whose
+      acceptance criteria require reasoning across multiple files.
+
+  default-verifier:
+    role: verifier
+    backend:
+      type: subagent
+      target: kanban-verifier
+    description: >-
+      Built-in verifier. Runs acceptance checks against the worker output and
+      emits a pass/fail verdict. Safe default for any verification task.

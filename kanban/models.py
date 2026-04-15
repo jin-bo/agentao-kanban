@@ -145,6 +145,8 @@ class Card:
     history: list[str] = field(default_factory=list)
     created_at: datetime = field(default_factory=utc_now)
     updated_at: datetime = field(default_factory=utc_now)
+    agent_profile: str | None = None
+    agent_profile_source: str | None = None
 
     def __post_init__(self) -> None:
         self.context_refs = [ContextRef.coerce(r) for r in self.context_refs]
@@ -176,6 +178,19 @@ class CardEvent:
     failure_reason: str | None = None
     failure_category: str | None = None
     retry_of_claim_id: str | None = None
+    # v0.2.0 profile routing diagnostics (mirror of AgentResult extras).
+    agent_profile: str | None = None
+    backend_type: str | None = None
+    backend_target: str | None = None
+    routing_source: str | None = None
+    routing_reason: str | None = None
+    fallback_from_profile: str | None = None
+    session_id: str | None = None
+    router_prompt_version: str | None = None
+    # Free-form backend diagnostics (stop_reason, effective_cwd, ...).
+    # Persisted alongside the scalar fields so ACP postmortems survive
+    # a board reload rather than only living on the in-memory AgentResult.
+    backend_metadata: dict[str, Any] = field(default_factory=dict)
 
     @property
     def is_execution(self) -> bool:
@@ -207,6 +222,22 @@ class AgentResult:
     duration_ms: int = 0
     attempt: int = 1
     raw_response: str | None = None
+    # v0.2.0 profile routing: which implementation actually ran this card,
+    # how it was selected, and backend-level diagnostics. All optional so
+    # legacy executors (mock, agentao_multi) keep working unchanged.
+    agent_profile: str | None = None
+    backend_type: str | None = None
+    backend_target: str | None = None
+    routing_source: str | None = None  # "card" | "planner" | "policy" | "default"
+    routing_reason: str | None = None
+    fallback_from_profile: str | None = None
+    session_id: str | None = None
+    # Version string of the router agent spec, populated ONLY when the
+    # router was actually invoked for this resolution (not on disabled,
+    # spec-missing, or single-candidate short-circuit paths). Resolves
+    # agent-router-design Open Question #2.
+    router_prompt_version: str | None = None
+    backend_metadata: dict[str, Any] = field(default_factory=dict)
 
 
 # ---------- v0.1.2 runtime concurrency kernel ----------

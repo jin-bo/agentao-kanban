@@ -209,6 +209,15 @@ class MarkdownBoardStore:
             duration_ms=result.duration_ms,
             attempt=result.attempt,
             raw_path=raw_path_str,
+            agent_profile=result.agent_profile,
+            backend_type=result.backend_type,
+            backend_target=result.backend_target,
+            routing_source=result.routing_source,
+            routing_reason=result.routing_reason,
+            fallback_from_profile=result.fallback_from_profile,
+            session_id=result.session_id,
+            router_prompt_version=result.router_prompt_version,
+            backend_metadata=dict(result.backend_metadata),
         )
         self._events.append(event)
         record: dict[str, Any] = {
@@ -222,6 +231,21 @@ class MarkdownBoardStore:
         }
         if raw_path_str is not None:
             record["raw_path"] = raw_path_str
+        for field_name in (
+            "agent_profile",
+            "backend_type",
+            "backend_target",
+            "routing_source",
+            "routing_reason",
+            "fallback_from_profile",
+            "session_id",
+            "router_prompt_version",
+        ):
+            value = getattr(result, field_name)
+            if value is not None:
+                record[field_name] = value
+        if result.backend_metadata:
+            record["backend_metadata"] = dict(result.backend_metadata)
         self._write_event_line(record)
 
     def list_events(self, *, limit: int | None = None) -> list[CardEvent]:
@@ -631,6 +655,19 @@ def _decode_event_line(line: str) -> CardEvent | None:
                 failure_reason=data.get("failure_reason"),
                 failure_category=data.get("failure_category"),
                 retry_of_claim_id=data.get("retry_of_claim_id"),
+                agent_profile=data.get("agent_profile"),
+                backend_type=data.get("backend_type"),
+                backend_target=data.get("backend_target"),
+                routing_source=data.get("routing_source"),
+                routing_reason=data.get("routing_reason"),
+                fallback_from_profile=data.get("fallback_from_profile"),
+                session_id=data.get("session_id"),
+                router_prompt_version=data.get("router_prompt_version"),
+                backend_metadata=(
+                    dict(data["backend_metadata"])
+                    if isinstance(data.get("backend_metadata"), dict)
+                    else {}
+                ),
             )
         except (json.JSONDecodeError, KeyError, ValueError):
             return None
@@ -677,6 +714,10 @@ def _card_to_toml_dict(card: Card) -> dict[str, Any]:
         data["owner_role"] = card.owner_role.value
     if card.blocked_reason is not None:
         data["blocked_reason"] = card.blocked_reason
+    if card.agent_profile is not None:
+        data["agent_profile"] = card.agent_profile
+    if card.agent_profile_source is not None:
+        data["agent_profile_source"] = card.agent_profile_source
     if card.outputs:
         data["outputs"] = dict(card.outputs)
     return data

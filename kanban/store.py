@@ -204,6 +204,15 @@ class InMemoryBoardStore:
                 prompt_version=result.prompt_version,
                 duration_ms=result.duration_ms,
                 attempt=result.attempt,
+                agent_profile=result.agent_profile,
+                backend_type=result.backend_type,
+                backend_target=result.backend_target,
+                routing_source=result.routing_source,
+                routing_reason=result.routing_reason,
+                fallback_from_profile=result.fallback_from_profile,
+                session_id=result.session_id,
+                router_prompt_version=result.router_prompt_version,
+                backend_metadata=dict(result.backend_metadata),
             )
         )
 
