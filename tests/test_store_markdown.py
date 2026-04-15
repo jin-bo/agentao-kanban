@@ -332,3 +332,58 @@ def test_blocked_reason_roundtrips(tmp_path: Path):
     got = reloaded.get_card(c.id)
     assert got.status == CardStatus.BLOCKED
     assert got.blocked_reason == "needs input"
+
+
+def test_agent_profile_round_trips(tmp_path: Path):
+    store = MarkdownBoardStore(tmp_path)
+    card = Card(
+        title="P",
+        goal="g",
+        agent_profile="gemini-worker",
+        agent_profile_source="manual",
+    )
+    store.add_card(card)
+
+    reloaded = MarkdownBoardStore(tmp_path)
+    got = reloaded.get_card(card.id)
+    assert got.agent_profile == "gemini-worker"
+    assert got.agent_profile_source == "manual"
+
+
+def test_agent_profile_absent_by_default(tmp_path: Path):
+    store = MarkdownBoardStore(tmp_path)
+    card = Card(title="P", goal="g")
+    store.add_card(card)
+
+    on_disk = (tmp_path / "cards" / f"{card.id}.md").read_text(encoding="utf-8")
+    assert "agent_profile" not in on_disk
+    assert "agent_profile_source" not in on_disk
+
+    reloaded = MarkdownBoardStore(tmp_path)
+    got = reloaded.get_card(card.id)
+    assert got.agent_profile is None
+    assert got.agent_profile_source is None
+
+
+def test_legacy_card_without_agent_profile_loads(tmp_path: Path):
+    (tmp_path / "cards").mkdir()
+    (tmp_path / "cards" / "legacy.md").write_text(
+        '+++\n'
+        'id = "legacy"\n'
+        'title = "L"\n'
+        'status = "inbox"\n'
+        'priority = 2\n'
+        'goal = "g"\n'
+        'acceptance_criteria = []\n'
+        'context_refs = []\n'
+        'depends_on = []\n'
+        'history = []\n'
+        'created_at = 2026-01-01T00:00:00+00:00\n'
+        'updated_at = 2026-01-01T00:00:00+00:00\n'
+        '+++\n\n# L\n',
+        encoding="utf-8",
+    )
+    store = MarkdownBoardStore(tmp_path)
+    card = store.get_card("legacy")
+    assert card.agent_profile is None
+    assert card.agent_profile_source is None

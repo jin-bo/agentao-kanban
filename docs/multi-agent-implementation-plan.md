@@ -3,7 +3,7 @@
 ## TL;DR
 
 Make the four roles real by defining each as an agentao sub-agent
-(`docs/agent-definitions/kanban-<role>.md`), add a local daemon so scheduling
+(`kanban/defaults/kanban-<role>.md`), add a local daemon so scheduling
 runs continuously, then add structured execution records. Defer ACP
 until this local runtime is stable.
 
@@ -139,7 +139,7 @@ Do **not** invent a parallel `AgentSpec` / prompt module in kanban.
 agentao already has a first-class sub-agent mechanism:
 
 - definition format: Markdown with YAML frontmatter
-- discovery: tracked templates under `docs/agent-definitions/*.md`,
+- discovery: tracked templates under `kanban/defaults/*.md`,
   with optional project-local overrides in `.agentao/agents/*.md`
 - fields: `name`, `description`, `tools`, `max_turns`, `model`,
   `temperature`, plus the Markdown body as system instructions
@@ -148,7 +148,7 @@ agentao already has a first-class sub-agent mechanism:
 
 Kanban should adopt this verbatim:
 
-1. Track four role definitions in the repo under `docs/agent-definitions/`:
+1. Track four role definitions in the repo under `kanban/defaults/`:
    - `kanban-planner.md`
    - `kanban-worker.md`
    - `kanban-reviewer.md`
@@ -183,7 +183,7 @@ Benefits:
 
 ### 3a. What a "sub-agent" is, concretely
 
-A kanban sub-agent **is one `docs/agent-definitions/<name>.md` file**
+A kanban sub-agent **is one `kanban/defaults/<name>.md` file**
 loaded by
 agentao's `AgentManager`. The frontmatter declares tool scope and
 iteration limits; the body is the system prompt.
@@ -206,7 +206,7 @@ Phase 1A still needs a short design note answering:
 ### 4. Role prompts live in agent definition files
 
 Role prompts are the body of each
-`docs/agent-definitions/kanban-<role>.md`. There is no
+`kanban/defaults/kanban-<role>.md`. There is no
 `kanban/prompts.py`.
 
 Each definition file should contain:
@@ -375,7 +375,7 @@ That is unnecessary for this repository right now.
 Deliverables:
 
 - short sub-agent design note (see section 3a) merged before code
-- four `docs/agent-definitions/kanban-<role>.md` files with `version:`
+- four `kanban/defaults/kanban-<role>.md` files with `version:`
   frontmatter
 - `ROLE_AGENTS` mapping in `kanban/agents.py`
 - `AgentaoMultiAgentExecutor` that resolves role → agent name →
@@ -440,10 +440,10 @@ Acceptance:
 Suggested new files:
 
 - `docs/multi-agent-implementation-plan.md`
-- `docs/agent-definitions/kanban-planner.md`
-- `docs/agent-definitions/kanban-worker.md`
-- `docs/agent-definitions/kanban-reviewer.md`
-- `docs/agent-definitions/kanban-verifier.md`
+- `kanban/defaults/kanban-planner.md`
+- `kanban/defaults/kanban-worker.md`
+- `kanban/defaults/kanban-reviewer.md`
+- `kanban/defaults/kanban-verifier.md`
 - `kanban/agents.py` (just the `ROLE_AGENTS` mapping)
 - `kanban/executors/agentao_multi.py`
 - `kanban/daemon.py`
@@ -453,7 +453,7 @@ Suggested new files:
 
 Removed from the earlier draft:
 
-- `kanban/prompts.py` — prompts live in `docs/agent-definitions/*.md`
+- `kanban/prompts.py` — prompts live in `kanban/defaults/*.md`
   bodies
 - `tests/test_agent_registry.py` — no registry class to test
 

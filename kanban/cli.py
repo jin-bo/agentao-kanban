@@ -70,9 +70,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--executor",
-        choices=["mock", "agentao"],
+        choices=["mock", "agentao", "multi-backend"],
         default="mock",
-        help="Executor backend (default: mock). `agentao` requires the agentao package.",
+        help=(
+            "Executor backend (default: mock). `agentao` uses the legacy "
+            "role-keyed subagent executor; `multi-backend` uses the "
+            "profile-aware executor that honors card.agent_profile and ACP "
+            "backends. Both require the agentao package."
+        ),
     )
     sub = p.add_subparsers(dest="command", required=True)
 
@@ -116,6 +121,19 @@ def build_parser() -> argparse.ArgumentParser:
         dest="clear_blocked_reason",
         action="store_true",
         help="Clear blocked_reason.",
+    )
+
+    profile_group = edit.add_mutually_exclusive_group()
+    profile_group.add_argument(
+        "--agent-profile",
+        dest="agent_profile",
+        help="Pin the card to a named agent profile (validated against agent_profiles.yaml).",
+    )
+    profile_group.add_argument(
+        "--clear-agent-profile",
+        dest="clear_agent_profile",
+        action="store_true",
+        help="Clear agent_profile and agent_profile_source.",
     )
 
     context = card_sub.add_parser("context", help="Manage card context_refs")
@@ -232,6 +250,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     recover.add_argument("--json", dest="as_json", action="store_true")
 
+    profiles = sub.add_parser("profiles", help="Inspect agent profile routing config")
+    profiles_sub = profiles.add_subparsers(dest="profiles_command", required=True)
+    profiles_sub.add_parser("list", help="List configured agent profiles")
+    p_show = profiles_sub.add_parser("show", help="Show one profile's resolved configuration")
+    p_show.add_argument("name")
+
     sub.add_parser("tick", help="Run a single orchestrator step")
     run = sub.add_parser("run", help="Run orchestrator until idle")
     run.add_argument("--max-steps", type=int, default=100)
@@ -276,7 +300,41 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def _build_executor(name: str) -> CardExecutor:
+def _project_root_for(board: Path) -> Path:
+    """Infer the project root from ``--board``.
+
+    Walks up from the board directory and returns the first ancestor
+    that contains a ``.kanban/`` or ``.agentao/`` marker. When no marker
+    is found we fall back to the resolved board path itself — never
+    ``Path.cwd()`` — so that ``kanban --board /elsewhere/board ...``
+    can only pick up config rooted inside that board's own directory
+    tree (or fall through to packaged defaults), instead of silently
+    reading the shell cwd's ``.kanban/``/``.agentao/`` config.
+    """
+    try:
+        current = board.resolve()
+    except OSError:
+        return board
+    for candidate in (current, *current.parents):
+        if (candidate / ".kanban").is_dir() or (candidate / ".agentao").is_dir():
+            return candidate
+    return current
+
+
+def _agents_dir_for(project_root: Path) -> Path:
+    """Return ``<project_root>/.agentao/agents`` even when it's missing.
+
+    We always return a concrete path so downstream spec loaders
+    (``SubagentBackend``, ``RouterPolicy``) get an explicit, board-scoped
+    search root instead of falling through to their ``Path.cwd()``
+    default. A non-existent path is harmless: the spec loader's
+    ``is_file()`` check skips it and the packaged-defaults fallback
+    still fires.
+    """
+    return project_root / ".agentao" / "agents"
+
+
+def _build_executor(name: str, board: Path | None = None) -> CardExecutor:
     if name == "mock":
         return MockAgentaoExecutor()
     if name == "agentao":
@@ -287,6 +345,58 @@ def _build_executor(name: str) -> CardExecutor:
                 "agentao package is not installed. Run `uv add --editable ../agentao` first."
             ) from exc
         return AgentaoMultiAgentExecutor()
+    if name == "multi-backend":
+        try:
+            from .agent_profiles import ProfileConfigError, load_default_config
+            from .executors.backends.acp_backend import AcpBackend
+            from .executors.backends.subagent_backend import SubagentBackend
+            from .executors.multi_backend import MultiBackendExecutor
+            from .executors.router_policy import RouterPolicy
+        except ImportError as exc:
+            raise SystemExit(
+                "agentao package is not installed. Run `uv add --editable ../agentao` first."
+            ) from exc
+
+        # Derive the project root from --board so config, subagent specs,
+        # ACP server definitions, and router spec all come from the same
+        # place. A bare `kanban --board /elsewhere ...` invocation must
+        # not silently read from the shell's cwd.
+        project_root = _project_root_for(board) if board is not None else Path.cwd()
+        agents_dir = _agents_dir_for(project_root)
+        # Pass the *intended* agents dir even when it doesn't exist on
+        # disk: the spec loader's ``is_file()`` guard skips missing
+        # paths, and passing ``None`` would let it fall back to
+        # ``Path.cwd()/.agentao/agents`` — reintroducing the shell-cwd
+        # leak we just closed in ``_project_root_for``.
+
+        try:
+            config = load_default_config(base=project_root)
+        except ProfileConfigError as exc:
+            raise SystemExit(f"agent_profiles.yaml: {exc}") from exc
+        # Register both backend types so ACP-routed profiles — including
+        # card-pinned ones like `gemini-worker` — can actually run.
+        # `AcpBackend` loads the ACPManager lazily on first invoke, so
+        # environments without `.agentao/acp.json` only fail when a card
+        # actually routes to an ACP profile.
+        #
+        # The router policy is always installed; its own guards
+        # (KANBAN_ROUTER=off, router.enabled_roles, missing spec,
+        # single-candidate short-circuit) decide whether it actually
+        # calls the router agent. Installing it unconditionally keeps
+        # CLI startup independent of whether the router spec is present.
+        return MultiBackendExecutor(
+            config=config,
+            working_directory=project_root,
+            agents_dir=agents_dir,
+            backends={
+                "subagent": SubagentBackend(agents_dir=agents_dir),
+                "acp": AcpBackend(project_root=project_root),
+            },
+            policy=RouterPolicy(
+                agents_dir=agents_dir,
+                working_directory=project_root,
+            ),
+        )
     raise ValueError(f"Unknown executor: {name}")
 
 
@@ -304,7 +414,9 @@ def _make_store(args: argparse.Namespace) -> MarkdownBoardStore:
 
 def _make_orchestrator(args: argparse.Namespace) -> tuple[MarkdownBoardStore, KanbanOrchestrator]:
     store = _make_store(args)
-    orchestrator = KanbanOrchestrator(store=store, executor=_build_executor(args.executor))
+    orchestrator = KanbanOrchestrator(
+        store=store, executor=_build_executor(args.executor, board=args.board)
+    )
     return store, orchestrator
 
 
@@ -432,6 +544,24 @@ def cmd_card_edit(args: argparse.Namespace) -> int:
         scalar_updates["blocked_reason"] = None
         blocked_changed = True
 
+    profile_changed = False
+    if getattr(args, "agent_profile", None) is not None:
+        from .agent_profiles import ProfileConfigError, load_default_config
+        try:
+            load_default_config(
+                base=_project_root_for(args.board)
+            ).get_profile(args.agent_profile)
+        except ProfileConfigError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        scalar_updates["agent_profile"] = args.agent_profile
+        scalar_updates["agent_profile_source"] = "manual"
+        profile_changed = True
+    elif getattr(args, "clear_agent_profile", False):
+        scalar_updates["agent_profile"] = None
+        scalar_updates["agent_profile_source"] = None
+        profile_changed = True
+
     if not scalar_updates and new_status is None:
         print("Nothing to edit. Pass at least one flag.", file=sys.stderr)
         return 2
@@ -447,6 +577,12 @@ def cmd_card_edit(args: argparse.Namespace) -> int:
                 "Blocked reason cleared via CLI"
                 if args.clear_blocked_reason
                 else "Blocked reason updated via CLI"
+            )
+        if profile_changed:
+            notes.append(
+                "Agent profile cleared via CLI"
+                if getattr(args, "clear_agent_profile", False)
+                else f"Agent profile set to {args.agent_profile!r} via CLI"
             )
         for note in notes:
             fresh.add_history(note, role="system")
@@ -1010,6 +1146,50 @@ def cmd_requeue(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_profiles_list(args: argparse.Namespace) -> int:
+    from .agent_profiles import ProfileConfigError, load_default_config
+    try:
+        cfg = load_default_config(base=_project_root_for(args.board))
+    except ProfileConfigError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    defaults = {rc.default_profile: role.value for role, rc in cfg.roles.items()}
+    width = max((len(n) for n in cfg.profiles), default=4)
+    header = f"{'PROFILE':<{width}}  ROLE       BACKEND  TARGET"
+    print(header)
+    for name, profile in sorted(cfg.profiles.items()):
+        default_tag = f"  (default for {defaults[name]})" if name in defaults else ""
+        print(
+            f"{name:<{width}}  {profile.role.value:<9}  "
+            f"{profile.backend.type:<7}  {profile.backend.target}{default_tag}"
+        )
+    return 0
+
+
+def cmd_profiles_show(args: argparse.Namespace) -> int:
+    from .agent_profiles import ProfileConfigError, load_default_config
+    try:
+        cfg = load_default_config(base=_project_root_for(args.board))
+        profile = cfg.get_profile(args.name)
+    except ProfileConfigError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    print(f"name:        {profile.name}")
+    print(f"role:        {profile.role.value}")
+    print(f"backend:     {profile.backend.type} -> {profile.backend.target}")
+    print(f"fallback:    {profile.fallback or '-'}")
+    if profile.capabilities:
+        print(f"capabilities: {', '.join(profile.capabilities)}")
+    if profile.description:
+        print(f"description: {profile.description}")
+    chain = cfg.fallback_chain(profile.name)
+    if len(chain) > 1:
+        print(f"chain:       {' -> '.join(chain)}")
+    return 0
+
+
 def cmd_tick(args: argparse.Namespace) -> int:
     _require_writable(args)
     _, orchestrator = _make_orchestrator(args)
@@ -1114,6 +1294,12 @@ def main(argv: list[str] | None = None) -> int:
                 parser.error(f"Unknown acceptance subcommand: {args.acceptance_command}")
             return handler(args)
         parser.error(f"Unknown card subcommand: {args.card_command}")
+    if args.command == "profiles":
+        if args.profiles_command == "list":
+            return cmd_profiles_list(args)
+        if args.profiles_command == "show":
+            return cmd_profiles_show(args)
+        parser.error(f"Unknown profiles subcommand: {args.profiles_command}")
     dispatch = {
         "list": cmd_list,
         "show": cmd_show,

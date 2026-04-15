@@ -1,12 +1,40 @@
 [project]
 name = "kanban"
-version = "0.1.0"
+version = "0.1.3"
 description = "Minimal multi-agent kanban board"
 readme = "README.md"
 requires-python = ">=3.12"
+license = { file = "LICENSE" }
+authors = [
+    { name = "jin-bo", email = "jinbobo@gmail.com" },
+]
+maintainers = [
+    { name = "jin-bo", email = "jinbobo@gmail.com" },
+]
+keywords = ["kanban", "agents", "agentao", "multi-agent", "workflow"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Software Development",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Office/Business :: Scheduling",
+]
 dependencies = [
     "agentao",
+    "pyyaml>=6.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/jin-bo/agentao-kanban"
+Repository = "https://github.com/jin-bo/agentao-kanban"
+Issues = "https://github.com/jin-bo/agentao-kanban/issues"
+Changelog = "https://github.com/jin-bo/agentao-kanban/releases"
 
 [project.scripts]
 kanban = "kanban.cli:main"
@@ -17,6 +45,26 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["kanban"]
+# Ship the packaged default config + router spec so wheel installs work
+# without a source checkout. Hatchling excludes non-Python files by
+# default; listing them explicitly keeps the artifact deterministic.
+include = [
+    "kanban/**/*.py",
+    "kanban/defaults/*.yaml",
+    "kanban/defaults/*.md",
+]
+
+[tool.hatch.build.targets.sdist]
+# Mirror the wheel's non-Python assets into the sdist so `pip install`
+# from a source tarball (or any downstream packaging that rebuilds the
+# wheel from sdist) still finds `kanban/defaults/*` at runtime.
+include = [
+    "kanban/**/*.py",
+    "kanban/defaults/*.yaml",
+    "kanban/defaults/*.md",
+    "README.md",
+    "LICENSE",
+]
 
 [tool.uv.sources]
 agentao = { path = "../agentao", editable = true }

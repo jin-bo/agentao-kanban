@@ -14,7 +14,7 @@ from kanban.executors.agentao_multi import AgentaoMultiAgentExecutor
 from kanban.models import AgentRole, Card, RetryPolicy
 from kanban.store_markdown import MarkdownBoardStore
 
-REPO_AGENTS_DIR = Path(__file__).resolve().parent.parent / "docs" / "agent-definitions"
+REPO_AGENTS_DIR = Path(__file__).resolve().parent.parent / "kanban" / "defaults"
 
 
 class _FlakyAgent:
