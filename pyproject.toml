@@ -1,6 +1,6 @@
 [project]
 name = "agentao-kanban"
-version = "0.1.4-rc1"
+version = "0.1.4"
 description = "Minimal multi-agent kanban board"
 readme = "README.md"
 requires-python = ">=3.12"
