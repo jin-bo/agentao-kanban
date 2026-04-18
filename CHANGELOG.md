@@ -4,6 +4,21 @@
 版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。1.0 前的 minor 版本视为
 可能包含破坏性变更的功能版本。
 
+## [Unreleased] — 2026-04-18
+
+### Added
+- **Daemon 并行执行**:daemon 支持同时认领并执行多张卡(`--max-claims N`,默认 1),
+  调度器与 worker 角色解耦后可并发推进互不依赖的卡片。
+- **依赖自动推进**:orchestrator 在 tick 时检测所有依赖均已 DONE 的卡,自动将其
+  从 PENDING 推进到 READY,无需手动 unblock。
+- **只读 Web UI**(`kanban web`):新增本地 HTTP server(`kanban/web.py` +
+  `kanban/web_assets/`),在浏览器中展示看板状态、卡片详情与事件流,仅读不写。
+  `pyproject.toml` 新增 `aiohttp` 依赖。
+- MCP server 工具集补充:新增 `tick_once` / `run_until_idle` 等 tool。
+- `uv.toml.example`:项目级 uv 配置样例。
+- 新测试:`tests/test_combined_parallel.py`、`tests/test_dependency_auto_advance.py`、
+  `tests/test_web.py`。
+
 ## [0.1.4-rc1] — 2026-04-17
 
 预发布候选(Release Candidate)。
@@ -102,6 +117,7 @@
   (planner / worker / reviewer / verifier)、本地 dispatcher daemon、基于
   `MockAgentaoExecutor` 的离线状态机。
 
+[Unreleased]: https://github.com/jin-bo/agentao-kanban/compare/v0.1.4-rc1...HEAD
 [0.1.4-rc1]: https://github.com/jin-bo/agentao-kanban/compare/v0.1.3...v0.1.4-rc1
 [0.1.3]: https://github.com/jin-bo/agentao-kanban/releases/tag/v0.1.3
 [0.1.2]: https://github.com/jin-bo/agentao-kanban/releases/tag/v0.1.2
