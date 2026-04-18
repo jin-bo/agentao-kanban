@@ -89,7 +89,7 @@ jobs:
             if /tmp/smoke/bin/pip install \
                 --index-url https://test.pypi.org/simple/ \
                 --extra-index-url https://pypi.org/simple/ \
-                "kanban==${{ steps.ver.outputs.version }}"; then
+                "agentao-kanban==${{ steps.ver.outputs.version }}"; then
               break
             fi
             echo "attempt ${attempt} failed, sleeping before retry (TestPyPI propagation)…"
