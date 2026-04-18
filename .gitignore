@@ -22,3 +22,6 @@ workspace/
 # Editor swap files
 *.swp
 *.swo
+
+# Per-developer uv source overrides (e.g. editable ../agentao)
+uv.toml

@@ -46,6 +46,110 @@ def _make_claim(
 # ---------- MarkdownBoardStore: claims ----------
 
 
+def test_gc_orphaned_runtime_removes_claims_and_results(tmp_path: Path):
+    """Deleting a card file but leaving claims/results must be GC-able."""
+    from kanban.models import Card
+
+    store = MarkdownBoardStore(tmp_path)
+    card = Card(title="Doomed", goal="x")
+    store.add_card(card)
+    claim = _make_claim(card_id=card.id, claim_id="clm-orphan")
+    store.create_claim(claim)
+    envelope = ExecutionResultEnvelope(
+        card_id=card.id,
+        claim_id="clm-orphan",
+        worker_id="w1",
+        role=AgentRole.WORKER,
+        attempt=1,
+        started_at=utc_now(),
+        finished_at=utc_now(),
+        duration_ms=10,
+        ok=True,
+    )
+    store.write_result(envelope)
+
+    # Simulate external card deletion.
+    (tmp_path / "cards" / f"{card.id}.md").unlink()
+
+    # Reopen store — load itself must not raise even with orphaned runtime.
+    reopened = MarkdownBoardStore(tmp_path)
+    # Explicit GC removes the orphans.
+    removed = reopened.gc_orphaned_runtime()
+    assert removed >= 2
+    assert reopened.get_claim(card.id) is None
+    assert list(reopened.read_results()) == []
+
+
+def test_gc_preserves_runtime_for_unparseable_card(tmp_path: Path):
+    """Unparseable card file must not trigger runtime GC — a TOML typo
+    or merge-conflict marker would otherwise destroy in-flight state."""
+    from kanban.models import Card
+
+    store = MarkdownBoardStore(tmp_path)
+    card = Card(title="Flaky", goal="x")
+    store.add_card(card)
+    claim = _make_claim(card_id=card.id, claim_id="clm-keep")
+    store.create_claim(claim)
+    envelope = ExecutionResultEnvelope(
+        card_id=card.id,
+        claim_id="clm-keep",
+        worker_id="w1",
+        role=AgentRole.WORKER,
+        attempt=1,
+        started_at=utc_now(),
+        finished_at=utc_now(),
+        duration_ms=10,
+        ok=True,
+    )
+    store.write_result(envelope)
+
+    # Corrupt the card file so _load() skips it as unparseable.
+    card_path = tmp_path / "cards" / f"{card.id}.md"
+    card_path.write_text("+++\nnot = valid = toml\n+++\n", encoding="utf-8")
+
+    reopened = MarkdownBoardStore(tmp_path)
+    assert card.id not in {c.id for c in reopened.list_cards()}
+    assert reopened.unparseable_cards(), "card should be reported unparseable"
+
+    removed = reopened.gc_orphaned_runtime()
+    assert removed == 0
+    assert any(reopened.claims_dir.glob("*.json")), "claim file must survive"
+    assert any(reopened.results_dir.glob("*.json")), "result file must survive"
+
+
+def test_commit_tolerates_deleted_card(tmp_path: Path):
+    """commit_pending_results must not crash when card file vanished mid-run."""
+    from kanban.models import Card
+    from kanban.executors import MockAgentaoExecutor
+    from kanban import KanbanOrchestrator
+
+    store = MarkdownBoardStore(tmp_path)
+    card = Card(title="Doomed", goal="x")
+    store.add_card(card)
+    claim = _make_claim(card_id=card.id, claim_id="clm-raceo")
+    claim.worker_id = "w1"
+    store.create_claim(claim)
+    envelope = ExecutionResultEnvelope(
+        card_id=card.id,
+        claim_id="clm-raceo",
+        worker_id="w1",
+        role=AgentRole.WORKER,
+        attempt=1,
+        started_at=utc_now(),
+        finished_at=utc_now(),
+        duration_ms=10,
+        ok=True,
+    )
+    store.write_result(envelope)
+    (tmp_path / "cards" / f"{card.id}.md").unlink()
+    store.refresh()
+
+    orch = KanbanOrchestrator(store=store, executor=MockAgentaoExecutor())
+    # Must not raise KeyError
+    orch.commit_pending_results()
+    orch.recover_stale_claims()
+
+
 def test_claim_round_trip_on_disk(tmp_path: Path):
     store = MarkdownBoardStore(tmp_path)
     claim = _make_claim()

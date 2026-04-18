@@ -4,9 +4,49 @@
 版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。1.0 前的 minor 版本视为
 可能包含破坏性变更的功能版本。
 
-## [0.1.3] — 2026-04-15
+## [0.1.4-rc1] — 2026-04-17
 
-当前版本。pyproject / README / 文档以此为准。
+预发布候选(Release Candidate)。
+
+### Added
+- **MCP Server (`kanban-mcp`)**:新增 stdio MCP server,把 card CRUD
+  (add/list/show/move/block/unblock)、`events.log` 尾流、orchestrator
+  `tick`/`run` 共 9 个 tool 暴露给 Claude Code / Codex / 任意 MCP client;
+  另外注册 `kanban://board/snapshot`、`kanban://card/{id}`、
+  `kanban://events/recent` 三个 resource。所有写类 tool 复用 CLI 的
+  `assert_no_daemon` 守卫(daemon 持锁时拒写,启动 `--force` 可绕过)。
+  入口注册在 `[project.scripts]` 的 `kanban-mcp = "kanban.mcp:main"`,
+  实现见 `kanban/mcp.py`,设计文档见
+  [`docs/mcp-server-design.md`](docs/mcp-server-design.md)。
+- **Reviewer/Verifier 返工闭环**:reviewer/verifier 的 `ok=false` JSON 新增
+  第三种形态 `{"ok": false, "revision_request": {"summary", "hints[]",
+  "failing_criteria[]"}}`。orchestrator 检测到 `revision_request` 时累加到
+  `Card.revision_requests`(按时间序,永不覆盖)、bump `Card.rework_iteration`、
+  把卡从 REVIEW/VERIFY rewind 到 READY(worktree 保持 attached),worker 下
+  一轮 prompt 里自动注入完整 REWORK HISTORY。预算由 `RetryPolicy.rework`
+  控制(默认 3 次),超限合成 BLOCKED 走原有终态路径。不带 `revision_request`
+  的旧 `{"ok": false, "blocked_reason"}` 继续直接 BLOCKED,向后兼容。
+- 新事件 `rework.requested`,带 `rework_iteration` extra,`events.log` +
+  `kanban events` 文本流同步可见。
+- reviewer / verifier agent spec bump 到 v2:新增 Request rework vs Terminal
+  rejection 的输出契约与选择指南。
+- **每卡 Git worktree 隔离（默认 auto）**:worker 首次 claim 时自动创建
+  `kanban/<card-id>` 分支与 `workspace/worktrees/<card-id>` 工作目录,
+  worker/reviewer/verifier 在同一 worktree 内串行执行;DONE/BLOCKED 自动
+  detach(目录释放、分支保留),scheduler idle tick 与 `kanban worktree
+  prune` 在 merged-to-base 或 BLOCKED retention(默认 7 天)后删分支。
+  `--worktree` tri-state:默认 auto(git repo 内启用、非 git 仓库 stderr
+  warning 后降级关闭);`--worktree` 硬要求 git repo;`--no-worktree` 关。
+- Worktree 运行时注入:worker 在调用 executor 前把 `executor.working_directory`
+  临时覆盖为 `claim.worktree_path`,对 executor protocol 零侵入。
+- 新事件:`worktree.created` / `worktree.detached` / `worktree.pruned`,
+  `events.log` + `kanban events` 文本流均带 `wt=kanban/<card-id>` extra。
+- 新子命令:`kanban worktree list` / `prune [--retention-days N]` / `diff <card-id>`。
+- Card TOML front-matter 新增 `worktree_branch` 与 `worktree_base_commit`
+  (fork-point SHA,不可变);ExecutionClaim JSON 新增 `worktree_path`。
+- `docs/worktree-isolation-design.md` — 每卡 Git worktree 隔离设计方案。
+
+## [0.1.3] — 2026-04-15
 
 ### Added
 - Multi-backend 执行器 (`--executor multi-backend`):按角色走 `agent_profiles.yaml`
@@ -62,6 +102,7 @@
   (planner / worker / reviewer / verifier)、本地 dispatcher daemon、基于
   `MockAgentaoExecutor` 的离线状态机。
 
+[0.1.4-rc1]: https://github.com/jin-bo/agentao-kanban/compare/v0.1.3...v0.1.4-rc1
 [0.1.3]: https://github.com/jin-bo/agentao-kanban/releases/tag/v0.1.3
 [0.1.2]: https://github.com/jin-bo/agentao-kanban/releases/tag/v0.1.2
 [0.1.1]: https://github.com/jin-bo/agentao-kanban/releases/tag/v0.1.1

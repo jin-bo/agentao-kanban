@@ -1,6 +1,6 @@
 # kanban
 
-**当前版本:v0.1.3**(2026-04-15)。完整变更见 [CHANGELOG.md](CHANGELOG.md)。
+**当前版本:v0.1.4-rc1**。完整变更见 [CHANGELOG.md](CHANGELOG.md)。
 
 一个最小可跑的多 Agent 看板,已经实现:
 
@@ -56,8 +56,14 @@ cd agentao-kanban
 uv sync
 ```
 
-> `pyproject.toml` 把 `agentao` 声明为 `{ path = "../agentao", editable = true }`,
-> 所以本仓库期望与 `agentao` 仓库同级存在。只跑 mock 模式可以忽略这条。
+> `agentao` 已发布到 PyPI(≥ 0.2.10),`uv sync` 会直接从 PyPI 拉,
+> 不再需要同级 `../agentao` 源码。只有同时在改 agentao 的开发者,才需要
+> 在仓库根放一份本地 `uv.toml`(已 `.gitignore`)override:
+>
+> ```toml
+> [sources]
+> agentao = { path = "../agentao", editable = true }
+> ```
 
 ### 路径 A:纯 mock 模式(默认,推荐首次上手)
 
@@ -81,7 +87,9 @@ uv run kanban daemon --detach                   # 后台,日志写 <board>/daemo
 用 `--executor agentao` 调四个本地 sub-agent(planner / worker / reviewer /
 verifier)。额外要求:
 
-1. `../agentao` 源码存在(见先决条件里的路径)。
+1. `agentao` 包可用。`uv sync` 已经从 PyPI 装好(≥ 0.2.10);只有同时在改
+   agentao 源码的开发者才需要按先决条件里的说明配 `uv.toml` 走本地
+   editable。
 2. sub-agent 定义:默认从 `kanban/defaults/*.md` 读,仓库已打包。若要本地
    改 prompt:
 
@@ -154,6 +162,80 @@ profile,或让 router 选中,才会真正调 ACP 后端。此时额外要求:
 uv run pytest -q                                # 单元+集成测试
 uv run kanban doctor                            # 板健康体检
 ```
+
+## 每卡 Worktree 隔离(默认 auto)
+
+当 board 位于 Git 仓库内时,worker 首次 claim 一张卡会自动创建独立
+worktree(`workspace/worktrees/<card-id>`)和分支(`kanban/<card-id>`)。
+worker / reviewer / verifier 都在这个 worktree 中执行,彼此不干扰。卡
+到 DONE 或 BLOCKED 时自动 detach(目录释放、分支保留),分支等你合 PR
+或手动 unblock。
+
+`--worktree` 是 tri-state:
+
+```bash
+uv run kanban run                 # auto(git repo 内默认启用)
+uv run kanban --worktree run      # 硬要求 git repo,否则 SystemExit
+uv run kanban --no-worktree run   # 显式关闭,行为回到 v0.1.3
+```
+
+非 git 仓库下默认会在 stderr 打印一行 warning 后自动降级关闭,不影响
+mock / 临时目录场景。
+
+子命令:
+
+```bash
+uv run kanban worktree list                  # 列出活跃 worktree
+uv run kanban worktree diff <card-id>        # 基于持久化的 fork-point 出 diff
+uv run kanban worktree prune                 # 清 merged/过期分支
+uv run kanban worktree prune --retention-days 14
+```
+
+完整设计见 [`docs/worktree-isolation-design.md`](docs/worktree-isolation-design.md)。
+
+## 作为 MCP Server 暴露(`kanban-mcp`)
+
+把看板当成 Claude Code / Codex / 任意 MCP client 的"调度中心":
+
+```bash
+# Claude Code:在仓库根注册一个 stdio MCP server,作用域是当前项目
+claude mcp add kanban -- uv run --directory $(pwd) kanban-mcp \
+    --board workspace/board
+
+# Codex 或其它 client 同理,改前缀即可:
+#   command = "uv", args = ["run", "--directory", "<repo>", "kanban-mcp", "--board", "workspace/board"]
+```
+
+启动参数:
+
+| 参数 | 说明 |
+|---|---|
+| `--board DIR` | 板路径,默认 `$KANBAN_BOARD` 或 `workspace/board` |
+| `--executor {mock,agentao,multi-backend}` | `tick`/`run` 用哪个执行器,默认 `mock` |
+| `--force` | 跳过 daemon-lock 守卫(仅在 daemon 异常残留锁时使用) |
+
+暴露的 tools(均直接调 `BoardStore`,不走 subprocess):
+
+| Tool | 等价 CLI |
+|---|---|
+| `card_add(title, goal, priority?, acceptance?, depends?)` | `kanban card add` |
+| `card_list(status?)` | `kanban list` |
+| `card_show(card_id)` | `kanban show` |
+| `card_move(card_id, status)` | `kanban move` |
+| `card_block(card_id, reason)` | `kanban block` |
+| `card_unblock(card_id, to?)` | `kanban unblock` |
+| `events_tail(limit?, card_id?, role?, execution_only?)` | `kanban events` |
+| `tick()` | `kanban tick` |
+| `run(max_steps?)` | `kanban run` |
+
+Resources(供 client 通过资源接口缓存读取):
+
+- `kanban://board/snapshot` — 当前 `{status: [titles]}` 快照
+- `kanban://card/{card_id}` — 单卡完整 JSON
+- `kanban://events/recent` — 最近 50 条事件 JSON 数组
+
+写类 tool 在 daemon 持有 `.daemon.lock` 时会拒绝,文案与 CLI `--force`
+路径一致;读类 tool / resource 不受守卫影响。
 
 ## CLI Guide
 

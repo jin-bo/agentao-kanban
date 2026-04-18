@@ -39,6 +39,24 @@ CONTEXT_REF_KINDS = ("required", "optional")
 
 
 @dataclass(slots=True)
+class RevisionRequest:
+    """A reviewer/verifier's structured ask for rework.
+
+    Persisted cumulatively on ``Card.revision_requests`` so every worker
+    pass sees the full history. ``iteration`` is stamped by the
+    orchestrator at apply time (1-based, matches ``card.rework_iteration``
+    after this request is accepted).
+    """
+
+    at: datetime
+    from_role: "AgentRole"
+    iteration: int
+    summary: str
+    hints: list[str] = field(default_factory=list)
+    failing_criteria: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
 class ContextRef:
     """Structured pointer to an external file the agent should read.
 
@@ -145,8 +163,17 @@ class Card:
     history: list[str] = field(default_factory=list)
     created_at: datetime = field(default_factory=utc_now)
     updated_at: datetime = field(default_factory=utc_now)
+    blocked_at: datetime | None = None
     agent_profile: str | None = None
     agent_profile_source: str | None = None
+    worktree_branch: str | None = None
+    worktree_base_commit: str | None = None
+    # Reviewer/verifier rework loop. ``revision_requests`` is append-only
+    # and shown to the worker on each rework pass. ``rework_iteration``
+    # counts accepted reworks (not raw reject events) and is capped by
+    # ``RetryPolicy.rework``.
+    revision_requests: list[RevisionRequest] = field(default_factory=list)
+    rework_iteration: int = 0
 
     def __post_init__(self) -> None:
         self.context_refs = [ContextRef.coerce(r) for r in self.context_refs]
@@ -191,6 +218,10 @@ class CardEvent:
     # Persisted alongside the scalar fields so ACP postmortems survive
     # a board reload rather than only living on the in-memory AgentResult.
     backend_metadata: dict[str, Any] = field(default_factory=dict)
+    worktree_branch: str | None = None
+    # Populated on ``rework.requested`` events so the text stream surfaces
+    # "iteration N/M" at a glance without reloading the card.
+    rework_iteration: int | None = None
 
     @property
     def is_execution(self) -> bool:
@@ -238,6 +269,12 @@ class AgentResult:
     # agent-router-design Open Question #2.
     router_prompt_version: str | None = None
     backend_metadata: dict[str, Any] = field(default_factory=dict)
+    # When the reviewer or verifier asks the worker to fix specific
+    # issues. Signals the orchestrator's rework path (see
+    # ``KanbanOrchestrator._apply_rework``). ``next_status`` is ignored on
+    # the rework path — the orchestrator moves the card back to READY
+    # (or BLOCKED if the rework budget is exhausted).
+    revision_request: RevisionRequest | None = None
 
 
 # ---------- v0.1.2 runtime concurrency kernel ----------
@@ -296,6 +333,7 @@ class ExecutionClaim:
     worker_id: str | None = None
     retry_count: int = 0
     retry_of_claim_id: str | None = None
+    worktree_path: str | None = None
 
     def is_expired(self, *, now: datetime | None = None) -> bool:
         return self.lease_expires_at < (now or utc_now())
@@ -332,6 +370,11 @@ class RetryPolicy:
     timeout: int = 1
     malformed: int = 0
     functional: int = 0
+    # Cross-role reviewer/verifier → worker rework cycles. Not a
+    # ``FailureCategory`` (reworks ride the success envelope with a
+    # ``revision_request`` payload). After this many accepted reworks,
+    # the next rework ask BLOCKs the card with "budget exhausted".
+    rework: int = 3
 
     def budget_for(self, category: "FailureCategory | None") -> int:
         if category is None:

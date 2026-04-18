@@ -279,6 +279,81 @@ def test_agent_refusal_blocks_card() -> None:
     assert "unclear goal" in result.updates["blocked_reason"]
 
 
+def test_reviewer_rework_request_produces_rework_result() -> None:
+    """Reviewer returning ok=false with a revision_request must flow through
+    the rework loop (next_status=REVIEW + revision_request attached), not be
+    collapsed into a terminal BLOCKED. Profile-routed runs must honor the
+    same reviewer/verifier contract as the legacy agentao executor."""
+    refused = (
+        """reject\n```json\n"""
+        """{"ok": false, "blocked_reason": "missing test", """
+        """"revision_request": {"summary": "add tests/test_foo.py", """
+        """"hints": ["write one assertion"], """
+        """"failing_criteria": ["tests exist"]}}\n"""
+        """```\n"""
+    )
+    exec_ = MultiBackendExecutor(
+        config=load_default_config(),
+        agents_dir=REPO_AGENTS_DIR,
+        backends={"subagent": _RecordingBackend("subagent", refused)},
+    )
+    card = Card(title="t", goal="g", status=CardStatus.REVIEW)
+    result = exec_.run(AgentRole.REVIEWER, card)
+
+    assert result.next_status == CardStatus.REVIEW  # safe fallback, not BLOCKED
+    assert result.revision_request is not None
+    assert result.revision_request.summary == "add tests/test_foo.py"
+    assert result.revision_request.hints == ["write one assertion"]
+    assert result.revision_request.failing_criteria == ["tests exist"]
+    assert result.revision_request.from_role == AgentRole.REVIEWER
+    # A rework result must not carry a blocked_reason update.
+    assert "blocked_reason" not in result.updates
+
+
+def test_verifier_rework_request_produces_rework_result() -> None:
+    refused = (
+        """reject\n```json\n"""
+        """{"ok": false, "blocked_reason": "did not run", """
+        """"revision_request": {"summary": "run the test"}}\n"""
+        """```\n"""
+    )
+    exec_ = MultiBackendExecutor(
+        config=load_default_config(),
+        agents_dir=REPO_AGENTS_DIR,
+        backends={"subagent": _RecordingBackend("subagent", refused)},
+    )
+    card = Card(title="t", goal="g", status=CardStatus.VERIFY)
+    result = exec_.run(AgentRole.VERIFIER, card)
+
+    assert result.next_status == CardStatus.VERIFY
+    assert result.revision_request is not None
+    assert result.revision_request.from_role == AgentRole.VERIFIER
+    assert result.revision_request.summary == "run the test"
+
+
+def test_worker_refusal_with_revision_request_still_blocks() -> None:
+    """Only reviewer/verifier may request rework. A worker ok=false payload
+    that happens to include a revision_request field must still BLOCK, so
+    misbehaving workers can't loop themselves."""
+    refused = (
+        """fail\n```json\n"""
+        """{"ok": false, "blocked_reason": "cannot proceed", """
+        """"revision_request": {"summary": "ignored"}}\n"""
+        """```\n"""
+    )
+    exec_ = MultiBackendExecutor(
+        config=load_default_config(),
+        agents_dir=REPO_AGENTS_DIR,
+        backends={"subagent": _RecordingBackend("subagent", refused)},
+    )
+    card = Card(title="t", goal="g", status=CardStatus.DOING)
+    result = exec_.run(AgentRole.WORKER, card)
+
+    assert result.next_status == CardStatus.BLOCKED
+    assert result.revision_request is None
+    assert "cannot proceed" in result.updates["blocked_reason"]
+
+
 def test_backend_exception_raises_for_retry() -> None:
     class _Boom:
         backend_type = "subagent"

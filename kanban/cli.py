@@ -18,6 +18,8 @@ from .daemon import (
 )
 import json as _json
 
+import yaml
+
 from .executors import CardExecutor, MockAgentaoExecutor
 from .models import (
     CONTEXT_REF_KINDS,
@@ -49,6 +51,36 @@ def _non_negative_int(value: str) -> int:
         raise argparse.ArgumentTypeError(f"must be >= 0, got {n}")
     return n
 
+
+def _resolve_card_id(store: MarkdownBoardStore, given: str) -> str:
+    """Expand a unique card-id prefix to the full id.
+
+    - Exact full-id match → returned as-is (fast path).
+    - Unique prefix match → expanded to the full id.
+    - No match → returned unchanged so the caller's KeyError path owns
+      the "No card with id X" error and echoes the operator's input.
+    - Ambiguous prefix (2+ matches) → SystemExit(2) with the candidate
+      list, so operators can't silently address the wrong card.
+    """
+    try:
+        store.get_card(given)
+        return given
+    except KeyError:
+        pass
+    matches = [c.id for c in store.list_cards() if c.id.startswith(given)]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        shown = ", ".join(m[:12] for m in matches[:5])
+        more = f" (+{len(matches) - 5} more)" if len(matches) > 5 else ""
+        print(
+            f"Ambiguous card id prefix {given!r} matches {len(matches)} "
+            f"cards: {shown}{more}. Provide more characters.",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+    return given
+
 # Statuses an operator may force via `card edit --set-status`. doing/review/verify
 # are excluded because they have an expected owner_role and would desync the
 # orchestrator — use `requeue` for recovery paths.
@@ -77,6 +109,17 @@ def build_parser() -> argparse.ArgumentParser:
             "role-keyed subagent executor; `multi-backend` uses the "
             "profile-aware executor that honors card.agent_profile and ACP "
             "backends. Both require the agentao package."
+        ),
+    )
+    p.add_argument(
+        "--worktree",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Per-card Git worktree isolation. Default: auto — on when the "
+            "board is inside a Git repo, off otherwise (with a one-line "
+            "warning to stderr). Pass --worktree to hard-require a repo "
+            "(exits if none), or --no-worktree to disable."
         ),
     )
     sub = p.add_subparsers(dest="command", required=True)
@@ -175,6 +218,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     show = sub.add_parser("show", help="Show a single card")
     show.add_argument("card_id")
+    show.add_argument(
+        "--json",
+        dest="as_json",
+        action="store_true",
+        help="Emit a single-line JSON object (for scripting).",
+    )
 
     move = sub.add_parser("move", help="Move a card to a status")
     move.add_argument("card_id")
@@ -297,6 +346,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Mutate the board even if a daemon holds the lock (for recovery only).",
     )
 
+    # --- worktree subcommands ---
+    wt = sub.add_parser("worktree", help="Manage Git worktrees for cards")
+    wt_sub = wt.add_subparsers(dest="worktree_command", required=True)
+    wt_sub.add_parser("list", help="List active worktrees")
+    wt_prune = wt_sub.add_parser("prune", help="Clean up stale worktree branches")
+    wt_prune.add_argument("--retention-days", type=int, default=7)
+    wt_diff = wt_sub.add_parser("diff", help="Show diff for a card's worktree")
+    wt_diff.add_argument("card_id")
+
     return p
 
 
@@ -319,6 +377,54 @@ def _project_root_for(board: Path) -> Path:
         if (candidate / ".kanban").is_dir() or (candidate / ".agentao").is_dir():
             return candidate
     return current
+
+
+def _find_git_root_optional(board: Path) -> Path | None:
+    """Return the Git toplevel for a board path, or None if none exists.
+
+    Uses ``git rev-parse --show-toplevel`` which works for regular repos,
+    linked worktrees (``.git`` is a file), and boards nested inside repos.
+    When the board path does not yet exist, walk up to the first existing
+    ancestor so we bind to the correct repo even on fresh boards. Returns
+    None (rather than raising) when no existing ancestor or no repo can
+    be found — callers decide whether that's a hard failure.
+    """
+    import subprocess
+
+    try:
+        start = board.resolve(strict=False)
+    except OSError:
+        start = board
+    probe = start
+    while not probe.exists():
+        parent = probe.parent
+        if parent == probe:
+            return None
+        probe = parent
+    result = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"],
+        cwd=probe,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    return Path(result.stdout.strip())
+
+
+def _find_git_root(board: Path) -> Path:
+    """Find the Git toplevel for a board path, raising SystemExit if none.
+
+    Used by subcommands that cannot function outside a Git repo
+    (``worktree list/prune/diff``) and by the ``--worktree`` explicit path.
+    """
+    root = _find_git_root_optional(board)
+    if root is None:
+        raise SystemExit(
+            f"--worktree requires a Git repository (no repo found for {board})"
+        )
+    return root
 
 
 def _agents_dir_for(project_root: Path) -> Path:
@@ -412,10 +518,88 @@ def _make_store(args: argparse.Namespace) -> MarkdownBoardStore:
     return MarkdownBoardStore(args.board)
 
 
+def _detach_worktree_after_terminal_cli(
+    args: argparse.Namespace, store: MarkdownBoardStore, card_id: str
+) -> None:
+    """CLI counterpart to ``KanbanOrchestrator._apply_normal_result``'s
+    detach step. Called by manual transitions to BLOCKED/DONE so they
+    release the attached ``workspace/worktrees/<card-id>`` directory
+    (otherwise ``worktree prune`` skips the branch because the
+    directory still exists, and manually-blocked cards accumulate
+    stale attached worktrees forever).
+
+    Quietly no-ops when:
+
+    - ``--no-worktree`` was passed (operator explicitly opted out of
+      touching Git state on this command),
+    - ``--force`` is set on a board outside any Git repo,
+    - the card was never attached to a worktree,
+    - the transition is not terminal.
+
+    Suppresses the auto-resolver's "worktree disabled" stderr warning
+    that would otherwise fire on every block/move/edit on a non-git
+    board — that warning is for orchestrator init, not cleanup.
+    """
+    if getattr(args, "worktree", None) is False:
+        return
+    try:
+        card = store.get_card(card_id)
+    except KeyError:
+        return
+    if card.worktree_branch is None:
+        return
+    if card.status not in (CardStatus.DONE, CardStatus.BLOCKED):
+        return
+    project_root = _find_git_root_optional(args.board)
+    if project_root is None:
+        return
+    from .orchestrator import detach_worktree_on_terminal
+    from .worktree import WorktreeManager
+
+    wt_mgr = WorktreeManager(
+        project_root=project_root,
+        worktrees_root=project_root / "workspace" / "worktrees",
+    )
+    detach_worktree_on_terminal(store, wt_mgr, card_id, card.status)
+
+
+def _resolve_worktree_mgr(args: argparse.Namespace):
+    """Resolve the worktree manager from ``--worktree`` tri-state semantics.
+
+    - ``None`` (default): auto — enable when the board is in a Git repo,
+      otherwise emit a one-line warning and disable.
+    - ``True`` (``--worktree``): hard-require a Git repo, SystemExit if none.
+    - ``False`` (``--no-worktree``): always disabled.
+    """
+    requested = getattr(args, "worktree", None)
+    if requested is False:
+        return None
+    project_root = _find_git_root_optional(args.board)
+    if project_root is None:
+        if requested is True:
+            # Reuse the raising helper to surface the existing error text.
+            _find_git_root(args.board)
+        print(
+            "kanban: worktree isolation disabled (board not in a Git "
+            "repo). Pass --no-worktree to silence, or --worktree to "
+            "hard-require a repo.",
+            file=sys.stderr,
+        )
+        return None
+    from .worktree import WorktreeManager
+
+    return WorktreeManager(
+        project_root=project_root,
+        worktrees_root=project_root / "workspace" / "worktrees",
+    )
+
+
 def _make_orchestrator(args: argparse.Namespace) -> tuple[MarkdownBoardStore, KanbanOrchestrator]:
     store = _make_store(args)
     orchestrator = KanbanOrchestrator(
-        store=store, executor=_build_executor(args.executor, board=args.board)
+        store=store,
+        executor=_build_executor(args.executor, board=args.board),
+        worktree_mgr=_resolve_worktree_mgr(args),
     )
     return store, orchestrator
 
@@ -468,34 +652,118 @@ def _require_card_writable(args: argparse.Namespace, card_id: str) -> None:
     raise SystemExit(2)
 
 
-def _print_card(card: Card) -> None:
-    print(f"{card.id}  [{card.status.value}]  {card.title}  (priority={card.priority.name})")
+def _iso_z(dt) -> str:
+    """Render a datetime as ISO-Z (matches ``_format_event_line``)."""
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _card_to_mapping(card: Card) -> dict[str, object]:
+    """Build the ordered dict rendered by both YAML and JSON outputs.
+
+    Only set/non-empty fields are included so the block stays tight for
+    cards that haven't hit the runtime path yet.
+    """
+    data: dict[str, object] = {
+        "id": card.id,
+        "title": card.title,
+        "status": card.status.value,
+        "priority": card.priority.name,
+    }
     if card.owner_role is not None:
-        print(f"  owner: {card.owner_role.value}")
+        data["owner_role"] = card.owner_role.value
+    data["goal"] = card.goal
     if card.blocked_reason:
-        print(f"  blocked: {card.blocked_reason}")
-    print(f"  goal: {card.goal}")
+        data["blocked_reason"] = card.blocked_reason
+    if card.blocked_at is not None:
+        data["blocked_at"] = _iso_z(card.blocked_at)
+    data["created_at"] = _iso_z(card.created_at)
+    data["updated_at"] = _iso_z(card.updated_at)
+    if card.agent_profile:
+        data["agent_profile"] = card.agent_profile
+    if card.agent_profile_source:
+        data["agent_profile_source"] = card.agent_profile_source
+    if card.worktree_branch:
+        data["worktree_branch"] = card.worktree_branch
+    if card.worktree_base_commit:
+        data["worktree_base_commit"] = card.worktree_base_commit
+    if card.rework_iteration:
+        data["rework_iteration"] = card.rework_iteration
+    if card.revision_requests:
+        data["revision_requests"] = [
+            _revision_to_mapping(r) for r in card.revision_requests
+        ]
     if card.depends_on:
-        print("  depends_on:")
-        for dep in card.depends_on:
-            print(f"    - {dep}")
+        data["depends_on"] = list(card.depends_on)
     if card.acceptance_criteria:
-        print("  acceptance_criteria:")
-        for item in card.acceptance_criteria:
-            print(f"    - {item}")
+        data["acceptance_criteria"] = list(card.acceptance_criteria)
+    if card.context_refs:
+        data["context_refs"] = [_context_ref_to_mapping(r) for r in card.context_refs]
     if card.outputs:
-        print("  outputs:")
-        for key, value in card.outputs.items():
-            print(f"    {key}: {value}")
+        data["outputs"] = dict(card.outputs)
     if card.history:
-        print("  history:")
-        for item in card.history:
-            print(f"    - {item}")
+        data["history"] = list(card.history)
+    return data
+
+
+def _context_ref_to_mapping(ref: ContextRef) -> dict[str, object]:
+    out: dict[str, object] = {"kind": ref.kind, "path": ref.path}
+    if ref.note:
+        out["note"] = ref.note
+    return out
+
+
+def _revision_to_mapping(rev) -> dict[str, object]:
+    out: dict[str, object] = {
+        "iteration": rev.iteration,
+        "from_role": rev.from_role.value,
+        "at": _iso_z(rev.at),
+        "summary": rev.summary,
+    }
+    if rev.hints:
+        out["hints"] = list(rev.hints)
+    if rev.failing_criteria:
+        out["failing_criteria"] = list(rev.failing_criteria)
+    return out
+
+
+class _BlockDumper(yaml.SafeDumper):
+    """SafeDumper that renders multi-line strings as ``|`` block scalars.
+
+    Default PyYAML renders ``"line1\\nline2"`` as a quoted single-line
+    string with embedded escapes, which is unreadable when the card
+    carries agent transcripts in ``outputs``. Subclassing (instead of
+    mutating ``yaml.SafeDumper`` globally) keeps the custom representer
+    scoped to this CLI.
+    """
+
+
+def _yaml_str_representer(dumper: yaml.SafeDumper, data: str):
+    if "\n" in data:
+        return dumper.represent_scalar("tag:yaml.org,2002:str", data, style="|")
+    return dumper.represent_scalar("tag:yaml.org,2002:str", data)
+
+
+_BlockDumper.add_representer(str, _yaml_str_representer)
+
+
+def _render_card(card: Card, *, as_json: bool) -> str:
+    mapping = _card_to_mapping(card)
+    if as_json:
+        return _json.dumps(mapping, ensure_ascii=False)
+    return yaml.dump(
+        mapping,
+        Dumper=_BlockDumper,
+        sort_keys=False,
+        default_flow_style=False,
+        allow_unicode=True,
+        width=100,
+    )
 
 
 def cmd_card_edit(args: argparse.Namespace) -> int:
-    _require_card_writable(args, args.card_id)
     store = _make_store(args)
+    args.card_id = _resolve_card_id(store, args.card_id)
+    _require_card_writable(args, args.card_id)
     try:
         card = store.get_card(args.card_id)
     except KeyError:
@@ -612,6 +880,7 @@ def cmd_card_edit(args: argparse.Namespace) -> int:
             new_status,
             f"Status manually set to {new_status.value} via CLI",
         )
+        _detach_worktree_after_terminal_cli(args, store, card.id)
 
     print(f"Edited {card.id}")
     return 0
@@ -619,6 +888,7 @@ def cmd_card_edit(args: argparse.Namespace) -> int:
 
 def cmd_card_context_list(args: argparse.Namespace) -> int:
     store = _make_store(args)
+    args.card_id = _resolve_card_id(store, args.card_id)
     try:
         card = store.get_card(args.card_id)
     except KeyError:
@@ -634,8 +904,9 @@ def cmd_card_context_list(args: argparse.Namespace) -> int:
 
 
 def cmd_card_context_add(args: argparse.Namespace) -> int:
-    _require_card_writable(args, args.card_id)
     store = _make_store(args)
+    args.card_id = _resolve_card_id(store, args.card_id)
+    _require_card_writable(args, args.card_id)
     try:
         card = store.get_card(args.card_id)
     except KeyError:
@@ -668,8 +939,9 @@ def cmd_card_context_add(args: argparse.Namespace) -> int:
 
 
 def cmd_card_context_rm(args: argparse.Namespace) -> int:
-    _require_card_writable(args, args.card_id)
     store = _make_store(args)
+    args.card_id = _resolve_card_id(store, args.card_id)
+    _require_card_writable(args, args.card_id)
     try:
         card = store.get_card(args.card_id)
     except KeyError:
@@ -693,6 +965,7 @@ def cmd_card_context_rm(args: argparse.Namespace) -> int:
 
 def cmd_card_acceptance_list(args: argparse.Namespace) -> int:
     store = _make_store(args)
+    args.card_id = _resolve_card_id(store, args.card_id)
     try:
         card = store.get_card(args.card_id)
     except KeyError:
@@ -707,8 +980,9 @@ def cmd_card_acceptance_list(args: argparse.Namespace) -> int:
 
 
 def cmd_card_acceptance_add(args: argparse.Namespace) -> int:
-    _require_card_writable(args, args.card_id)
     store = _make_store(args)
+    args.card_id = _resolve_card_id(store, args.card_id)
+    _require_card_writable(args, args.card_id)
     try:
         card = store.get_card(args.card_id)
     except KeyError:
@@ -726,8 +1000,9 @@ def cmd_card_acceptance_add(args: argparse.Namespace) -> int:
 
 
 def cmd_card_acceptance_rm(args: argparse.Namespace) -> int:
-    _require_card_writable(args, args.card_id)
     store = _make_store(args)
+    args.card_id = _resolve_card_id(store, args.card_id)
+    _require_card_writable(args, args.card_id)
     try:
         card = store.get_card(args.card_id)
     except KeyError:
@@ -753,8 +1028,9 @@ def cmd_card_acceptance_rm(args: argparse.Namespace) -> int:
 
 
 def cmd_card_acceptance_clear(args: argparse.Namespace) -> int:
-    _require_card_writable(args, args.card_id)
     store = _make_store(args)
+    args.card_id = _resolve_card_id(store, args.card_id)
+    _require_card_writable(args, args.card_id)
     try:
         card = store.get_card(args.card_id)
     except KeyError:
@@ -776,13 +1052,14 @@ def cmd_card_acceptance_clear(args: argparse.Namespace) -> int:
 def cmd_card_add(args: argparse.Namespace) -> int:
     _require_writable(args)
     store = _make_store(args)
+    depends_on = [_resolve_card_id(store, dep) for dep in args.depends]
     card = store.add_card(
         Card(
             title=args.title,
             goal=args.goal,
             priority=CardPriority[args.priority],
             acceptance_criteria=list(args.acceptance),
-            depends_on=list(args.depends),
+            depends_on=depends_on,
         )
     )
     print(f"Created card {card.id}")
@@ -807,43 +1084,56 @@ def cmd_list(args: argparse.Namespace) -> int:
 
 def cmd_show(args: argparse.Namespace) -> int:
     store = _make_store(args)
+    args.card_id = _resolve_card_id(store, args.card_id)
     try:
         card = store.get_card(args.card_id)
     except KeyError:
         print(f"No card with id {args.card_id}", file=sys.stderr)
         return 1
-    _print_card(card)
+    rendered = _render_card(card, as_json=getattr(args, "as_json", False))
+    # yaml.safe_dump already ends with "\n"; json.dumps does not. Use
+    # print's implicit newline for JSON, raw write for YAML so we don't
+    # emit a blank trailing line.
+    if getattr(args, "as_json", False):
+        print(rendered)
+    else:
+        sys.stdout.write(rendered)
     return 0
 
 
 def cmd_move(args: argparse.Namespace) -> int:
-    _require_card_writable(args, args.card_id)
     store = _make_store(args)
+    args.card_id = _resolve_card_id(store, args.card_id)
+    _require_card_writable(args, args.card_id)
     try:
         card = store.move_card(args.card_id, CardStatus(args.status), "Manual move via CLI")
     except KeyError:
         print(f"No card with id {args.card_id}", file=sys.stderr)
         return 1
+    _detach_worktree_after_terminal_cli(args, store, card.id)
     print(f"Moved {card.id} to {card.status.value}")
     return 0
 
 
 def cmd_block(args: argparse.Namespace) -> int:
-    _require_card_writable(args, args.card_id)
     store = _make_store(args)
+    args.card_id = _resolve_card_id(store, args.card_id)
+    _require_card_writable(args, args.card_id)
     try:
         store.update_card(args.card_id, blocked_reason=args.reason)
         card = store.move_card(args.card_id, CardStatus.BLOCKED, f"Blocked: {args.reason}")
     except KeyError:
         print(f"No card with id {args.card_id}", file=sys.stderr)
         return 1
+    _detach_worktree_after_terminal_cli(args, store, card.id)
     print(f"Blocked {card.id}: {args.reason}")
     return 0
 
 
 def cmd_unblock(args: argparse.Namespace) -> int:
-    _require_card_writable(args, args.card_id)
     store = _make_store(args)
+    args.card_id = _resolve_card_id(store, args.card_id)
+    _require_card_writable(args, args.card_id)
     try:
         target = CardStatus(args.target)
         store.update_card(args.card_id, blocked_reason=None)
@@ -851,6 +1141,9 @@ def cmd_unblock(args: argparse.Namespace) -> int:
     except KeyError:
         print(f"No card with id {args.card_id}", file=sys.stderr)
         return 1
+    # Unblocking to DONE is the only terminal target here; INBOX/READY/etc.
+    # leave the worktree attached so the next worker dispatch can resume.
+    _detach_worktree_after_terminal_cli(args, store, card.id)
     print(f"Unblocked {card.id} to {card.status.value}")
     return 0
 
@@ -877,6 +1170,8 @@ def _event_to_json(e: CardEvent) -> dict[str, object]:
         ("failure_reason", e.failure_reason),
         ("failure_category", e.failure_category),
         ("retry_of_claim_id", e.retry_of_claim_id),
+        ("worktree_branch", e.worktree_branch),
+        ("rework_iteration", e.rework_iteration),
     ):
         if value is not None:
             record[key] = value
@@ -903,12 +1198,18 @@ def _format_event_line(e: CardEvent) -> str:
         extras.append(f"attempt={e.attempt}")
     if e.retry_of_claim_id:
         extras.append(f"retry_of={e.retry_of_claim_id}")
+    if e.worktree_branch:
+        extras.append(f"wt={e.worktree_branch}")
+    if e.rework_iteration is not None:
+        extras.append(f"rework={e.rework_iteration}")
     suffix = ("  " + " ".join(extras)) if extras else ""
     return f"{stamp}  {e.card_id[:8]}  {tag}  {e.message}{suffix}"
 
 
 def cmd_events(args: argparse.Namespace) -> int:
     store = _make_store(args)
+    if args.card_id is not None:
+        args.card_id = _resolve_card_id(store, args.card_id)
     if args.role is not None:
         role = AgentRole(args.role)
         records = store.list_execution_events(
@@ -948,6 +1249,8 @@ def _format_age(delta_seconds: float) -> str:
 
 def cmd_claims(args: argparse.Namespace) -> int:
     store = _make_store(args)
+    if args.card_id is not None:
+        args.card_id = _resolve_card_id(store, args.card_id)
     from datetime import datetime, timezone as _tz
 
     now = datetime.now(_tz.utc)
@@ -1105,6 +1408,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
 def cmd_traces(args: argparse.Namespace) -> int:
     store = _make_store(args)
+    args.card_id = _resolve_card_id(store, args.card_id)
     try:
         store.get_card(args.card_id)
     except KeyError:
@@ -1122,8 +1426,9 @@ def cmd_traces(args: argparse.Namespace) -> int:
 
 
 def cmd_requeue(args: argparse.Namespace) -> int:
-    _require_card_writable(args, args.card_id)
     store = _make_store(args)
+    args.card_id = _resolve_card_id(store, args.card_id)
+    _require_card_writable(args, args.card_id)
     try:
         card = store.get_card(args.card_id)
     except KeyError:
@@ -1237,7 +1542,7 @@ def cmd_daemon(args: argparse.Namespace) -> int:
     # Workers do not hold the board lock — only scheduler/legacy/all do.
     needs_board_lock = role in ("scheduler", "legacy-serial", "all")
 
-    def _run_daemon() -> int:
+    def _run_daemon(lock_file: Path | None = None) -> int:
         _, orchestrator = _make_orchestrator(args)
         config = _build_config()
         if role == "scheduler":
@@ -1248,6 +1553,10 @@ def cmd_daemon(args: argparse.Namespace) -> int:
             daemon = KanbanDaemon(orchestrator, config=config)
         else:  # all
             daemon = CombinedDaemon(orchestrator, config=config)
+        if lock_file is not None:
+            daemon.add_force_exit_cleanup(
+                lambda p=lock_file: p.unlink(missing_ok=True)
+            )
         daemon.install_signal_handlers()
         if args.once:
             did = daemon.run_once()
@@ -1258,12 +1567,100 @@ def cmd_daemon(args: argparse.Namespace) -> int:
 
     try:
         if needs_board_lock:
-            with daemon_lock(board_dir):
-                return _run_daemon()
+            with daemon_lock(board_dir) as lock_file:
+                return _run_daemon(lock_file)
         return _run_daemon()
     except DaemonLockError as exc:
         print(str(exc), file=sys.stderr)
         return 2
+
+
+def _make_worktree_mgr(args: argparse.Namespace):
+    from .worktree import WorktreeManager
+
+    project_root = _find_git_root(args.board)
+    return WorktreeManager(
+        project_root=project_root,
+        worktrees_root=project_root / "workspace" / "worktrees",
+    )
+
+
+def cmd_worktree_list(args: argparse.Namespace) -> int:
+    mgr = _make_worktree_mgr(args)
+    active = mgr.list_active()
+    if not active:
+        print("No active worktrees.")
+        return 0
+    for wt in active:
+        path_str = str(wt.path) if wt.path else "(detached)"
+        print(f"{wt.card_id[:8]}  {wt.branch}  {path_str}  HEAD={wt.head_commit[:12]}")
+    return 0
+
+
+def cmd_worktree_prune(args: argparse.Namespace) -> int:
+    # Mutates card metadata (worktree_branch / worktree_base_commit) and
+    # appends runtime events; must respect .daemon.lock like every other
+    # write path so it doesn't race the scheduler's own prune cycle.
+    _require_writable(args)
+    mgr = _make_worktree_mgr(args)
+    store = _make_store(args)
+    all_cards = store.list_cards()
+    card_statuses = {c.id: c.status for c in all_cards}
+    card_blocked_at = {
+        c.id: c.blocked_at for c in all_cards if c.blocked_at is not None
+    }
+    pruned = mgr.prune_stale(
+        card_statuses,
+        retention_days=args.retention_days,
+        card_blocked_at=card_blocked_at,
+    )
+    if not pruned:
+        print("No stale branches to prune.")
+    else:
+        for cid in pruned:
+            # Clear stale worktree metadata so later reruns rebuild isolation.
+            # Match the scheduler's idle-prune path in kanban/daemon.py so
+            # manual prunes are also visible in events.log / `kanban events`.
+            try:
+                store.update_card(
+                    cid, worktree_branch=None, worktree_base_commit=None,
+                )
+                store.append_runtime_event(
+                    cid,
+                    event_type="worktree.pruned",
+                    message=f"Worktree branch pruned: kanban/{cid}",
+                    worktree_branch=f"kanban/{cid}",
+                )
+            except KeyError:
+                pass
+            print(f"Pruned kanban/{cid}")
+    return 0
+
+
+def cmd_worktree_diff(args: argparse.Namespace) -> int:
+    mgr = _make_worktree_mgr(args)
+    store = _make_store(args)
+    args.card_id = _resolve_card_id(store, args.card_id)
+    try:
+        card = store.get_card(args.card_id)
+    except KeyError:
+        print(f"No card with id {args.card_id}", file=sys.stderr)
+        return 1
+    if not card.worktree_base_commit:
+        print(f"Card {args.card_id[:8]} has no worktree base commit.", file=sys.stderr)
+        return 1
+    from .worktree import WorktreeDiffError
+
+    try:
+        diff = mgr.diff_summary(card.id, card.worktree_base_commit)
+    except WorktreeDiffError as exc:
+        print(f"worktree diff failed: {exc}", file=sys.stderr)
+        return 1
+    if diff:
+        print(diff, end="")
+    else:
+        print("No changes.")
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1300,6 +1697,13 @@ def main(argv: list[str] | None = None) -> int:
         if args.profiles_command == "show":
             return cmd_profiles_show(args)
         parser.error(f"Unknown profiles subcommand: {args.profiles_command}")
+    if args.command == "worktree":
+        handlers = {
+            "list": cmd_worktree_list,
+            "prune": cmd_worktree_prune,
+            "diff": cmd_worktree_diff,
+        }
+        return handlers[args.worktree_command](args)
     dispatch = {
         "list": cmd_list,
         "show": cmd_show,

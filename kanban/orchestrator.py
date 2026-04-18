@@ -4,6 +4,9 @@ from dataclasses import dataclass
 from datetime import timedelta
 from uuid import uuid4
 
+from pathlib import Path
+from typing import TYPE_CHECKING
+
 from .executors.base import CardExecutor
 from .models import (
     AgentResult,
@@ -18,9 +21,13 @@ from .models import (
     LeasePolicy,
     ResourceUsage,
     RetryPolicy,
+    RevisionRequest,
     utc_now,
 )
 from .store import BoardStore
+
+if TYPE_CHECKING:
+    from .worktree import WorktreeManager
 
 
 @dataclass(slots=True)
@@ -29,6 +36,109 @@ class WipPolicy:
 
 
 _WIP_STATUSES = (CardStatus.DOING, CardStatus.REVIEW, CardStatus.VERIFY)
+
+# Sentinel used to distinguish "executor had no `working_directory` attribute"
+# from "executor had `working_directory = None`". Dataclass executors like
+# `MultiBackendExecutor` default the field to `None`, so a plain `is None`
+# check would incorrectly trigger ``del`` and break the next run with
+# ``AttributeError``.
+_MISSING: object = object()
+
+
+def detach_worktree_on_terminal(
+    store: BoardStore,
+    worktree_mgr,
+    card_id: str,
+    target_status: CardStatus,
+) -> None:
+    """Detach the card's worktree if the transition is terminal.
+
+    Mirrors the inline logic ``KanbanOrchestrator._apply_normal_result``
+    has used since v0.1.3. Factored out so manual CLI transitions
+    (``kanban block``, ``kanban move <id> done``, ``card edit
+    --set-status``) don't leak attached ``workspace/worktrees/<card-id>``
+    directories — once attached, ``worktree prune`` skips the branch
+    because the directory still exists.
+
+    No-op when:
+
+    - ``worktree_mgr`` is ``None`` (board not git-backed),
+    - ``target_status`` is not ``DONE`` / ``BLOCKED``, or
+    - the card was never attached to a worktree.
+    """
+    if worktree_mgr is None:
+        return
+    if target_status not in (CardStatus.DONE, CardStatus.BLOCKED):
+        return
+    card = store.get_card(card_id)
+    if card.worktree_branch is None:
+        return
+    if worktree_mgr.detach(card_id):
+        store.append_runtime_event(
+            card_id,
+            event_type="worktree.detached",
+            message=f"Worktree detached: {card.worktree_branch}",
+            worktree_branch=card.worktree_branch,
+        )
+    else:
+        store.append_runtime_event(
+            card_id,
+            event_type="worktree.detach_failed",
+            message=(
+                f"Worktree detach aborted (uncommitted changes preserved): "
+                f"{card.worktree_branch}"
+            ),
+            worktree_branch=card.worktree_branch,
+        )
+
+
+def _patch_executor_cwd(executor, worktree_path: Path):
+    """Point the executor (and its router policy / client) at ``worktree_path``.
+
+    Returns a ``restore()`` callable that puts every patched attribute back.
+    Without walking into ``executor.policy`` / ``policy.client``, a card
+    running under per-card worktree isolation would have the backend
+    invocation read from the worktree while the router agent still read
+    from the shared checkout — defeating isolation for profile selection.
+
+    The executor itself is patched unconditionally (mirrors the v0.1.3
+    contract: ``MockAgentaoExecutor`` has no ``working_directory`` field
+    but the legacy/serial and worker paths have always patched it). For
+    the router policy and its lazily-loaded client we only patch when
+    the attribute already exists, so simple callable policies are left
+    alone.
+    """
+    saved: list[tuple[object, object]] = []
+
+    saved.append((executor, getattr(executor, "working_directory", _MISSING)))
+    executor.working_directory = worktree_path
+
+    policy = getattr(executor, "policy", None)
+    if policy is not None and hasattr(policy, "working_directory"):
+        saved.append((policy, policy.working_directory))
+        policy.working_directory = worktree_path
+        client = getattr(policy, "client", None)
+        if client is not None and hasattr(client, "working_directory"):
+            saved.append((client, client.working_directory))
+            client.working_directory = worktree_path
+
+    def restore() -> None:
+        for target, prev in saved:
+            if prev is _MISSING:
+                if hasattr(target, "working_directory"):
+                    try:
+                        del target.working_directory
+                    except AttributeError:
+                        pass
+            else:
+                target.working_directory = prev
+
+    return restore
+
+
+class WorktreeMissingError(RuntimeError):
+    """Raised when a retry cannot proceed because the card's worktree
+    branch was deleted and cannot be recovered. Caller should BLOCK."""
 
 
 class KanbanOrchestrator:
@@ -39,12 +149,14 @@ class KanbanOrchestrator:
         wip_policy: WipPolicy | None = None,
         lease_policy: LeasePolicy | None = None,
         retry_policy: RetryPolicy | None = None,
+        worktree_mgr: WorktreeManager | None = None,
     ) -> None:
         self.store = store
         self.executor = executor
         self.wip_policy = wip_policy or WipPolicy()
         self.lease_policy = lease_policy or LeasePolicy()
         self.retry_policy = retry_policy or RetryPolicy()
+        self.worktree_mgr = worktree_mgr
 
     def create_card(
         self,
@@ -65,11 +177,21 @@ class KanbanOrchestrator:
 
     def block(self, card_id: str, reason: str) -> Card:
         self.store.update_card(card_id, blocked_reason=reason)
-        return self.store.move_card(card_id, CardStatus.BLOCKED, f"Blocked: {reason}")
+        card = self.store.move_card(
+            card_id, CardStatus.BLOCKED, f"Blocked: {reason}"
+        )
+        detach_worktree_on_terminal(
+            self.store, self.worktree_mgr, card_id, CardStatus.BLOCKED
+        )
+        return card
 
     def unblock(self, card_id: str, target: CardStatus = CardStatus.INBOX) -> Card:
         self.store.update_card(card_id, blocked_reason=None)
-        return self.store.move_card(card_id, target, f"Unblocked to {target.value}")
+        card = self.store.move_card(card_id, target, f"Unblocked to {target.value}")
+        detach_worktree_on_terminal(
+            self.store, self.worktree_mgr, card_id, target
+        )
+        return card
 
     LEGACY_SERIAL_WORKER_ID = "local-serial"
 
@@ -87,7 +209,16 @@ class KanbanOrchestrator:
             return None
 
         card = self.store.get_card(claim.card_id)
-        result = self.executor.run(claim.role, card)
+        _restore_cwd = None
+        if claim.worktree_path is not None:
+            _restore_cwd = _patch_executor_cwd(
+                self.executor, Path(claim.worktree_path)
+            )
+        try:
+            result = self.executor.run(claim.role, card)
+        finally:
+            if _restore_cwd is not None:
+                _restore_cwd()
         self.apply_claim_result(claim, result)
         return self.store.get_card(claim.card_id)
 
@@ -105,60 +236,213 @@ class KanbanOrchestrator:
         Walks actionable cards in priority order and skips any that
         already have a live claim — one claimed front card must not
         prevent the scheduler from filling remaining ``max_claims``
-        capacity behind it. Returns ``None`` only when *every* actionable
-        card is already claimed or there is no actionable card at all.
+        capacity behind it. Cards that fail worktree setup are moved to
+        BLOCKED and the scan continues to the next candidate, so a single
+        bad card cannot stall lower-priority work in the same tick.
+        Returns ``None`` only when *every* actionable card is already
+        claimed, blocked, or there is no actionable card at all.
         """
-        card: Card | None = None
         for candidate in self._iter_actionable_cards():
-            if self.store.get_claim(candidate.id) is None:
-                card = candidate
-                break
-        if card is None:
-            return None
+            if self.store.get_claim(candidate.id) is not None:
+                continue
 
-        role = self._role_for(card)
+            role = self._role_for(candidate)
 
-        # Status-at-claim reflects where the worker will see the card.
-        # READY → DOING at claim time so scheduler owns all workflow-status
-        # transitions into executable states.
-        status_at_claim = (
-            CardStatus.DOING if card.status == CardStatus.READY else card.status
-        )
+            # Status-at-claim reflects where the worker will see the card.
+            # READY → DOING at claim time so scheduler owns all workflow-status
+            # transitions into executable states.
+            status_at_claim = (
+                CardStatus.DOING
+                if candidate.status == CardStatus.READY
+                else candidate.status
+            )
 
-        now = utc_now()
-        lease_expires = now + timedelta(seconds=self.lease_policy.lease_seconds)
-        claim = ExecutionClaim(
-            card_id=card.id,
-            claim_id=f"clm-{uuid4().hex[:12]}",
-            role=role,
-            status_at_claim=status_at_claim,
-            attempt=1,
-            claimed_at=now,
-            heartbeat_at=now,
-            lease_expires_at=lease_expires,
-            timeout_s=self.lease_policy.timeout_for(role),
-            worker_id=worker_id,
-        )
+            now = utc_now()
+            lease_expires = now + timedelta(seconds=self.lease_policy.lease_seconds)
+            claim = ExecutionClaim(
+                card_id=candidate.id,
+                claim_id=f"clm-{uuid4().hex[:12]}",
+                role=role,
+                status_at_claim=status_at_claim,
+                attempt=1,
+                claimed_at=now,
+                heartbeat_at=now,
+                lease_expires_at=lease_expires,
+                timeout_s=self.lease_policy.timeout_for(role),
+                worker_id=worker_id,
+            )
 
-        # Persist the claim BEFORE moving status. If create_claim raises
-        # (stale sentinel, fs error, duplicate), the card stays in READY —
-        # the scheduler will simply retry on the next tick. Only after the
-        # claim is safely on disk do we advance the card, so we can never
-        # leave a DOING card without a live claim.
-        self.store.create_claim(claim)
-        if card.status == CardStatus.READY:
-            try:
-                self.store.move_card(
-                    card.id, CardStatus.DOING, "Dispatcher moved card to doing"
-                )
-            except Exception:
-                # Roll back the claim so the next tick can retry cleanly.
+            if not self._setup_worktree_for_claim(candidate, role, claim):
+                # Card was blocked by worktree setup; try the next candidate
+                # so one broken card does not stall the rest of the queue.
+                continue
+
+            # Persist the claim BEFORE moving status. If create_claim raises
+            # (stale sentinel, fs error, duplicate), the card stays in READY —
+            # the scheduler will simply retry on the next tick. Only after the
+            # claim is safely on disk do we advance the card, so we can never
+            # leave a DOING card without a live claim.
+            self.store.create_claim(claim)
+            if candidate.status == CardStatus.READY:
                 try:
-                    self.store.clear_claim(card.id, claim_id=claim.claim_id)
-                except Exception:  # noqa: BLE001 — best-effort rollback
-                    pass
-                raise
-        return claim
+                    self.store.move_card(
+                        candidate.id, CardStatus.DOING,
+                        "Dispatcher moved card to doing",
+                    )
+                except Exception:
+                    # Roll back the claim so the next tick can retry cleanly.
+                    try:
+                        self.store.clear_claim(
+                            candidate.id, claim_id=claim.claim_id,
+                        )
+                    except Exception:  # noqa: BLE001 — best-effort rollback
+                        pass
+                    raise
+            return claim
+        return None
+
+    def _setup_worktree_for_claim(
+        self, card: Card, role: AgentRole, claim: ExecutionClaim,
+    ) -> bool:
+        """Resolve the card's worktree and stamp ``claim.worktree_path``.
+
+        Returns ``True`` when the claim is ready to persist. Returns
+        ``False`` after blocking the card on a worktree error so the
+        caller can move on to the next actionable candidate.
+        """
+        if self.worktree_mgr is None or role == AgentRole.PLANNER:
+            return True
+
+        from .worktree import WorktreeCreateError
+
+        if card.worktree_branch is None and role in (
+            AgentRole.REVIEWER, AgentRole.VERIFIER,
+        ):
+            # Card reached REVIEW/VERIFY without a worktree — either the
+            # board pre-dates the worktree feature, or metadata was
+            # cleared. Block rather than run unisolated against the
+            # worker's (presumably modified) main checkout.
+            reason = (
+                f"card has no worktree branch; cannot run "
+                f"{role.value} in isolation"
+            )
+            self.store.update_card(card.id, blocked_reason=reason)
+            self.store.move_card(
+                card.id, CardStatus.BLOCKED, f"Blocked: {reason}",
+            )
+            self.store.append_runtime_event(
+                card.id,
+                event_type="worktree.missing",
+                message=reason,
+            )
+            return False
+
+        if card.worktree_branch is None and role == AgentRole.WORKER:
+            try:
+                wt_info = self.worktree_mgr.create(card.id)
+            except WorktreeCreateError as exc:
+                self.store.update_card(card.id, blocked_reason=str(exc))
+                self.store.move_card(
+                    card.id, CardStatus.BLOCKED, f"Blocked: {exc}",
+                )
+                return False
+            self.store.update_card(
+                card.id,
+                worktree_branch=wt_info.branch,
+                worktree_base_commit=wt_info.base_commit,
+            )
+            claim.worktree_path = str(wt_info.path)
+            self.store.append_runtime_event(
+                card.id,
+                event_type="worktree.created",
+                message=(
+                    f"Worktree created: {wt_info.branch}"
+                    f" from {wt_info.base_commit[:12]}"
+                ),
+                worktree_branch=wt_info.branch,
+            )
+            return True
+
+        if card.worktree_branch is not None:
+            wt_info = self.worktree_mgr.get(
+                card.id, base_commit=card.worktree_base_commit or "",
+            )
+            if wt_info is not None and wt_info.path is not None:
+                claim.worktree_path = str(wt_info.path)
+                return True
+            if wt_info is not None and wt_info.path is None:
+                # Worktree was detached (card unblocked/requeued) — re-checkout
+                recheckout = self.worktree_mgr.recheckout(
+                    card.id, card.worktree_branch,
+                )
+                if recheckout is not None:
+                    claim.worktree_path = str(recheckout)
+                    return True
+                reason = (
+                    f"failed to recheckout worktree {card.worktree_branch};"
+                    " cannot run without isolation"
+                )
+                self.store.update_card(card.id, blocked_reason=reason)
+                self.store.move_card(
+                    card.id, CardStatus.BLOCKED, f"Blocked: {reason}",
+                )
+                self.store.append_runtime_event(
+                    card.id,
+                    event_type="worktree.missing",
+                    message=reason,
+                    worktree_branch=card.worktree_branch,
+                )
+                return False
+            if wt_info is None and role == AgentRole.WORKER:
+                # Branch was pruned but card metadata is stale. Clear it
+                # and create a fresh worktree so isolation is restored.
+                try:
+                    wt_info_new = self.worktree_mgr.create(card.id)
+                except WorktreeCreateError as exc:
+                    self.store.update_card(card.id, blocked_reason=str(exc))
+                    self.store.move_card(
+                        card.id, CardStatus.BLOCKED, f"Blocked: {exc}",
+                    )
+                    return False
+                self.store.update_card(
+                    card.id,
+                    worktree_branch=wt_info_new.branch,
+                    worktree_base_commit=wt_info_new.base_commit,
+                )
+                claim.worktree_path = str(wt_info_new.path)
+                self.store.append_runtime_event(
+                    card.id,
+                    event_type="worktree.created",
+                    message=(
+                        f"Worktree recreated after prune: {wt_info_new.branch}"
+                        f" from {wt_info_new.base_commit[:12]}"
+                    ),
+                    worktree_branch=wt_info_new.branch,
+                )
+                return True
+            if wt_info is None and role in (
+                AgentRole.REVIEWER, AgentRole.VERIFIER,
+            ):
+                # Reviewer/verifier cannot run without the worker's branch;
+                # block the card rather than silently running in the main
+                # checkout.
+                reason = (
+                    f"worktree branch {card.worktree_branch} missing; "
+                    "cannot review/verify deleted work"
+                )
+                self.store.update_card(card.id, blocked_reason=reason)
+                self.store.move_card(
+                    card.id, CardStatus.BLOCKED, f"Blocked: {reason}",
+                )
+                self.store.append_runtime_event(
+                    card.id,
+                    event_type="worktree.missing",
+                    message=reason,
+                    worktree_branch=card.worktree_branch,
+                )
+                return False
+
+        return True
 
     def apply_claim_result(
         self, claim: ExecutionClaim, result: AgentResult
@@ -241,6 +525,20 @@ class KanbanOrchestrator:
         """
         processed = 0
         for env in self.store.read_results():
+            # Defense-in-depth: if the card was deleted externally, drop the
+            # envelope + any live claim rather than crashing in _apply_result.
+            try:
+                self.store.get_card(env.card_id)
+            except KeyError:
+                try:
+                    self.store.delete_result(env.card_id, env.claim_id)
+                    existing = self.store.get_claim(env.card_id)
+                    if existing is not None:
+                        self.store.clear_claim(env.card_id, claim_id=existing.claim_id)
+                except Exception:  # noqa: BLE001
+                    pass
+                processed += 1
+                continue
             claim = self.store.get_claim(env.card_id)
             if claim is None or claim.claim_id != env.claim_id:
                 self._emit_orphan(env, claim, reason="claim_id mismatch")
@@ -313,6 +611,15 @@ class KanbanOrchestrator:
         """
         stale = self.store.list_stale_claims(now=now or utc_now())
         for claim in stale:
+            # Drop stale claim if its card was deleted externally.
+            try:
+                self.store.get_card(claim.card_id)
+            except KeyError:
+                try:
+                    self.store.clear_claim(claim.card_id, claim_id=claim.claim_id)
+                except Exception:  # noqa: BLE001
+                    pass
+                continue
             reason = (
                 f"runtime lease expired on attempt {claim.attempt} "
                 f"(role={claim.role.value}, claim={claim.claim_id})"
@@ -365,7 +672,57 @@ class KanbanOrchestrator:
             worker_id=None,
             retry_count=previous.retry_count + 1,
             retry_of_claim_id=previous.claim_id,
+            worktree_path=previous.worktree_path,
         )
+
+        # Validate the worktree still exists. The previous claim may have
+        # had a worktree_path, but the branch could have been deleted (via
+        # prune or external git branch -D) between executions. If so,
+        # either recreate it (WORKER) or raise so caller can BLOCK
+        # (REVIEWER/VERIFIER).
+        if (
+            self.worktree_mgr is not None
+            and previous.role != AgentRole.PLANNER
+        ):
+            card = self.store.get_card(previous.card_id)
+            if card.worktree_branch is not None:
+                wt_info = self.worktree_mgr.get(
+                    card.id, base_commit=card.worktree_base_commit or "",
+                )
+                if wt_info is not None and wt_info.path is not None:
+                    new_claim.worktree_path = str(wt_info.path)
+                elif wt_info is not None and wt_info.path is None:
+                    recheckout = self.worktree_mgr.recheckout(
+                        card.id, card.worktree_branch,
+                    )
+                    if recheckout is not None:
+                        new_claim.worktree_path = str(recheckout)
+                    else:
+                        raise WorktreeMissingError(
+                            f"cannot recheckout {card.worktree_branch}; "
+                            f"cannot retry {previous.role.value} role"
+                        )
+                elif wt_info is None and previous.role == AgentRole.WORKER:
+                    from .worktree import WorktreeCreateError
+
+                    try:
+                        wt_info_new = self.worktree_mgr.create(card.id)
+                    except WorktreeCreateError as exc:
+                        raise WorktreeMissingError(
+                            f"cannot recreate worktree for retry: {exc}"
+                        ) from exc
+                    self.store.update_card(
+                        card.id,
+                        worktree_branch=wt_info_new.branch,
+                        worktree_base_commit=wt_info_new.base_commit,
+                    )
+                    new_claim.worktree_path = str(wt_info_new.path)
+                elif wt_info is None:
+                    new_claim.worktree_path = None
+                    raise WorktreeMissingError(
+                        f"worktree branch {card.worktree_branch} missing; "
+                        f"cannot retry {previous.role.value} role"
+                    )
 
         self.store.clear_claim(previous.card_id, claim_id=previous.claim_id)
         try:
@@ -421,8 +778,13 @@ class KanbanOrchestrator:
         budget = self.retry_policy.budget_for(category)
         retries_used = failed_claim.retry_count
         if retries_used < budget:
-            self.retry_claim(failed_claim, reason=reason, category=category)
-            return
+            try:
+                self.retry_claim(failed_claim, reason=reason, category=category)
+                return
+            except WorktreeMissingError as exc:
+                # Branch was deleted and cannot be recovered — fall through
+                # to BLOCKED instead of running in the main checkout.
+                reason = f"{reason} ({exc})"
 
         # Exhausted — terminal BLOCKED transition FIRST (card status moves
         # out of any execution state), THEN clear the claim. If the move
@@ -434,6 +796,26 @@ class KanbanOrchestrator:
         self.store.move_card(
             failed_claim.card_id, CardStatus.BLOCKED, f"Blocked: {block_reason}"
         )
+        if self.worktree_mgr is not None:
+            card_obj = self.store.get_card(failed_claim.card_id)
+            if card_obj.worktree_branch is not None:
+                if self.worktree_mgr.detach(failed_claim.card_id):
+                    self.store.append_runtime_event(
+                        failed_claim.card_id,
+                        event_type="worktree.detached",
+                        message=f"Worktree detached: {card_obj.worktree_branch}",
+                        worktree_branch=card_obj.worktree_branch,
+                    )
+                else:
+                    self.store.append_runtime_event(
+                        failed_claim.card_id,
+                        event_type="worktree.detach_failed",
+                        message=(
+                            f"Worktree detach aborted (uncommitted changes preserved): "
+                            f"{card_obj.worktree_branch}"
+                        ),
+                        worktree_branch=card_obj.worktree_branch,
+                    )
         self.store.clear_claim(
             failed_claim.card_id, claim_id=failed_claim.claim_id
         )
@@ -524,6 +906,16 @@ class KanbanOrchestrator:
         return mapping[card.status]
 
     def _apply_result(self, card_id: str, result: AgentResult) -> None:
+        # Reviewer/verifier rework takes a dedicated path so the worktree
+        # stays attached and ``rework_iteration`` / ``revision_requests``
+        # stay internally consistent. A terminal rework exhaustion produces
+        # a synthetic BLOCKED result and delegates back to the normal path.
+        if result.revision_request is not None:
+            self._apply_rework(card_id, result)
+            return
+        self._apply_normal_result(card_id, result)
+
+    def _apply_normal_result(self, card_id: str, result: AgentResult) -> None:
         card = self.store.update_card(card_id, **result.updates)
         card.add_history(result.summary, role=result.role)
         self.store.append_execution_event(card_id, result)
@@ -532,3 +924,135 @@ class KanbanOrchestrator:
             result.next_status,
             f"Status changed to {result.next_status.value}",
         )
+        # Detach on any terminal transition so a reviewer/verifier rejection
+        # (next_status=BLOCKED) doesn't leave workspace/worktrees/<card>
+        # attached forever — prune_stale() skips cards whose directory
+        # still exists, so those branches would otherwise accumulate.
+        detach_worktree_on_terminal(
+            self.store, self.worktree_mgr, card_id, result.next_status,
+        )
+
+    def _apply_rework(self, card_id: str, result: AgentResult) -> None:
+        """Handle a reviewer/verifier revision request.
+
+        Accepts up to ``retry_policy.rework`` reworks per card. Each accepted
+        rework appends to ``card.revision_requests``, bumps
+        ``card.rework_iteration``, and moves the card REVIEW/VERIFY → READY
+        so the worker is re-dispatched on the next scheduler tick. The
+        worktree stays attached — the worker picks up where it left off.
+
+        Budget exhaustion synthesizes a BLOCKED ``AgentResult`` and delegates
+        to :meth:`_apply_normal_result` so the standard detach + event path
+        still runs.
+        """
+        assert result.revision_request is not None  # dispatcher guarantees this
+        req = result.revision_request
+        card = self.store.get_card(card_id)
+        next_iter = card.rework_iteration + 1
+        budget = int(self.retry_policy.rework)
+
+        if next_iter > budget:
+            # Budget exhausted — block the card. Still record this last
+            # revision request for postmortem so the operator sees the
+            # final ask that tipped it over.
+            stamped = RevisionRequest(
+                at=req.at,
+                from_role=req.from_role,
+                iteration=next_iter,
+                summary=req.summary,
+                hints=list(req.hints),
+                failing_criteria=list(req.failing_criteria),
+            )
+            new_requests = list(card.revision_requests) + [stamped]
+            self.store.update_card(
+                card_id,
+                revision_requests=new_requests,
+            )
+            reason = (
+                f"rework budget exhausted ({budget} iterations). "
+                f"Last ask from {req.from_role.value}: {req.summary}"
+            )
+            blocked = AgentResult(
+                role=result.role,
+                summary=(
+                    f"{result.role.value} exhausted rework budget "
+                    f"({budget} iterations)"
+                ),
+                next_status=CardStatus.BLOCKED,
+                updates={"blocked_reason": reason, "owner_role": None},
+                prompt_version=result.prompt_version,
+                duration_ms=result.duration_ms,
+                attempt=result.attempt,
+                raw_response=result.raw_response,
+                agent_profile=result.agent_profile,
+                backend_type=result.backend_type,
+                backend_target=result.backend_target,
+                routing_source=result.routing_source,
+                routing_reason=result.routing_reason,
+                fallback_from_profile=result.fallback_from_profile,
+                session_id=result.session_id,
+                router_prompt_version=result.router_prompt_version,
+                backend_metadata=dict(result.backend_metadata),
+            )
+            self._apply_normal_result(card_id, blocked)
+            return
+
+        # Accept rework: stamp iteration, append, bump counter, rewind to READY.
+        stamped = RevisionRequest(
+            at=req.at,
+            from_role=req.from_role,
+            iteration=next_iter,
+            summary=req.summary,
+            hints=list(req.hints),
+            failing_criteria=list(req.failing_criteria),
+        )
+        new_requests = list(card.revision_requests) + [stamped]
+        updates = dict(result.updates)
+        updates["revision_requests"] = new_requests
+        updates["rework_iteration"] = next_iter
+        updates["owner_role"] = AgentRole.WORKER
+        card = self.store.update_card(card_id, **updates)
+        card.add_history(
+            f"rework requested (iteration {next_iter}/{budget}): {req.summary}",
+            role=result.role,
+        )
+        self.store.append_execution_event(card_id, result)
+        self.store.append_runtime_event(
+            card_id,
+            event_type="rework.requested",
+            message=(
+                f"iteration {next_iter}/{budget} by {req.from_role.value}: "
+                f"{req.summary}"
+            ),
+            role=req.from_role,
+            rework_iteration=next_iter,
+            worktree_branch=card.worktree_branch,
+        )
+        self.store.move_card(
+            card_id,
+            CardStatus.READY,
+            (
+                f"Rework iteration {next_iter}/{budget} requested by "
+                f"{req.from_role.value}"
+            ),
+        )
+        # The router cache key is built from card fields the router sees
+        # (title/goal/acceptance/context_refs/...) and ignores rework
+        # state, so the next worker dispatch would otherwise reuse the
+        # pre-rework profile. Bust the entry so the new revision_requests
+        # / rework_iteration trigger a fresh routing decision.
+        self._invalidate_router_cache(card_id)
+
+    def _invalidate_router_cache(self, card_id: str) -> None:
+        """Best-effort: drop cached router decisions for ``card_id``.
+
+        Decoupled via duck-typing on ``executor.policy.invalidate_card``
+        so executors without a router policy (mock, agentao_multi,
+        custom) need no extra surface.
+        """
+        policy = getattr(self.executor, "policy", None)
+        if policy is None:
+            return
+        invalidate = getattr(policy, "invalidate_card", None)
+        if callable(invalidate):
+            invalidate(card_id)

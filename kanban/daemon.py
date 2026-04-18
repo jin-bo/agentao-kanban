@@ -21,11 +21,11 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
-from typing import Iterator
+from typing import Callable, Iterator
 from uuid import uuid4
 
 from .models import ExecutionClaim, FailureCategory, WorkerPresence, utc_now
-from .orchestrator import KanbanOrchestrator
+from .orchestrator import KanbanOrchestrator, _patch_executor_cwd
 
 
 LOCK_FILENAME = ".daemon.lock"
@@ -46,6 +46,24 @@ def _refresh_store(store) -> None:
     refresh = getattr(store, "refresh", None)
     if callable(refresh):
         refresh()
+
+
+def _gc_orphaned_runtime(store) -> None:
+    """Clean runtime artifacts whose card file was deleted externally.
+
+    Without this, the first ``commit_pending_results`` / ``recover_stale``
+    tick would call ``update_card()`` on a missing id and raise KeyError,
+    crashing the daemon loop.
+    """
+    gc = getattr(store, "gc_orphaned_runtime", None)
+    if callable(gc):
+        try:
+            removed = gc()
+        except Exception:  # noqa: BLE001 — best-effort cleanup
+            log.exception("orphan-runtime GC failed; continuing")
+            return
+        if removed:
+            log.warning("GC: removed %d orphan runtime file(s) at startup", removed)
 
 
 def lock_path(board_dir: Path) -> Path:
@@ -169,11 +187,36 @@ class KanbanDaemon:
         self._stop = False
         self._ticks = 0
         self._idle_cycles = 0
+        self._force_exit_cleanups: list[Callable[[], None]] = []
+
+    def add_force_exit_cleanup(self, fn: Callable[[], None]) -> None:
+        """Register a callable to run before force-exiting on a second signal.
+
+        Normal shutdown unwinds through context managers; the force-exit
+        path uses ``os._exit`` to escape a blocked executor call and would
+        otherwise skip them (notably the ``.daemon.lock`` cleanup).
+        """
+        self._force_exit_cleanups.append(fn)
+
+    def _run_force_exit_cleanups(self) -> None:
+        for fn in self._force_exit_cleanups:
+            try:
+                fn()
+            except Exception:  # pragma: no cover - best effort
+                log.exception("force-exit cleanup failed")
 
     # signal handling
     def request_stop(self, signum: int | None = None, _frame=None) -> None:
         name = signal.Signals(signum).name if signum else "request"
-        log.info("Shutdown requested (%s); will stop after current tick.", name)
+        if self._stop:
+            # Second signal — force exit immediately. The current tick may be
+            # blocked in executor.run() which can hold for minutes on real
+            # agents; operators hitting Ctrl-C a second time expect exit now.
+            log.warning("Second %s received; forcing exit.", name)
+            self._run_force_exit_cleanups()
+            os._exit(130)
+        log.info("Shutdown requested (%s); will stop after current tick. "
+                 "Press Ctrl-C again to force exit.", name)
         self._stop = True
 
     def install_signal_handlers(self) -> None:
@@ -201,6 +244,7 @@ class KanbanDaemon:
             self.config.poll_interval,
             type(self.orchestrator.executor).__name__,
         )
+        _gc_orphaned_runtime(self.orchestrator.store)
         while not self._stop:
             did_work = self.run_once()
             if did_work:
@@ -238,10 +282,35 @@ class _RoleDaemonBase:
         self._stop = False
         self._ticks = 0
         self._idle_cycles = 0
+        self._force_exit_cleanups: list[Callable[[], None]] = []
+
+    def add_force_exit_cleanup(self, fn: Callable[[], None]) -> None:
+        """Register a callable to run before force-exiting on a second signal.
+
+        Normal shutdown unwinds through context managers; the force-exit
+        path uses ``os._exit`` to escape a blocked executor call and would
+        otherwise skip them (notably the ``.daemon.lock`` cleanup).
+        """
+        self._force_exit_cleanups.append(fn)
+
+    def _run_force_exit_cleanups(self) -> None:
+        for fn in self._force_exit_cleanups:
+            try:
+                fn()
+            except Exception:  # pragma: no cover - best effort
+                log.exception("force-exit cleanup failed")
 
     def request_stop(self, signum: int | None = None, _frame=None) -> None:
         name = signal.Signals(signum).name if signum else "request"
-        log.info("Shutdown requested (%s); will stop after current tick.", name)
+        if self._stop:
+            # Second signal — force exit. The current tick may be blocked in
+            # executor.run() on a real agent for minutes; Ctrl-C twice means
+            # exit now.
+            log.warning("Second %s received; forcing exit.", name)
+            self._run_force_exit_cleanups()
+            os._exit(130)
+        log.info("Shutdown requested (%s); will stop after current tick. "
+                 "Press Ctrl-C again to force exit.", name)
         self._stop = True
 
     def install_signal_handlers(self) -> None:
@@ -270,6 +339,7 @@ class _RoleDaemonBase:
             os.getpid(),
             self.config.poll_interval,
         )
+        _gc_orphaned_runtime(self.orchestrator.store)
         while not self._stop:
             did_work = self.run_once()
             if did_work:
@@ -332,6 +402,44 @@ class SchedulerDaemon(_RoleDaemonBase):
                 claim.role.value,
                 claim.attempt,
             )
+
+        if not (created or committed or recovered):
+            wt_mgr = getattr(self.orchestrator, "worktree_mgr", None)
+            if wt_mgr is not None:
+                all_cards = store.list_cards()
+                card_statuses = {c.id: c.status for c in all_cards}
+                card_blocked_at = {
+                    c.id: c.blocked_at for c in all_cards if c.blocked_at is not None
+                }
+                pruned = wt_mgr.prune_stale(
+                    card_statuses, card_blocked_at=card_blocked_at,
+                )
+                for cid in pruned:
+                    # Clear stale worktree metadata on the card so any later
+                    # unblock/requeue recreates isolation from scratch.
+                    # Tolerate races where an operator deleted the card file
+                    # between list_cards() and this loop — match the same
+                    # external-delete handling in commit_pending_results()
+                    # and recover_stale_claims().
+                    try:
+                        self.orchestrator.store.update_card(
+                            cid,
+                            worktree_branch=None,
+                            worktree_base_commit=None,
+                        )
+                        self.orchestrator.store.append_runtime_event(
+                            cid,
+                            event_type="worktree.pruned",
+                            message=f"Worktree branch pruned: kanban/{cid}",
+                            worktree_branch=f"kanban/{cid}",
+                        )
+                    except KeyError:
+                        log.info(
+                            "card %s vanished before worktree prune metadata "
+                            "could be recorded; skipping",
+                            cid[:8],
+                        )
+
         return bool(created or committed or recovered)
 
 
@@ -468,6 +576,11 @@ class WorkerDaemon(_RoleDaemonBase):
         started_at = utc_now()
         # Run executor under a heartbeat-renewed lease so a legitimate
         # long run is not declared stale mid-flight.
+        _restore_cwd = None
+        if claim.worktree_path is not None:
+            _restore_cwd = _patch_executor_cwd(
+                self.orchestrator.executor, Path(claim.worktree_path)
+            )
         with self._heartbeat_claim(claim):
             try:
                 result = self.orchestrator.executor.run(claim.role, card)
@@ -492,6 +605,9 @@ class WorkerDaemon(_RoleDaemonBase):
                     started_at=started_at,
                     ok=True,
                 )
+            finally:
+                if _restore_cwd is not None:
+                    _restore_cwd()
         self._ticks += 1
         return True
 

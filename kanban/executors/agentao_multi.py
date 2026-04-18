@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, Callable, Protocol
 
 from ..agents import AgentSpec, load_spec
-from ..models import AgentResult, AgentRole, Card, CardStatus
+from ..models import AgentResult, AgentRole, Card, CardStatus, RevisionRequest, utc_now
 
 
 _NEXT_STATUS: dict[AgentRole, CardStatus] = {
@@ -92,10 +92,14 @@ class AgentaoMultiAgentExecutor:
 
         elapsed_ms = int((time.monotonic() - t0) * 1000)
         parsed = _parse_response(raw)
-        # Agent self-declared failure = functional rejection. The matrix
-        # treats this as unretryable (agent ran fine, said no).
+        # Agent self-declared failure. Reviewer/verifier may attach a
+        # structured ``revision_request`` to ask for worker rework; absent
+        # that, the rejection is terminal (current behavior).
         if parsed.get("ok") is False:
             reason = str(parsed.get("blocked_reason") or "Agent reported failure")
+            revision = _extract_revision_request(role, parsed)
+            if revision is not None:
+                return _rework_result(role, revision, spec, elapsed_ms, raw)
             return _blocked_result(role, reason, spec, elapsed_ms, raw)
 
         if role == AgentRole.PLANNER:
@@ -163,12 +167,37 @@ def _build_prompt(role: AgentRole, card: Card) -> str:
     context_block = _render_context_block(card)
     if context_block:
         parts += ["", context_block]
+    rework_block = _render_rework_block(card)
+    if rework_block:
+        parts += ["", rework_block]
     parts += [
         "",
         "Follow your role's system instructions. End with the required "
         "```json``` fenced block.",
     ]
     return "\n".join(parts)
+
+
+def _render_rework_block(card: Card) -> str:
+    if not card.revision_requests:
+        return ""
+    lines = [
+        (
+            f"REWORK HISTORY ({len(card.revision_requests)} request(s) "
+            "— address every open issue):"
+        ),
+    ]
+    for r in card.revision_requests:
+        lines.append(
+            f"- iteration {r.iteration} by {r.from_role.value.upper()}: {r.summary}"
+        )
+        if r.failing_criteria:
+            lines.append(
+                "    failing criteria: " + ", ".join(r.failing_criteria)
+            )
+        for hint in r.hints:
+            lines.append(f"    hint: {hint}")
+    return "\n".join(lines)
 
 
 def _render_context_block(card: Card) -> str:
@@ -321,6 +350,78 @@ def _blocked_result(
         prompt_version=spec.version if spec else "",
         duration_ms=duration_ms,
         raw_response=raw,
+    )
+
+
+def _extract_revision_request(
+    role: AgentRole, parsed: dict[str, Any],
+) -> RevisionRequest | None:
+    """Parse a reviewer/verifier ``revision_request`` payload, if any.
+
+    Returns None (caller falls back to terminal BLOCKED) when the role
+    is not reviewer/verifier, when the payload is missing, or when it
+    lacks a ``summary``. Orchestrator stamps the final ``iteration`` so
+    we always emit 0 here.
+    """
+    if role not in (AgentRole.REVIEWER, AgentRole.VERIFIER):
+        return None
+    payload = parsed.get("revision_request")
+    if not isinstance(payload, dict):
+        return None
+    summary = str(payload.get("summary") or "").strip()
+    if not summary:
+        return None
+    hints_raw = payload.get("hints") or []
+    fail_raw = payload.get("failing_criteria") or []
+    hints = (
+        [str(h).strip() for h in hints_raw if str(h).strip()]
+        if isinstance(hints_raw, list)
+        else []
+    )
+    failing = (
+        [str(c).strip() for c in fail_raw if str(c).strip()]
+        if isinstance(fail_raw, list)
+        else []
+    )
+    return RevisionRequest(
+        at=utc_now(),
+        from_role=role,
+        iteration=0,  # stamped by orchestrator
+        summary=summary,
+        hints=hints,
+        failing_criteria=failing,
+    )
+
+
+def _rework_result(
+    role: AgentRole,
+    revision: RevisionRequest,
+    spec: AgentSpec | None,
+    duration_ms: int = 0,
+    raw: str | None = None,
+) -> AgentResult:
+    """Wrap a rework request as an ``AgentResult``.
+
+    ``next_status`` is set to REVIEW (or VERIFY) to match the card's
+    current status so the value is a safe fallback if the orchestrator
+    ever misses the rework path — it won't spuriously advance the card.
+    The orchestrator's ``_apply_rework`` ignores ``next_status`` and
+    moves the card to READY itself.
+    """
+    fallback_status = (
+        CardStatus.REVIEW if role == AgentRole.REVIEWER else CardStatus.VERIFY
+    )
+    return AgentResult(
+        role=role,
+        summary=_tagged(
+            f"{role.value} requested rework: {revision.summary}", spec,
+        ),
+        next_status=fallback_status,
+        updates={},
+        prompt_version=spec.version if spec else "",
+        duration_ms=duration_ms,
+        raw_response=raw,
+        revision_request=revision,
     )
 
 

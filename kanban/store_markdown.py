@@ -26,6 +26,7 @@ from .models import (
     ExecutionResultEnvelope,
     FailureCategory,
     ResourceUsage,
+    RevisionRequest,
     TraceInfo,
     WorkerPresence,
     utc_now,
@@ -105,7 +106,12 @@ class MarkdownBoardStore:
 
     def move_card(self, card_id: str, status: CardStatus, note: str) -> Card:
         card = self.get_card(card_id)
+        previous = card.status
         card.status = status
+        if status == CardStatus.BLOCKED and previous != CardStatus.BLOCKED:
+            card.blocked_at = utc_now()
+        elif status != CardStatus.BLOCKED:
+            card.blocked_at = None
         card.add_history(note, role="system")
         self._write_card(card)
         self.append_event(card_id, note)
@@ -145,6 +151,8 @@ class MarkdownBoardStore:
         failure_reason: str | None = None,
         failure_category: str | None = None,
         retry_of_claim_id: str | None = None,
+        worktree_branch: str | None = None,
+        rework_iteration: int | None = None,
     ) -> None:
         """Emit a structured runtime lifecycle event (plan §Event Model Upgrade).
 
@@ -165,6 +173,8 @@ class MarkdownBoardStore:
             failure_reason=failure_reason,
             failure_category=failure_category,
             retry_of_claim_id=retry_of_claim_id,
+            worktree_branch=worktree_branch,
+            rework_iteration=rework_iteration,
         )
         self._events.append(event)
         record: dict[str, Any] = {
@@ -183,6 +193,8 @@ class MarkdownBoardStore:
             ("failure_reason", failure_reason),
             ("failure_category", failure_category),
             ("retry_of_claim_id", retry_of_claim_id),
+            ("worktree_branch", worktree_branch),
+            ("rework_iteration", rework_iteration),
         ):
             if value is not None:
                 record[key] = value
@@ -610,6 +622,54 @@ class MarkdownBoardStore:
         if self.events_path.exists():
             self._load_events()
 
+    def gc_orphaned_runtime(self) -> int:
+        """Remove claim/result files whose card file is missing from disk.
+
+        A card file that exists but fails to parse is treated as present:
+        runtime state is preserved so a transient front-matter error or
+        merge conflict does not permanently erase in-flight execution
+        metadata. Returns count of files removed.
+        """
+        removed = 0
+        known_ids = (
+            {p.stem for p in self.cards_dir.glob("*.md")}
+            if self.cards_dir.is_dir()
+            else set()
+        )
+        if self.claims_dir.is_dir():
+            for path in self.claims_dir.glob("*.json"):
+                if path.stem in known_ids:
+                    continue
+                try:
+                    path.unlink()
+                    removed += 1
+                    _LOG.warning("Removed orphan claim %s (card missing)", path.name)
+                except OSError as exc:
+                    _LOG.warning("Could not remove orphan claim %s: %s", path.name, exc)
+            for path in self.claims_dir.glob("*.acquiring"):
+                if path.stem not in known_ids:
+                    try:
+                        path.unlink()
+                        removed += 1
+                    except OSError:
+                        pass
+        if self.results_dir.is_dir():
+            for path in self.results_dir.glob("*.json"):
+                try:
+                    data = json.loads(path.read_text(encoding="utf-8"))
+                    card_id = str(data.get("card_id", ""))
+                except (json.JSONDecodeError, OSError):
+                    continue
+                if not card_id or card_id in known_ids:
+                    continue
+                try:
+                    path.unlink()
+                    removed += 1
+                    _LOG.warning("Removed orphan result %s (card missing)", path.name)
+                except OSError as exc:
+                    _LOG.warning("Could not remove orphan result %s: %s", path.name, exc)
+        return removed
+
     def unparseable_cards(self) -> list[str]:
         return list(self._unparseable)
 
@@ -668,6 +728,8 @@ def _decode_event_line(line: str) -> CardEvent | None:
                     if isinstance(data.get("backend_metadata"), dict)
                     else {}
                 ),
+                worktree_branch=data.get("worktree_branch"),
+                rework_iteration=data.get("rework_iteration"),
             )
         except (json.JSONDecodeError, KeyError, ValueError):
             return None
@@ -710,6 +772,8 @@ def _card_to_toml_dict(card: Card) -> dict[str, Any]:
         "created_at": card.created_at,
         "updated_at": card.updated_at,
     }
+    if card.blocked_at is not None:
+        data["blocked_at"] = card.blocked_at
     if card.owner_role is not None:
         data["owner_role"] = card.owner_role.value
     if card.blocked_reason is not None:
@@ -720,6 +784,24 @@ def _card_to_toml_dict(card: Card) -> dict[str, Any]:
         data["agent_profile_source"] = card.agent_profile_source
     if card.outputs:
         data["outputs"] = dict(card.outputs)
+    if card.worktree_branch is not None:
+        data["worktree_branch"] = card.worktree_branch
+    if card.worktree_base_commit is not None:
+        data["worktree_base_commit"] = card.worktree_base_commit
+    if card.revision_requests:
+        data["revision_requests"] = [
+            {
+                "at": r.at,
+                "from_role": r.from_role.value,
+                "iteration": int(r.iteration),
+                "summary": r.summary,
+                "hints": list(r.hints),
+                "failing_criteria": list(r.failing_criteria),
+            }
+            for r in card.revision_requests
+        ]
+    if card.rework_iteration:
+        data["rework_iteration"] = int(card.rework_iteration)
     return data
 
 
@@ -787,9 +869,55 @@ def _card_from_toml_dict(data: dict[str, Any]) -> Card:
                     continue
                 coerced.append(ref)
             kwargs[key] = coerced
+        elif key == "revision_requests":
+            kwargs[key] = _coerce_revision_requests(
+                value, card_id=data.get("id", "<unknown>"),
+            )
         else:
             kwargs[key] = value
     return Card(**kwargs)
+
+
+def _coerce_revision_requests(
+    raw: Any, *, card_id: str,
+) -> list[RevisionRequest]:
+    if not isinstance(raw, list):
+        return []
+    out: list[RevisionRequest] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            _LOG.warning(
+                "Dropping malformed revision_request in card %s: %r",
+                card_id, item,
+            )
+            continue
+        try:
+            at = item.get("at")
+            if isinstance(at, str):
+                at = datetime.fromisoformat(at)
+            if not isinstance(at, datetime):
+                raise ValueError(f"bad at: {at!r}")
+            if at.tzinfo is None:
+                at = at.replace(tzinfo=_UTC)
+            from_role = AgentRole(str(item["from_role"]))
+            out.append(
+                RevisionRequest(
+                    at=at,
+                    from_role=from_role,
+                    iteration=int(item.get("iteration", 0)),
+                    summary=str(item.get("summary", "")),
+                    hints=[str(h) for h in (item.get("hints") or [])],
+                    failing_criteria=[
+                        str(c) for c in (item.get("failing_criteria") or [])
+                    ],
+                )
+            )
+        except (KeyError, ValueError, TypeError) as exc:
+            _LOG.warning(
+                "Dropping malformed revision_request in card %s: %r (%s)",
+                card_id, item, exc,
+            )
+    return out
 
 
 # ---------- minimal TOML dumper (covers the types we use) ----------
@@ -891,7 +1019,7 @@ def _parse_iso(raw: Any) -> datetime:
 
 
 def _claim_to_json(claim: ExecutionClaim) -> dict[str, Any]:
-    return {
+    data: dict[str, Any] = {
         "card_id": claim.card_id,
         "claim_id": claim.claim_id,
         "worker_id": claim.worker_id,
@@ -905,6 +1033,9 @@ def _claim_to_json(claim: ExecutionClaim) -> dict[str, Any]:
         "lease_expires_at": _iso(claim.lease_expires_at),
         "timeout_s": claim.timeout_s,
     }
+    if claim.worktree_path is not None:
+        data["worktree_path"] = claim.worktree_path
+    return data
 
 
 def _claim_from_json(data: dict[str, Any]) -> ExecutionClaim:
@@ -921,6 +1052,7 @@ def _claim_from_json(data: dict[str, Any]) -> ExecutionClaim:
         worker_id=data.get("worker_id"),
         retry_count=int(data.get("retry_count", 0)),
         retry_of_claim_id=data.get("retry_of_claim_id"),
+        worktree_path=data.get("worktree_path"),
     )
 
 
@@ -945,7 +1077,7 @@ def _resource_from_json(data: dict[str, Any]) -> ResourceUsage:
 def _agent_result_to_json(result: AgentResult) -> dict[str, Any]:
     # Normalized copy per open-questions decision — drop raw_response to keep
     # envelopes small; raw text still lives under workspace/raw/.
-    return {
+    data: dict[str, Any] = {
         "role": result.role.value,
         "summary": result.summary,
         "next_status": result.next_status.value,
@@ -954,9 +1086,14 @@ def _agent_result_to_json(result: AgentResult) -> dict[str, Any]:
         "duration_ms": result.duration_ms,
         "attempt": result.attempt,
     }
+    if result.revision_request is not None:
+        data["revision_request"] = _revision_request_to_json(result.revision_request)
+    return data
 
 
 def _agent_result_from_json(data: dict[str, Any]) -> AgentResult:
+    rr_raw = data.get("revision_request")
+    revision = _revision_request_from_json(rr_raw) if rr_raw else None
     return AgentResult(
         role=AgentRole(data["role"]),
         summary=str(data["summary"]),
@@ -965,6 +1102,29 @@ def _agent_result_from_json(data: dict[str, Any]) -> AgentResult:
         prompt_version=str(data.get("prompt_version", "")),
         duration_ms=int(data.get("duration_ms", 0)),
         attempt=int(data.get("attempt", 1)),
+        revision_request=revision,
+    )
+
+
+def _revision_request_to_json(r: RevisionRequest) -> dict[str, Any]:
+    return {
+        "at": _iso(r.at),
+        "from_role": r.from_role.value,
+        "iteration": int(r.iteration),
+        "summary": r.summary,
+        "hints": list(r.hints),
+        "failing_criteria": list(r.failing_criteria),
+    }
+
+
+def _revision_request_from_json(data: dict[str, Any]) -> RevisionRequest:
+    return RevisionRequest(
+        at=_parse_iso(data["at"]),
+        from_role=AgentRole(data["from_role"]),
+        iteration=int(data.get("iteration", 0)),
+        summary=str(data.get("summary", "")),
+        hints=[str(h) for h in (data.get("hints") or [])],
+        failing_criteria=[str(c) for c in (data.get("failing_criteria") or [])],
     )
 
 

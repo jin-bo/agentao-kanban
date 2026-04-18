@@ -53,6 +53,8 @@ class BoardStore(Protocol):
         failure_reason: str | None = ...,
         failure_category: str | None = ...,
         retry_of_claim_id: str | None = ...,
+        worktree_branch: str | None = ...,
+        rework_iteration: int | None = ...,
     ) -> None: ...
     def events_for_card(self, card_id: str) -> list[CardEvent]: ...
     def list_events(self, *, limit: int | None = ...) -> list[CardEvent]: ...
@@ -143,7 +145,12 @@ class InMemoryBoardStore:
 
     def move_card(self, card_id: str, status: CardStatus, note: str) -> Card:
         card = self.get_card(card_id)
+        previous = card.status
         card.status = status
+        if status == CardStatus.BLOCKED and previous != CardStatus.BLOCKED:
+            card.blocked_at = utc_now()
+        elif status != CardStatus.BLOCKED:
+            card.blocked_at = None
         card.add_history(note, role="system")
         self.append_event(card_id, note)
         return card
@@ -178,6 +185,8 @@ class InMemoryBoardStore:
         failure_reason: str | None = None,
         failure_category: str | None = None,
         retry_of_claim_id: str | None = None,
+        worktree_branch: str | None = None,
+        rework_iteration: int | None = None,
     ) -> None:
         self._events.append(
             CardEvent(
@@ -192,6 +201,8 @@ class InMemoryBoardStore:
                 failure_reason=failure_reason,
                 failure_category=failure_category,
                 retry_of_claim_id=retry_of_claim_id,
+                worktree_branch=worktree_branch,
+                rework_iteration=rework_iteration,
             )
         )
 

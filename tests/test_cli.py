@@ -771,3 +771,269 @@ class TestCliEditsEmitEvents:
         assert any("Acceptance criterion added: A1" == m for m in msgs)
         assert any("Acceptance criterion removed at index 1" == m for m in msgs)
         assert any("Acceptance criteria cleared via CLI" == m for m in msgs)
+
+
+class TestShowOutput:
+    """`kanban show` renders YAML by default and single-line JSON under --json.
+
+    Tests parse the output rather than pinning whitespace so we're free to
+    adjust the layout later without churning expectations.
+    """
+
+    def test_default_is_valid_yaml(self, tmp_path: Path, capsys):
+        import yaml as _yaml
+
+        board = tmp_path / "board"
+        cid = _add_card(board)
+        capsys.readouterr()  # drain the "Created card ..." line
+        rc = main(["--board", str(board), "show", cid])
+        assert rc == 0
+        data = _yaml.safe_load(capsys.readouterr().out)
+        assert isinstance(data, dict)
+        assert data["id"] == cid
+        assert data["title"] == "T"
+        assert data["goal"] == "G"
+        assert data["status"] == "inbox"
+        assert data["priority"] == "MEDIUM"
+
+    def test_json_flag_emits_single_line_json(self, tmp_path: Path, capsys):
+        import json as _json_
+        import yaml as _yaml
+
+        board = tmp_path / "board"
+        cid = _add_card(board)
+        capsys.readouterr()
+
+        rc = main(["--board", str(board), "show", cid, "--json"])
+        assert rc == 0
+        out = capsys.readouterr().out
+        # Trailing newline from print() is fine; the payload itself is one line.
+        payload_line = out.rstrip("\n")
+        assert "\n" not in payload_line
+        json_data = _json_.loads(payload_line)
+
+        # The JSON payload must mirror the YAML payload exactly.
+        rc = main(["--board", str(board), "show", cid])
+        assert rc == 0
+        yaml_data = _yaml.safe_load(capsys.readouterr().out)
+        assert json_data == yaml_data
+
+    def test_shows_runtime_fields_when_set(self, tmp_path: Path, capsys):
+        import yaml as _yaml
+        from datetime import datetime, timezone
+        from kanban.models import (
+            AgentRole,
+            Card,
+            ContextRef,
+            RevisionRequest,
+        )
+
+        board = tmp_path / "board"
+        store = MarkdownBoardStore(board)
+        card = store.add_card(
+            Card(
+                id="abcd1234-0000-0000-0000-000000000000",
+                title="runtime",
+                goal="exercise all fields",
+                agent_profile="claude-worker",
+                agent_profile_source="manual",
+                worktree_branch="kanban/abcd1234",
+                worktree_base_commit="9f2c1abc00",
+                rework_iteration=2,
+                revision_requests=[
+                    RevisionRequest(
+                        at=datetime(2026, 4, 16, 10, 30, tzinfo=timezone.utc),
+                        from_role=AgentRole.REVIEWER,
+                        iteration=1,
+                        summary="add a test",
+                        hints=["write tests/test_foo.py"],
+                        failing_criteria=["tests exist"],
+                    )
+                ],
+                context_refs=[
+                    ContextRef(kind="required", path="docs/api.md", note="contract")
+                ],
+            )
+        )
+
+        rc = main(["--board", str(board), "show", card.id])
+        assert rc == 0
+        data = _yaml.safe_load(capsys.readouterr().out)
+
+        assert data["agent_profile"] == "claude-worker"
+        assert data["agent_profile_source"] == "manual"
+        assert data["worktree_branch"] == "kanban/abcd1234"
+        assert data["worktree_base_commit"] == "9f2c1abc00"
+        assert data["rework_iteration"] == 2
+        assert data["revision_requests"] == [
+            {
+                "iteration": 1,
+                "from_role": "reviewer",
+                "at": "2026-04-16T10:30:00Z",
+                "summary": "add a test",
+                "hints": ["write tests/test_foo.py"],
+                "failing_criteria": ["tests exist"],
+            }
+        ]
+        assert data["context_refs"] == [
+            {"kind": "required", "path": "docs/api.md", "note": "contract"}
+        ]
+
+    def test_omits_unset_optional_fields(self, tmp_path: Path, capsys):
+        import yaml as _yaml
+
+        board = tmp_path / "board"
+        cid = _add_card(board)
+        capsys.readouterr()
+        rc = main(["--board", str(board), "show", cid])
+        assert rc == 0
+        data = _yaml.safe_load(capsys.readouterr().out)
+
+        for absent in (
+            "owner_role",
+            "blocked_reason",
+            "blocked_at",
+            "agent_profile",
+            "agent_profile_source",
+            "worktree_branch",
+            "worktree_base_commit",
+            "rework_iteration",
+            "revision_requests",
+            "depends_on",
+            "acceptance_criteria",
+            "context_refs",
+            "outputs",
+        ):
+            assert absent not in data, f"{absent} should be omitted when unset"
+
+    def test_yaml_uses_block_scalar_for_multiline_outputs(self, tmp_path: Path, capsys):
+        from kanban.models import Card
+
+        board = tmp_path / "board"
+        store = MarkdownBoardStore(board)
+        card = store.add_card(
+            Card(
+                title="multi",
+                goal="g",
+                outputs={"implementation": "line1\nline2\nline3"},
+            )
+        )
+
+        rc = main(["--board", str(board), "show", card.id])
+        assert rc == 0
+        raw = capsys.readouterr().out
+        # Multi-line outputs must render as a YAML block scalar, not a
+        # single-line quoted string with embedded \n.
+        assert "implementation: |" in raw
+        assert "line1" in raw
+        assert "line3" in raw
+
+    def test_timestamps_use_iso_z(self, tmp_path: Path, capsys):
+        import re
+        import json as _json_
+        import yaml as _yaml
+
+        board = tmp_path / "board"
+        cid = _add_card(board)
+        capsys.readouterr()
+        iso_z = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
+
+        main(["--board", str(board), "show", cid])
+        y = _yaml.safe_load(capsys.readouterr().out)
+        assert iso_z.fullmatch(y["created_at"])
+        assert iso_z.fullmatch(y["updated_at"])
+
+        main(["--board", str(board), "show", cid, "--json"])
+        j = _json_.loads(capsys.readouterr().out)
+        assert iso_z.fullmatch(j["created_at"])
+        assert iso_z.fullmatch(j["updated_at"])
+
+
+class TestCardIdPrefix:
+    """Unique card-id prefixes should resolve to the full id.
+
+    UUIDs are random in practice, so seed explicit ids through the store
+    to pin the prefix space and exercise unique, ambiguous, and no-match
+    branches deterministically.
+    """
+
+    def _seed_two(self, board: Path) -> tuple[str, str]:
+        from kanban.models import Card
+        store = MarkdownBoardStore(board)
+        a = store.add_card(Card(id="aaaa1111-0000-0000-0000-000000000000", title="A", goal="ga"))
+        b = store.add_card(Card(id="bbbb2222-0000-0000-0000-000000000000", title="B", goal="gb"))
+        return a.id, b.id
+
+    def test_show_expands_unique_prefix(self, tmp_path: Path, capsys):
+        board = tmp_path / "board"
+        a, _ = self._seed_two(board)
+        rc = main(["--board", str(board), "show", "aaaa"])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert a in out
+        assert "ga" in out
+
+    def test_edit_expands_unique_prefix(self, tmp_path: Path):
+        board = tmp_path / "board"
+        a, _ = self._seed_two(board)
+        rc = main([
+            "--board", str(board), "card", "edit", "aaaa", "--title", "A2",
+        ])
+        assert rc == 0
+        assert MarkdownBoardStore(board).get_card(a).title == "A2"
+
+    def test_ambiguous_prefix_errors(self, tmp_path: Path, capsys):
+        from kanban.models import Card
+        board = tmp_path / "board"
+        store = MarkdownBoardStore(board)
+        store.add_card(Card(id="abcd1111-0000-0000-0000-000000000000", title="A", goal="g"))
+        store.add_card(Card(id="abcd2222-0000-0000-0000-000000000000", title="B", goal="g"))
+        with pytest.raises(SystemExit) as exc:
+            main(["--board", str(board), "show", "abcd"])
+        assert exc.value.code == 2
+        err = capsys.readouterr().err
+        assert "Ambiguous" in err
+        assert "abcd" in err
+
+    def test_unknown_prefix_still_exits_one(self, tmp_path: Path, capsys):
+        board = tmp_path / "board"
+        self._seed_two(board)
+        rc = main(["--board", str(board), "show", "zz"])
+        assert rc == 1
+        err = capsys.readouterr().err
+        # Original input is echoed back so operators recognize their typo.
+        assert "zz" in err
+
+    def test_move_expands_unique_prefix(self, tmp_path: Path):
+        board = tmp_path / "board"
+        a, _ = self._seed_two(board)
+        rc = main(["--board", str(board), "move", "aaaa", "ready"])
+        assert rc == 0
+        assert MarkdownBoardStore(board).get_card(a).status == CardStatus.READY
+
+    def test_depends_expands_unique_prefix(self, tmp_path: Path):
+        board = tmp_path / "board"
+        a, _ = self._seed_two(board)
+        rc = main([
+            "--board", str(board), "card", "add",
+            "--title", "Child", "--goal", "c",
+            "--depends", "aaaa",
+        ])
+        assert rc == 0
+        cards = MarkdownBoardStore(board).list_cards()
+        child = next(c for c in cards if c.title == "Child")
+        assert child.depends_on == [a]
+
+    def test_depends_ambiguous_prefix_errors(self, tmp_path: Path):
+        from kanban.models import Card
+        board = tmp_path / "board"
+        store = MarkdownBoardStore(board)
+        store.add_card(Card(id="abcd1111-0000-0000-0000-000000000000", title="A", goal="g"))
+        store.add_card(Card(id="abcd2222-0000-0000-0000-000000000000", title="B", goal="g"))
+        with pytest.raises(SystemExit) as exc:
+            main([
+                "--board", str(board), "card", "add",
+                "--title", "Child", "--goal", "c",
+                "--depends", "abcd",
+            ])
+        assert exc.value.code == 2

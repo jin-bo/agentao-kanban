@@ -38,6 +38,14 @@ class RouterCardSummary:
     acceptance_criteria: tuple[str, ...]
     context_refs: tuple[dict[str, str], ...]
     current_agent_profile: str | None
+    # Bumped each time the orchestrator accepts a reviewer/verifier rework
+    # ask. Surfaced in the router input so per-process cache keys
+    # naturally diverge in the split scheduler/worker topology — a worker
+    # daemon's RouterPolicy._decision_cache is in a different process
+    # from the scheduler that called ``invalidate_card``. Routers may
+    # also use it to bias toward a more capable profile after repeated
+    # reworks.
+    rework_iteration: int = 0
 
 
 @dataclass(slots=True, frozen=True)
@@ -137,6 +145,7 @@ def build_card_summary(card: Card, role: AgentRole) -> RouterCardSummary:
         acceptance_criteria=tuple(card.acceptance_criteria),
         context_refs=tuple(_summarize_ref(r) for r in card.context_refs),
         current_agent_profile=card.agent_profile,
+        rework_iteration=card.rework_iteration,
     )
 
 
@@ -182,6 +191,7 @@ def render_request(request: RouterRequest) -> str:
             "acceptance_criteria": list(request.card.acceptance_criteria),
             "context_refs": [dict(r) for r in request.card.context_refs],
             "current_agent_profile": request.card.current_agent_profile,
+            "rework_iteration": request.card.rework_iteration,
         },
         "candidates": [
             {

@@ -119,6 +119,28 @@ class RouterPolicy:
     def last_outcome(self, card_id: str, role: AgentRole) -> PolicyOutcome | None:
         return self._last_outcome.get((card_id, role))
 
+    def invalidate_card(self, card_id: str) -> int:
+        """Drop every cached router decision for this card across all roles.
+
+        The cache key is built from card fields the router actually sees
+        (title, goal, acceptance, context_refs, candidates, ...) and does
+        NOT include ``revision_requests`` / ``rework_iteration``. After a
+        rework is accepted, the worker prompt changes but those fields
+        do not, so the next worker dispatch would silently reuse the
+        pre-rework profile. The orchestrator calls this from
+        ``_apply_rework`` so the next dispatch re-routes against the new
+        rework state. Returns the number of evicted cache entries.
+        """
+        keys = [k for k in self._decision_cache if k[0] == card_id]
+        for k in keys:
+            self._decision_cache.pop(k, None)
+        # Also drop last_outcome so any observability hook that reads it
+        # between rework and re-dispatch sees no stale entry.
+        self._last_outcome = {
+            k: v for k, v in self._last_outcome.items() if k[0] != card_id
+        }
+        return len(keys)
+
     # ------------------------------------------------------------------
 
     def _decide(

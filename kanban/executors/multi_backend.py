@@ -104,6 +104,11 @@ class MultiBackendExecutor:
 
         if parsed.get("ok") is False:
             reason = str(parsed.get("blocked_reason") or "Agent reported failure")
+            revision = _legacy._extract_revision_request(role, parsed)
+            if revision is not None:
+                return _tag(_legacy._rework_result(
+                    role, revision, synth_spec, elapsed_ms, response.raw_text,
+                ))
             return _tag(_legacy._blocked_result(role, reason, synth_spec, elapsed_ms, response.raw_text))
 
         if role == AgentRole.PLANNER:
