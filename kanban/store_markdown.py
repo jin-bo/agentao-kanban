@@ -74,7 +74,10 @@ class MarkdownBoardStore:
         # for a board at workspace/board/). workspace/ is already gitignored.
         self.raw_root = Path(raw_root) if raw_root else self.root.parent / "raw"
         self.raw_retention = raw_retention
-        self.cards_dir.mkdir(parents=True, exist_ok=True)
+        # No mkdir here: read-only callers (e.g. the web server) should be
+        # able to instantiate the store without materializing the board on
+        # disk. Write paths (`_write_card`, `_write_event_line`, runtime
+        # writers) mkdir their own directories lazily.
 
         self._cards: dict[str, Card] = {}
         self._events: list[CardEvent] = []
@@ -321,6 +324,7 @@ class MarkdownBoardStore:
     def _write_event_line(self, record: dict[str, Any]) -> None:
         # O_APPEND writes are atomic for < PIPE_BUF on POSIX, so concurrent
         # CLI + daemon writers don't interleave whole lines.
+        self.root.mkdir(parents=True, exist_ok=True)
         line = (json.dumps(record, ensure_ascii=False) + "\n").encode("utf-8")
         fd = os.open(self.events_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
         try:
@@ -433,6 +437,12 @@ class MarkdownBoardStore:
                 claims.append(
                     _claim_from_json(json.loads(path.read_text(encoding="utf-8")))
                 )
+            except FileNotFoundError:
+                # Glob → read is non-atomic. A parallel committer or
+                # scheduler may clear the claim between the listdir and
+                # the read. That's a legitimate "claim is gone" signal,
+                # not an error.
+                continue
             except (json.JSONDecodeError, KeyError, ValueError) as exc:
                 _LOG.warning("Skipping unparseable claim %s: %s", path.name, exc)
         return claims
@@ -523,6 +533,9 @@ class MarkdownBoardStore:
                 results.append(
                     _result_from_json(json.loads(path.read_text(encoding="utf-8")))
                 )
+            except FileNotFoundError:
+                # Glob → read is non-atomic under the parallel committer.
+                continue
             except (json.JSONDecodeError, KeyError, ValueError) as exc:
                 _LOG.warning("Skipping unparseable result %s: %s", path.name, exc)
         return results
@@ -684,6 +697,7 @@ class MarkdownBoardStore:
                     self._events.append(event)
 
     def _write_card(self, card: Card) -> None:
+        self.cards_dir.mkdir(parents=True, exist_ok=True)
         path = self._card_path(card.id)
         tmp = path.with_suffix(".md.tmp")
         content = _render_card(card)

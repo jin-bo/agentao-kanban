@@ -408,11 +408,16 @@ def tool_card_move(
     ctx.guard_card_write(card_id)
     store = ctx.store()
     try:
+        previous_status = store.get_card(card_id).status
         card = store.move_card(
             card_id, _coerce_status(status), "Manual move via MCP"
         )
     except KeyError as exc:
         raise ValueError(f"card {card_id} not found") from exc
+    if card.status == CardStatus.DONE and previous_status != CardStatus.DONE:
+        from .orchestrator import advance_inbox_dependents
+
+        advance_inbox_dependents(store, card.id)
     _detach_worktree_after_terminal(ctx, store, card.id)
     return card_to_dict(card)
 
@@ -440,12 +445,17 @@ def tool_card_unblock(
     store = ctx.store()
     target = _coerce_status(to)
     try:
+        previous_status = store.get_card(card_id).status
         store.update_card(card_id, blocked_reason=None)
         card = store.move_card(
             card_id, target, f"Unblocked to {target.value}"
         )
     except KeyError as exc:
         raise ValueError(f"card {card_id} not found") from exc
+    if card.status == CardStatus.DONE and previous_status != CardStatus.DONE:
+        from .orchestrator import advance_inbox_dependents
+
+        advance_inbox_dependents(store, card.id)
     _detach_worktree_after_terminal(ctx, store, card.id)
     return card_to_dict(card)
 

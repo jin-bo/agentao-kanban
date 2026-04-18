@@ -346,6 +346,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="Mutate the board even if a daemon holds the lock (for recovery only).",
     )
 
+    # --- web subcommand (read-only HTTP board) ---
+    web_p = sub.add_parser(
+        "web",
+        help="Run the read-only web board (no writes; polls the board dir).",
+    )
+    web_p.add_argument("--host", default="127.0.0.1", help="Bind host (default 127.0.0.1)")
+    web_p.add_argument("--port", type=int, default=8000, help="Bind port (default 8000)")
+    web_p.add_argument(
+        "--poll-interval-ms",
+        type=int,
+        default=5000,
+        dest="poll_interval_ms",
+        help="Frontend poll interval in ms (default 5000)",
+    )
+
     # --- worktree subcommands ---
     wt = sub.add_parser("worktree", help="Manage Git worktrees for cards")
     wt_sub = wt.add_subparsers(dest="worktree_command", required=True)
@@ -875,11 +890,16 @@ def cmd_card_edit(args: argparse.Namespace) -> int:
         ):
             forced_updates["blocked_reason"] = None
         store.update_card(card.id, **forced_updates)
+        previous_status = card.status
         store.move_card(
             card.id,
             new_status,
             f"Status manually set to {new_status.value} via CLI",
         )
+        if new_status == CardStatus.DONE and previous_status != CardStatus.DONE:
+            from .orchestrator import advance_inbox_dependents
+
+            advance_inbox_dependents(store, card.id)
         _detach_worktree_after_terminal_cli(args, store, card.id)
 
     print(f"Edited {card.id}")
@@ -1106,10 +1126,15 @@ def cmd_move(args: argparse.Namespace) -> int:
     args.card_id = _resolve_card_id(store, args.card_id)
     _require_card_writable(args, args.card_id)
     try:
+        previous_status = store.get_card(args.card_id).status
         card = store.move_card(args.card_id, CardStatus(args.status), "Manual move via CLI")
     except KeyError:
         print(f"No card with id {args.card_id}", file=sys.stderr)
         return 1
+    if card.status == CardStatus.DONE and previous_status != CardStatus.DONE:
+        from .orchestrator import advance_inbox_dependents
+
+        advance_inbox_dependents(store, card.id)
     _detach_worktree_after_terminal_cli(args, store, card.id)
     print(f"Moved {card.id} to {card.status.value}")
     return 0
@@ -1136,11 +1161,16 @@ def cmd_unblock(args: argparse.Namespace) -> int:
     _require_card_writable(args, args.card_id)
     try:
         target = CardStatus(args.target)
+        previous_status = store.get_card(args.card_id).status
         store.update_card(args.card_id, blocked_reason=None)
         card = store.move_card(args.card_id, target, f"Unblocked to {target.value}")
     except KeyError:
         print(f"No card with id {args.card_id}", file=sys.stderr)
         return 1
+    if card.status == CardStatus.DONE and previous_status != CardStatus.DONE:
+        from .orchestrator import advance_inbox_dependents
+
+        advance_inbox_dependents(store, card.id)
     # Unblocking to DONE is the only terminal target here; INBOX/READY/etc.
     # leave the worktree attached so the next worker dispatch can resume.
     _detach_worktree_after_terminal_cli(args, store, card.id)
@@ -1526,6 +1556,10 @@ def cmd_daemon(args: argparse.Namespace) -> int:
 
     board_dir = args.board
     role = args.role
+    # `--detach` MUST fork before any scheduler/worker thread is created.
+    # CombinedDaemon spawns threads inside run(); forking after threads
+    # exist would leave orphan threads in the parent and break signal
+    # handling in the child.
     if args.detach:
         detach_to_background(board_dir)
 
@@ -1551,12 +1585,23 @@ def cmd_daemon(args: argparse.Namespace) -> int:
             daemon = WorkerDaemon(orchestrator, config=config)
         elif role == "legacy-serial":
             daemon = KanbanDaemon(orchestrator, config=config)
-        else:  # all
-            daemon = CombinedDaemon(orchestrator, config=config)
+        else:  # all — real N-way parallel; workers need their own orchestrators
+            def _fresh_orchestrator() -> KanbanOrchestrator:
+                _, o = _make_orchestrator(args)
+                return o
+
+            daemon = CombinedDaemon(
+                orchestrator,
+                config=config,
+                orchestrator_factory=_fresh_orchestrator,
+            )
         if lock_file is not None:
             daemon.add_force_exit_cleanup(
                 lambda p=lock_file: p.unlink(missing_ok=True)
             )
+        # Signal handlers live ONLY on the main thread. CombinedDaemon
+        # relies on its shared stop event to propagate into child threads;
+        # no sub-daemon calls signal.signal(...) itself.
         daemon.install_signal_handlers()
         if args.once:
             did = daemon.run_once()
@@ -1663,6 +1708,21 @@ def cmd_worktree_diff(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_web(args: argparse.Namespace) -> int:
+    # Read-only endpoint: no ``_require_writable`` check so the daemon can
+    # hold ``.daemon.lock`` while the UI observes it. The server mounts a
+    # fresh store per request, which picks up daemon/CLI writes on the
+    # next poll.
+    from .web import main as web_main
+
+    return web_main(
+        args.board,
+        host=args.host,
+        port=args.port,
+        poll_interval_ms=args.poll_interval_ms,
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -1720,6 +1780,7 @@ def main(argv: list[str] | None = None) -> int:
         "tick": cmd_tick,
         "run": cmd_run,
         "daemon": cmd_daemon,
+        "web": cmd_web,
     }
     return dispatch[args.command](args)
 

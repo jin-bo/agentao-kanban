@@ -141,6 +141,58 @@ class WorktreeMissingError(RuntimeError):
     branch was deleted and cannot be recovered. Caller should BLOCK."""
 
 
+def advance_inbox_dependents(store: BoardStore, done_card_id: str) -> list[str]:
+    """Auto-advance INBOX cards whose dependencies are now fully satisfied.
+
+    Called from every path that transitions a card from (!= DONE) to DONE
+    (orchestrator commit, legacy ``tick()``, CLI ``move``/``unblock``,
+    MCP equivalents). For each card still in INBOX that lists
+    ``done_card_id`` among its ``depends_on`` and whose *every* dep is
+    now DONE, moves the card INBOX → READY and emits a
+    ``dependencies.satisfied`` runtime event plus an explicit
+    history/plain-event message.
+
+    Not recursive: only this card's direct reverse-dependencies are
+    considered. Deeper chains advance naturally as each parent reaches
+    DONE. Never touches non-INBOX candidates (BLOCKED / READY / DOING /
+    REVIEW / VERIFY / DONE keep their current state).
+
+    Runs a single ``store.list_cards()`` scan, O(n) over the board. Fine
+    at current board sizes and simpler than maintaining a reverse-dep
+    index.
+    """
+    advanced: list[str] = []
+    for candidate in store.list_cards():
+        if candidate.status != CardStatus.INBOX:
+            continue
+        if done_card_id not in candidate.depends_on:
+            continue
+        all_done = True
+        for dep_id in candidate.depends_on:
+            try:
+                dep = store.get_card(dep_id)
+            except KeyError:
+                all_done = False
+                break
+            if dep.status != CardStatus.DONE:
+                all_done = False
+                break
+        if not all_done:
+            continue
+        note = (
+            f"Dependency {done_card_id[:8]} finished; all dependencies "
+            f"satisfied — auto-advancing from inbox to ready"
+        )
+        store.move_card(candidate.id, CardStatus.READY, note)
+        store.append_runtime_event(
+            candidate.id,
+            event_type="dependencies.satisfied",
+            message=note,
+        )
+        advanced.append(candidate.id)
+    return advanced
+
+
 class KanbanOrchestrator:
     def __init__(
         self,
@@ -916,6 +968,7 @@ class KanbanOrchestrator:
         self._apply_normal_result(card_id, result)
 
     def _apply_normal_result(self, card_id: str, result: AgentResult) -> None:
+        previous_status = self.store.get_card(card_id).status
         card = self.store.update_card(card_id, **result.updates)
         card.add_history(result.summary, role=result.role)
         self.store.append_execution_event(card_id, result)
@@ -924,6 +977,15 @@ class KanbanOrchestrator:
             result.next_status,
             f"Status changed to {result.next_status.value}",
         )
+        # First-time transition to DONE fans out to any INBOX card whose
+        # depends_on is now fully satisfied. Guard on the pre-update status
+        # so a DONE card replayed into DONE (idempotent commit) does not
+        # re-emit dependency-advance events.
+        if (
+            result.next_status == CardStatus.DONE
+            and previous_status != CardStatus.DONE
+        ):
+            advance_inbox_dependents(self.store, card_id)
         # Detach on any terminal transition so a reviewer/verifier rejection
         # (next_status=BLOCKED) doesn't leave workspace/worktrees/<card>
         # attached forever — prune_stale() skips cards whose directory

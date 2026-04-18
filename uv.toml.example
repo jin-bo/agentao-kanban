@@ -1,0 +1,13 @@
+# This file is intentionally comment-only.
+#
+# `uv` 0.11.x rejects project dependency sources inside `uv.toml`; the old
+# `[sources]` pattern no longer works here. Keep this example as a reminder that
+# local config belongs here, but project dependency source overrides do not.
+#
+# If you are developing this repo alongside `../agentao`, use:
+#
+#   uv sync
+#   uv pip install --editable ../agentao
+#
+# That keeps `pyproject.toml` and `uv.lock` on the published PyPI dependency
+# while letting your current virtualenv import the sibling checkout.

@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Kanban board (read-only)</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+    <script>
+      window.KANBAN_CONFIG = { pollIntervalMs: __POLL_INTERVAL_MS__ };
+    </script>
+  </head>
+  <body>
+    <header class="topbar">
+      <h1>Kanban <span class="subtitle">read-only</span></h1>
+      <div class="meta" id="meta">
+        <span id="board-dir">–</span>
+        <span id="status-dot" class="dot idle" title="poll status"></span>
+        <span id="updated-at">never</span>
+      </div>
+    </header>
+    <main class="layout" aria-live="polite">
+      <section id="col-inbox" class="column" data-status="inbox"></section>
+      <section id="col-ready" class="column" data-status="ready"></section>
+      <section id="col-doing" class="column" data-status="doing"></section>
+      <section id="col-done" class="column tall" data-status="done"></section>
+      <aside class="panel detail-cell" id="detail-panel">
+        <h2>Card detail</h2>
+        <p class="hint">Click any card to inspect.</p>
+      </aside>
+      <aside class="panel runtime-cell">
+        <h2>Runtime</h2>
+        <div id="runtime"></div>
+      </aside>
+      <section id="col-blocked" class="column" data-status="blocked"></section>
+      <section id="col-review" class="column" data-status="review"></section>
+      <section id="col-verify" class="column" data-status="verify"></section>
+      <aside class="panel events-cell">
+        <h2>Recent events</h2>
+        <ol class="events" id="events"></ol>
+      </aside>
+    </main>
+    <script src="/static/app.js"></script>
+  </body>
+</html>

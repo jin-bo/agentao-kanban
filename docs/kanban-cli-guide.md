@@ -168,7 +168,17 @@ uv run kanban run
 uv run kanban daemon
 ```
 
-真正并发执行:
+真正并发执行(单进程,最简单):
+
+```bash
+uv run kanban daemon --role all --max-claims 4
+```
+
+这会在同一个进程里开 **1 条 scheduler 线程 + 4 条 worker 线程**,每个 worker 有
+独立的 store / orchestrator / executor,互不共享 cwd、router 缓存或可变状态。
+worker id 默认是 `worker-1..worker-4`;传 `--worker-id ci` 会得到 `ci-1..ci-4`。
+
+需要跨机 / 跨进程分布时再手动拆:
 
 ```bash
 uv run kanban daemon --role scheduler --max-claims 4
@@ -180,7 +190,9 @@ uv run kanban daemon --role worker --worker-id worker-2
 
 - `run` 适合本地小规模手动推进
 - `daemon` 适合持续消费
-- `daemon --role all` 只是一个进程内的便利模式,不是多 worker 拓扑
+- `daemon --role all --max-claims N` 是**单进程真并行**:N 个 worker 线程并行消费
+  claim,`--max-claims` 既是全局 claim 预算,也是 worker 数量
+- `--once` 的精确语义:**1 轮 scheduler + 每个 worker 各 1 轮**,然后退出
 
 ## 4. 推荐命令分工
 
@@ -248,7 +260,7 @@ v0.1.2 的运行时里有两层互斥保护,作用范围不同,别混起来:
 `.daemon.lock` 只由以下三种 daemon 角色持有:
 
 - `--role scheduler`
-- `--role all` (scheduler + worker 同进程)
+- `--role all` (scheduler + N 个 worker 线程同进程)
 - `--role legacy-serial` (v0.1.1 串行路径)
 
 **`--role worker` 故意不持这把锁**,因为多 worker 是设计目标。这意味着:
@@ -334,6 +346,29 @@ uv run kanban events <card_id>
 1. 先 `claims` 看 card 是否有 live claim
 2. 再 `workers` 看 claim 对应的 worker 是否还活着
 3. 最后 `events <card_id>` 看是正常完成、重试、超时还是被阻塞
+
+### 6.1 `--role all --max-claims N` 下 workers 的预期
+
+起 `daemon --role all --max-claims 4` 后,`kanban workers` 应该看到 **4 条
+WorkerPresence**(`worker-1` … `worker-4`,或前缀变体)。如果只看到 1 条:
+
+- 很可能还在用旧版(`all` 曾经是「同进程里 1 scheduler + 1 worker」的便利模式)
+- 或者进程在启动期 crash 了,剩下的线程没来得及 heartbeat
+
+stop 时(Ctrl-C 或 SIGTERM),主进程会在退出前把所有 worker 的 presence 文件清空;
+`kanban workers` 应该一次性归零,不会留下 4 条「僵尸」记录。
+
+### 6.2 依赖链自动推进
+
+当某张父卡从 `!= done` 首次转为 `done`(走 orchestrator、`move ... done`、
+`unblock ... --to done`、或 MCP 的 `card_move` / `card_unblock` 都算),
+orchestrator 会扫描所有 **`inbox`** 状态下以它为直接依赖的卡,凡是 `depends_on`
+已经全部 DONE 的,自动从 `inbox` 推进到 `ready`,并在该卡的 events.log 写入一条
+`dependencies.satisfied` 运行时事件。
+
+- 只推进 **inbox** 候选;ready / doing / review / verify / done / blocked 都不动
+- 只看直接反向依赖(非递归);孙子卡要等它的父卡自己 DONE 时才触发
+- `done → done` 的重复 move 不会再次触发,避免重复事件
 
 ## 7. 遇到问题怎么处理
 
@@ -449,11 +484,17 @@ uv run kanban traces <card_id>
 
 | 目的 | 命令 |
 |---|---|
-| 起 scheduler | `uv run kanban daemon --role scheduler --max-claims 4` |
-| 起 worker | `uv run kanban daemon --role worker --worker-id worker-1` |
+| 单进程真并行(推荐) | `uv run kanban daemon --role all --max-claims 4` |
+| 调试一轮并发 | `uv run kanban daemon --role all --max-claims 4 --once` |
+| 跨进程拆:scheduler | `uv run kanban daemon --role scheduler --max-claims 4` |
+| 跨进程拆:worker | `uv run kanban daemon --role worker --worker-id worker-1` |
+| 后台运行 | `uv run kanban daemon --role all --max-claims 4 --detach` |
 | 看活跃 claims | `uv run kanban claims` |
 | 看活跃 workers | `uv run kanban workers` |
 | 回收过期 claim | `uv run kanban recover --stale` |
+
+`--detach` 必须在任何线程创建**之前**完成 fork(`all` 模式下父进程会双 fork 后再
+建 scheduler/worker 线程),否则子进程里拿不到正确的线程状态。
 
 ## 10. 给新用户的最低可行命令集
 
