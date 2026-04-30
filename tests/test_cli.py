@@ -4,7 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from kanban.cli import main
+from kanban.cli import _build_executor, main
+from kanban.executors.agentao_multi import AgentaoMultiAgentExecutor
 from kanban.executors import MockAgentaoExecutor
 from kanban.models import CardPriority, CardStatus
 from kanban.orchestrator import KanbanOrchestrator
@@ -114,6 +115,18 @@ class TestCardEdit:
         _add_card(board)
         rc = main(["--board", str(board), "card", "edit", "no-such-id", "--title", "x"])
         assert rc == 1
+
+
+def test_agentao_executor_uses_board_project_root(tmp_path: Path):
+    project = tmp_path / "project"
+    board = project / ".kanban"
+    (project / ".agentao" / "agents").mkdir(parents=True)
+
+    executor = _build_executor("agentao", board=board)
+
+    assert isinstance(executor, AgentaoMultiAgentExecutor)
+    assert executor.working_directory == project.resolve()
+    assert executor.agents_dir == project.resolve() / ".agentao" / "agents"
 
 
 class TestCardContext:

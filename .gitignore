@@ -25,3 +25,7 @@ workspace/
 
 # Per-developer uv source overrides (e.g. editable ../agentao)
 uv.toml
+
+# Claude Code local state (machine-local PIDs / per-checkout settings)
+.claude/scheduled_tasks.lock
+.claude/settings.local.json

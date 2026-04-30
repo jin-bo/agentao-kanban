@@ -21,6 +21,7 @@ import pytest
 from kanban.daemon import LOCK_FILENAME
 from kanban.mcp import (
     ServerContext,
+    _build_executor,
     _build_orchestrator,
     _resolve_worktree_mgr,
     build_server,
@@ -35,6 +36,7 @@ from kanban.mcp import (
     tool_run,
     tool_tick,
 )
+from kanban.executors.agentao_multi import AgentaoMultiAgentExecutor
 from kanban.models import (
     AgentRole,
     Card,
@@ -56,6 +58,18 @@ def ctx(tmp_path: Path) -> ServerContext:
 
 def _add(ctx: ServerContext, title: str = "T", goal: str = "G", **kw) -> dict:
     return tool_card_add(ctx, title=title, goal=goal, **kw)
+
+
+def test_mcp_agentao_executor_uses_board_project_root(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    board = project / ".kanban"
+    (project / ".agentao" / "agents").mkdir(parents=True)
+
+    executor = _build_executor("agentao", board)
+
+    assert isinstance(executor, AgentaoMultiAgentExecutor)
+    assert executor.working_directory == project.resolve()
+    assert executor.agents_dir == project.resolve() / ".agentao" / "agents"
 
 
 # ---------- card lifecycle ----------

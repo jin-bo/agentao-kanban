@@ -26,7 +26,7 @@ classifiers = [
     "Topic :: Office/Business :: Scheduling",
 ]
 dependencies = [
-    "agentao>=0.2.10",
+    "agentao>=0.3.0",
     "mcp>=1.0",
     "pyyaml>=6.0",
     "fastapi>=0.110",

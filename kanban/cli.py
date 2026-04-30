@@ -378,11 +378,14 @@ def _project_root_for(board: Path) -> Path:
 
     Walks up from the board directory and returns the first ancestor
     that contains a ``.kanban/`` or ``.agentao/`` marker. When no marker
-    is found we fall back to the resolved board path itself — never
-    ``Path.cwd()`` — so that ``kanban --board /elsewhere/board ...``
-    can only pick up config rooted inside that board's own directory
-    tree (or fall through to packaged defaults), instead of silently
-    reading the shell cwd's ``.kanban/``/``.agentao/`` config.
+    is found we fall back to the Git toplevel for the board path — which
+    is the right answer for the documented default layout
+    (``workspace/board`` inside a fresh checkout that hasn't created
+    ``.kanban/``/``.agentao/`` yet) so agentao runs against the source
+    tree rather than the board directory. As a last resort, return the
+    resolved board path. We never use ``Path.cwd()``, so
+    ``kanban --board /elsewhere/board ...`` can't silently pick up the
+    shell cwd's ``.kanban/``/``.agentao/`` config.
     """
     try:
         current = board.resolve()
@@ -391,6 +394,9 @@ def _project_root_for(board: Path) -> Path:
     for candidate in (current, *current.parents):
         if (candidate / ".kanban").is_dir() or (candidate / ".agentao").is_dir():
             return candidate
+    git_root = _find_git_root_optional(board)
+    if git_root is not None:
+        return git_root
     return current
 
 
@@ -402,7 +408,8 @@ def _find_git_root_optional(board: Path) -> Path | None:
     When the board path does not yet exist, walk up to the first existing
     ancestor so we bind to the correct repo even on fresh boards. Returns
     None (rather than raising) when no existing ancestor or no repo can
-    be found — callers decide whether that's a hard failure.
+    be found, or when the ``git`` binary itself is unavailable — callers
+    decide whether that's a hard failure.
     """
     import subprocess
 
@@ -416,13 +423,16 @@ def _find_git_root_optional(board: Path) -> Path | None:
         if parent == probe:
             return None
         probe = parent
-    result = subprocess.run(
-        ["git", "rev-parse", "--show-toplevel"],
-        cwd=probe,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=probe,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return None
     if result.returncode != 0:
         return None
     return Path(result.stdout.strip())
@@ -440,6 +450,10 @@ def _find_git_root(board: Path) -> Path:
             f"--worktree requires a Git repository (no repo found for {board})"
         )
     return root
+
+
+def _project_root_or_cwd(board: Path | None) -> Path:
+    return _project_root_for(board) if board is not None else Path.cwd()
 
 
 def _agents_dir_for(project_root: Path) -> Path:
@@ -465,7 +479,11 @@ def _build_executor(name: str, board: Path | None = None) -> CardExecutor:
             raise SystemExit(
                 "agentao package is not installed. Run `uv add --editable ../agentao` first."
             ) from exc
-        return AgentaoMultiAgentExecutor()
+        project_root = _project_root_or_cwd(board)
+        return AgentaoMultiAgentExecutor(
+            agents_dir=_agents_dir_for(project_root),
+            working_directory=project_root,
+        )
     if name == "multi-backend":
         try:
             from .agent_profiles import ProfileConfigError, load_default_config
@@ -482,7 +500,7 @@ def _build_executor(name: str, board: Path | None = None) -> CardExecutor:
         # ACP server definitions, and router spec all come from the same
         # place. A bare `kanban --board /elsewhere ...` invocation must
         # not silently read from the shell's cwd.
-        project_root = _project_root_for(board) if board is not None else Path.cwd()
+        project_root = _project_root_or_cwd(board)
         agents_dir = _agents_dir_for(project_root)
         # Pass the *intended* agents dir even when it doesn't exist on
         # disk: the spec loader's ``is_file()`` guard skips missing

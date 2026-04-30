@@ -344,12 +344,10 @@ def _build_executor(name: str, board_dir: Path):
         from .executors import MockAgentaoExecutor
 
         return MockAgentaoExecutor()
-    if name == "agentao":
-        from .executors.agentao_multi import AgentaoMultiAgentExecutor
-
-        return AgentaoMultiAgentExecutor()
-    if name == "multi-backend":
-        # Reuse the CLI factory so config resolution matches exactly.
+    if name in {"agentao", "multi-backend"}:
+        # Reuse the CLI factory so project-root inference, `.agentao/`
+        # resolution, and config loading all stay identical to the
+        # command-line path.
         from .cli import _build_executor as _cli_build
 
         return _cli_build(name, board=board_dir)

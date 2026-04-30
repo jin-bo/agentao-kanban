@@ -435,20 +435,48 @@ def _tagged(summary: str, spec: AgentSpec | None) -> str:
 
 
 def _default_agent_factory(spec: AgentSpec, working_directory: Path | None) -> _AgentLike:
-    from agentao import Agentao  # lazy; raises ImportError if unavailable
+    # In agentao 0.3 the bare ``Agentao(...)`` constructor no longer
+    # discovers ``.env`` files, ``LLM_PROVIDER``-prefixed credentials,
+    # ``permissions.json``, or MCP registries — embedded hosts must
+    # opt in via ``build_from_environment``. Skipping it here would
+    # trip the constructor's "missing api_key/base_url/model" guard
+    # on the first card execution.
+    from agentao.embedding import build_from_environment  # lazy; raises ImportError if unavailable
 
+    if working_directory is None:
+        raise ValueError(
+            "Agentao 0.3+ requires an explicit working_directory; "
+            "construct AgentaoMultiAgentExecutor with a project root."
+        )
+
+    # build_from_environment runs project ``.env`` discovery and
+    # ``discover_llm_kwargs`` in a single shot, so we can't slot a
+    # home-``.env`` load between them. Pre-load both files here in the
+    # desired precedence (shell > project > home): project goes first
+    # with ``override=False`` so shell exports still win, then home goes
+    # second with ``override=False`` so it can only fill keys neither
+    # shell nor project set. The factory's later project-``.env`` load
+    # is a no-op once the values are already in ``os.environ``.
+    _load_project_dotenv(working_directory)
     _load_home_dotenv()
-    kwargs: dict[str, Any] = {"working_directory": working_directory}
+    overrides: dict[str, Any] = {}
     if spec.model:
-        kwargs["model"] = spec.model
+        overrides["model"] = spec.model
     if spec.temperature is not None:
-        kwargs["temperature"] = spec.temperature
-    agent = Agentao(**kwargs)
-    # Propagate the role-specific system prompt into agentao's project
-    # instructions hook so sub_agent.chat() prepends it to every turn.
+        overrides["temperature"] = spec.temperature
     if spec.system_instructions:
-        agent.project_instructions = spec.system_instructions
-    return agent
+        overrides["project_instructions"] = spec.system_instructions
+    return build_from_environment(working_directory, **overrides)
+
+
+def _load_project_dotenv(working_directory: Path) -> None:
+    try:
+        from dotenv import load_dotenv
+    except ImportError:
+        return
+    project_env = working_directory / ".env"
+    if project_env.is_file():
+        load_dotenv(project_env, override=False)
 
 
 def _load_home_dotenv() -> None:

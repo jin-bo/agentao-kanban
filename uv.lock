@@ -4,7 +4,7 @@ requires-python = ">=3.12"
 
 [[package]]
 name = "agentao"
-version = "0.2.10"
+version = "0.3.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "beautifulsoup4" },
@@ -20,9 +20,9 @@ dependencies = [
     { name = "readchar" },
     { name = "rich" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/41/66/8c8f68dc11569ca9cd0173048105944f9eebc8f13edddc1d14907b126a0c/agentao-0.2.10.tar.gz", hash = "sha256:44da44abcbd23ce1f9fa447c4737c9017926a47d68b7c138d7ed9cd24d3ac32f", size = 675542, upload-time = "2026-04-15T16:48:48.603Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/f8/6f/f78bfb32cab07978c8a39143d661599a349077f4e849cb597580990c9caa/agentao-0.3.0.tar.gz", hash = "sha256:8b78b10faf80c8a3c466500ef2bcb481f6be5ebc41ad91c6a3e4c89ff29e6d41", size = 830895, upload-time = "2026-04-29T11:48:08.114Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/fe/3c/1099087d78287e8150213aa657e0edd636433ff2f1e04603bfa83ccdc93b/agentao-0.2.10-py3-none-any.whl", hash = "sha256:bd55b9774fe35f62755e74a3c6255eee7496eb643d97a1431b3dbebd15041cdd", size = 402008, upload-time = "2026-04-15T16:48:46.973Z" },
+    { url = "https://files.pythonhosted.org/packages/bc/35/264fbb68ac2a2b86645a03f6210217ad8403cfe80effd2d4f8911d0833c9/agentao-0.3.0-py3-none-any.whl", hash = "sha256:90913fbbc6eb19181c0e9ccf08275083800d3ca3884106b167895d5a1065dc2a", size = 570271, upload-time = "2026-04-29T11:48:05.942Z" },
 ]
 
 [[package]]
@@ -45,7 +45,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "agentao", specifier = ">=0.2.10" },
+    { name = "agentao", specifier = ">=0.3.0" },
     { name = "fastapi", specifier = ">=0.110" },
     { name = "mcp", specifier = ">=1.0" },
     { name = "pyyaml", specifier = ">=6.0" },

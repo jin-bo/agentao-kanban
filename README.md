@@ -56,7 +56,7 @@ cd agentao-kanban
 uv sync
 ```
 
-> `agentao` 已发布到 PyPI(≥ 0.2.10),`uv sync` 默认直接从 PyPI 拉,
+> `agentao` 已发布到 PyPI(≥ 0.3.0),`uv sync` 默认直接从 PyPI 拉,
 > 不需要同级 `../agentao` 源码。只有同时在改 agentao 的开发者才需要在
 > 当前虚拟环境里手动覆盖为本地 editable:
 >
@@ -90,7 +90,7 @@ uv run kanban daemon --detach                   # 后台,日志写 <board>/daemo
 用 `--executor agentao` 调四个本地 sub-agent(planner / worker / reviewer /
 verifier)。额外要求:
 
-1. `agentao` 包可用。`uv sync` 已经从 PyPI 装好(≥ 0.2.10);只有同时在改
+1. `agentao` 包可用。`uv sync` 已经从 PyPI 装好(≥ 0.3.0);只有同时在改
    agentao 源码的开发者才需要按先决条件里的说明再执行一次
    `uv pip install --editable ../agentao` 覆盖当前 `.venv`。
 2. sub-agent 定义:默认从 `kanban/defaults/*.md` 读,仓库已打包。若要本地
