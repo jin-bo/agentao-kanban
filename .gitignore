@@ -12,6 +12,7 @@ wheels/
 # OS / local logs
 .DS_Store
 *.log
+*.log.*
 
 # Agentao runtime state
 .agentao/
