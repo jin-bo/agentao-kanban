@@ -3,6 +3,8 @@ from __future__ import annotations
 import threading
 from pathlib import Path
 
+import pytest
+
 from kanban import CardPriority, CardStatus, KanbanOrchestrator
 from kanban.daemon import (
     CombinedDaemon,
@@ -87,13 +89,15 @@ def test_try_acquire_claim_is_exclusive_under_concurrent_workers(tmp_path: Path)
         start.wait()
         results[idx] = store.try_acquire_claim(claim.card_id, worker_id=worker_id)
 
-    t1 = threading.Thread(target=attempt, args=(0, "worker-a"))
-    t2 = threading.Thread(target=attempt, args=(1, "worker-b"))
+    t1 = threading.Thread(target=attempt, args=(0, "worker-a"), daemon=True)
+    t2 = threading.Thread(target=attempt, args=(1, "worker-b"), daemon=True)
     t1.start()
     t2.start()
     start.set()
-    t1.join()
-    t2.join()
+    t1.join(timeout=5.0)
+    t2.join(timeout=5.0)
+    if t1.is_alive() or t2.is_alive():
+        pytest.fail("concurrent claim acquisition threads did not finish")
 
     winners = [r for r in results if r is not None]
     losers = [r for r in results if r is None]
@@ -220,7 +224,9 @@ def test_combined_daemon_runs_cards_to_completion(tmp_path: Path):
         Card(title="t", goal="g", acceptance_criteria=["x"])
     )
     daemon = CombinedDaemon(
-        orch, config=DaemonConfig(max_idle_cycles=2, poll_interval=0.01, max_claims=2)
+        orch,
+        config=DaemonConfig(max_idle_cycles=2, poll_interval=0.01, max_claims=2),
+        orchestrator_factory=lambda: _make(tmp_path)[1],
     )
     daemon.run()
     final = store.get_card(card.id)
