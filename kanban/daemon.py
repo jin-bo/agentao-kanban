@@ -157,6 +157,48 @@ def assert_no_daemon(board_dir: Path) -> None:
         )
 
 
+def daemon_status(board_dir: Path) -> dict:
+    """Read-only snapshot of ``.daemon.lock`` state for observability.
+
+    Returns one of three shapes (always with the same keys, so callers
+    don't need to defend against missing fields):
+
+    - ``{"status": "stopped", "pid": None, "started_at": None, ...}``
+      No lock file present.
+    - ``{"status": "running", "pid": <int>, "started_at": <float>, ...}``
+      Lock present, recorded pid is alive.
+    - ``{"status": "stale", "pid": <int>, "started_at": <float>, ...}``
+      Lock present, but the recorded pid is gone — the daemon crashed
+      or was killed without unlinking the file.
+
+    Crucially this does *not* clear stale locks (use
+    :func:`clear_stale_lock` for that). The web UI calls this every
+    poll and must stay strictly read-only.
+    """
+    path = lock_path(board_dir)
+    base: dict = {
+        "lock_path": str(path),
+        "pid": None,
+        "started_at": None,
+    }
+    data = read_lock(board_dir)
+    if data is None:
+        return {**base, "status": "stopped"}
+    pid_raw = data.get("pid", 0)
+    try:
+        pid = int(pid_raw)
+    except (TypeError, ValueError):
+        pid = 0
+    started_at = data.get("started_at")
+    base["pid"] = pid if pid > 0 else None
+    base["started_at"] = (
+        float(started_at) if isinstance(started_at, (int, float)) else None
+    )
+    if pid > 0 and _pid_alive(pid):
+        return {**base, "status": "running"}
+    return {**base, "status": "stale"}
+
+
 # ---------- daemon loop ----------
 
 

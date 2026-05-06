@@ -34,6 +34,7 @@ uv run kanban <subcommand>    # run CLI
 - `workspace/board/cards/<card-id>.md` — one file per card. TOML front-matter between `+++` fences is source of truth; body is regenerated on each write.
 - `workspace/board/events.log` — JSONL. Execution events include `role`, `prompt_version`, `duration_ms`, `attempt`, optional `raw_path`.
 - `workspace/raw/<card-id>/<role>-<ts>.md` — optional full agent transcripts. Retention: last 5 per (card, role). `workspace/` is gitignored.
+- `workspace/raw/<card-id>/artifacts-<ts>/` — snapshot of any gitignored files the worker wrote inside its worktree, captured by `WorktreeManager.detach()` before `git worktree remove` deletes them. Retention: last 5 per card; size cap 500 MiB (env: `KANBAN_ARTIFACTS_MAX_BYTES`). Build caches like `node_modules/`, `__pycache__/`, `.venv/`, `dist/`, `target/` are excluded by a denylist before counting. Per-file accounting: when the cap is reached, remaining files are skipped but already-copied files are kept. Surfaced in `events.log` as `worktree.artifacts_saved`.
 - `workspace/board/.daemon.lock` — single-writer guard while the daemon runs.
 
 The CLI uses this store by default at `workspace/board` (override with `--board DIR`).

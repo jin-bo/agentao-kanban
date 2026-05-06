@@ -81,11 +81,11 @@ body {
 
 .layout {
   display: grid;
-  grid-template-columns: repeat(6, minmax(160px, 1fr));
+  grid-template-columns: repeat(5, minmax(160px, 1fr));
   grid-template-rows: 1fr 1fr;
   grid-template-areas:
-    "inbox   ready    doing    done    detail    runtime"
-    "blocked review   verify   done    detail    events";
+    "inbox   ready    doing    done    runtime"
+    "blocked review   verify   done    events";
   gap: 10px;
   padding: 14px;
   height: calc(100vh - 58px);
@@ -103,7 +103,6 @@ body {
 #col-blocked { grid-area: blocked; }
 #col-review  { grid-area: review; }
 #col-verify  { grid-area: verify; }
-.detail-cell  { grid-area: detail; }
 .runtime-cell { grid-area: runtime; }
 .events-cell  { grid-area: events; }
 
@@ -195,6 +194,264 @@ body {
 }
 .card-id {
   opacity: 0.7;
+}
+
+.add-toggle {
+  background: transparent;
+  border: 1px dashed var(--border);
+  color: var(--text-dim);
+  border-radius: 4px;
+  padding: 4px 6px;
+  font-size: 12px;
+  cursor: pointer;
+  font-family: inherit;
+  margin: 6px 8px 0;
+}
+.add-toggle:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(8, 10, 14, 0.55);
+  backdrop-filter: blur(2px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  z-index: 100;
+  animation: backdrop-in 0.12s ease-out;
+}
+.modal-backdrop.hidden {
+  display: none;
+}
+@keyframes backdrop-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+.card-modal {
+  cursor: default;
+  width: min(440px, 100%);
+  padding: 14px 14px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.5),
+              0 0 0 1px var(--accent) inset;
+  border-color: var(--accent);
+  animation: modal-in 0.14s ease-out;
+}
+.card-modal:hover {
+  border-color: var(--accent);
+}
+@keyframes modal-in {
+  from { transform: translateY(6px); opacity: 0; }
+  to   { transform: translateY(0);   opacity: 1; }
+}
+
+.card-modal-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+}
+.card-modal .add-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  color: var(--text-dim);
+  margin-top: 2px;
+}
+.card-modal .add-input {
+  background: var(--bg-elev);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 6px 8px;
+  font-size: 13px;
+  font-family: inherit;
+  width: 100%;
+}
+.card-modal textarea.add-input {
+  resize: vertical;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+.card-modal .add-input:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent) inset;
+}
+.card-modal .add-title {
+  font-size: 14px;
+  font-weight: 500;
+}
+.card-modal .add-priority {
+  width: auto;
+  font-family: var(--mono);
+  font-size: 11px;
+  padding: 2px 6px;
+}
+
+.add-actions {
+  display: flex;
+  gap: 6px;
+  justify-content: flex-end;
+  margin-top: 4px;
+}
+.add-submit,
+.add-cancel {
+  font-family: inherit;
+  font-size: 12px;
+  padding: 4px 14px;
+  border-radius: 3px;
+  cursor: pointer;
+  border: 1px solid var(--border);
+}
+.add-submit {
+  background: var(--accent);
+  color: #0b1320;
+  border-color: var(--accent);
+  font-weight: 600;
+}
+.add-submit:disabled {
+  opacity: 0.6;
+  cursor: progress;
+}
+.add-cancel {
+  background: transparent;
+  color: var(--text-dim);
+}
+.add-cancel:hover {
+  color: var(--text);
+  border-color: var(--text-dim);
+}
+.add-error {
+  color: var(--danger);
+  font-size: 11px;
+  font-family: var(--mono);
+  word-break: break-word;
+}
+.add-error:empty {
+  display: none;
+}
+
+/* Card detail modal — read-only inspector. Re-uses .modal-backdrop and
+ * the .card visual language; sized larger than the create form because
+ * it carries metadata + acceptance + recent events.
+ */
+.card-detail-modal {
+  cursor: default;
+  width: min(640px, 100%);
+  max-height: min(82vh, 760px);
+  padding: 14px 16px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.5),
+              0 0 0 1px var(--accent) inset;
+  border-color: var(--accent);
+  animation: modal-in 0.14s ease-out;
+  overflow: hidden;
+}
+.card-detail-modal:hover {
+  border-color: var(--accent);
+}
+.card-detail-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.card-detail-head .card-detail-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.card-detail-title {
+  font-size: 15px;
+  font-weight: 600;
+  margin: 0;
+  word-break: break-word;
+}
+.card-detail-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  overflow-y: auto;
+  padding-right: 4px;
+  min-height: 0;
+}
+.card-detail-section {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.card-detail-section h3 {
+  margin: 0;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  color: var(--text-dim);
+  font-weight: 600;
+}
+.card-detail-section .hint {
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.card-detail-section dl {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 3px 10px;
+  font-size: 12px;
+  margin: 0;
+}
+.card-detail-section dt {
+  color: var(--text-dim);
+}
+.card-detail-section dd {
+  margin: 0;
+  font-family: var(--mono);
+  word-break: break-word;
+}
+.card-detail-section pre {
+  background: var(--bg-elev-2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 6px 8px;
+  font-size: 11px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  margin: 0;
+}
+.detail-close {
+  background: transparent;
+  color: var(--text-dim);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  width: 24px;
+  height: 24px;
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  font-family: inherit;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.detail-close:hover {
+  color: var(--text);
+  border-color: var(--text-dim);
+}
+.card-detail-loading {
+  font-style: italic;
+  color: var(--text-dim);
+  font-size: 12px;
 }
 
 .blocked-reason {
@@ -305,6 +562,42 @@ body {
 .runtime-block {
   margin-bottom: 6px;
 }
+.daemon-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--mono);
+  font-size: 11px;
+  padding: 3px 0;
+}
+.daemon-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-dim);
+  flex: 0 0 auto;
+}
+.daemon-running .daemon-dot {
+  background: var(--ok);
+  box-shadow: 0 0 6px var(--ok);
+}
+.daemon-stopped .daemon-dot {
+  background: var(--text-dim);
+}
+.daemon-stale .daemon-dot {
+  background: var(--warn);
+  box-shadow: 0 0 6px var(--warn);
+}
+.daemon-label {
+  color: var(--text);
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+}
+.daemon-running .daemon-label { color: var(--ok); }
+.daemon-stale   .daemon-label { color: var(--warn); }
+.daemon-detail {
+  color: var(--text-dim);
+}
 .runtime-block h3 {
   margin: 0 0 3px;
   font-size: 11px;
@@ -332,9 +625,9 @@ body {
     grid-template-columns: repeat(3, minmax(180px, 1fr)) minmax(260px, 1fr);
     grid-template-rows: repeat(4, minmax(220px, 1fr));
     grid-template-areas:
-      "inbox   ready   doing   detail"
-      "blocked review  verify  detail"
-      "done    done    done    runtime"
+      "inbox   ready   doing   runtime"
+      "blocked review  verify  runtime"
+      "done    done    done    events"
       "done    done    done    events";
     height: auto;
     min-height: calc(100vh - 58px);
@@ -344,12 +637,11 @@ body {
 @media (max-width: 1000px) {
   .layout {
     grid-template-columns: repeat(3, minmax(160px, 1fr));
-    grid-template-rows: repeat(5, minmax(220px, auto));
+    grid-template-rows: repeat(4, minmax(220px, auto));
     grid-template-areas:
       "inbox   ready   doing"
       "blocked review  verify"
       "done    done    done"
-      "detail  detail  detail"
       "runtime runtime events";
     height: auto;
   }
@@ -369,7 +661,6 @@ body {
       "review"
       "verify"
       "done"
-      "detail"
       "runtime"
       "events";
     height: auto;

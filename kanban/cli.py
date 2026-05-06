@@ -360,6 +360,24 @@ def build_parser() -> argparse.ArgumentParser:
         dest="poll_interval_ms",
         help="Frontend poll interval in ms (default 5000)",
     )
+    web_p.add_argument(
+        "--enable-writes",
+        action="store_true",
+        dest="enable_writes",
+        help=(
+            "Expose POST /api/cards so the browser can create new INBOX "
+            "cards. Off by default; the rest of the surface stays read-only."
+        ),
+    )
+    web_p.add_argument(
+        "--allow-remote-writes",
+        action="store_true",
+        dest="allow_remote_writes",
+        help=(
+            "Permit --enable-writes on non-loopback bind hosts. Required "
+            "when fronting the server with a reverse proxy or firewall."
+        ),
+    )
 
     # --- worktree subcommands ---
     wt = sub.add_parser("worktree", help="Manage Git worktrees for cards")
@@ -592,6 +610,7 @@ def _detach_worktree_after_terminal_cli(
     wt_mgr = WorktreeManager(
         project_root=project_root,
         worktrees_root=project_root / "workspace" / "worktrees",
+        artifacts_root=project_root / "workspace" / "raw",
     )
     detach_worktree_on_terminal(store, wt_mgr, card_id, card.status)
 
@@ -624,6 +643,7 @@ def _resolve_worktree_mgr(args: argparse.Namespace):
     return WorktreeManager(
         project_root=project_root,
         worktrees_root=project_root / "workspace" / "worktrees",
+        artifacts_root=project_root / "workspace" / "raw",
     )
 
 
@@ -1645,6 +1665,7 @@ def _make_worktree_mgr(args: argparse.Namespace):
     return WorktreeManager(
         project_root=project_root,
         worktrees_root=project_root / "workspace" / "worktrees",
+        artifacts_root=project_root / "workspace" / "raw",
     )
 
 
@@ -1738,6 +1759,8 @@ def cmd_web(args: argparse.Namespace) -> int:
         host=args.host,
         port=args.port,
         poll_interval_ms=args.poll_interval_ms,
+        enable_writes=args.enable_writes,
+        allow_remote_writes=args.allow_remote_writes,
     )
 
 

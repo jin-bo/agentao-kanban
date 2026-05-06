@@ -7,8 +7,10 @@ can execute in an isolated branch without conflicting with concurrent work.
 from __future__ import annotations
 
 import logging
+import os
+import shutil
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -17,6 +19,54 @@ from .models import CardStatus
 log = logging.getLogger("kanban.worktree")
 
 BRANCH_PREFIX = "kanban/"
+
+DEFAULT_ARTIFACTS_RETENTION = 5
+DEFAULT_ARTIFACTS_MAX_BYTES = 500 * 1024 * 1024  # 500 MiB
+ARTIFACTS_MAX_BYTES_ENV = "KANBAN_ARTIFACTS_MAX_BYTES"
+# Path components or path suffixes that almost always represent build
+# caches / dependency stores rather than worker deliverables. Skipping
+# them keeps the snapshot focused on real outputs and (importantly)
+# stops a single ``node_modules/`` from blowing the size cap. Operators
+# who actually need one of these for a card can override
+# ``WorktreeManager.artifacts_denylist`` at construction.
+DEFAULT_ARTIFACTS_DENYLIST: tuple[str, ...] = (
+    "__pycache__/",
+    "node_modules/",
+    ".venv/",
+    "venv/",
+    ".tox/",
+    ".cache/",
+    ".pytest_cache/",
+    ".mypy_cache/",
+    ".ruff_cache/",
+    ".next/",
+    ".turbo/",
+    "target/",        # Rust / sbt
+    "dist/",
+    "build/",
+    ".gradle/",
+    ".pyc",           # extension match
+    ".pyo",
+)
+
+
+def _is_denylisted(rel_path: str, patterns: tuple[str, ...]) -> bool:
+    """Match POSIX-style ``rel_path`` against the denylist.
+
+    A pattern ending in ``/`` matches when its stripped name appears as
+    *any* path component (so ``node_modules/`` hits both
+    ``node_modules/foo.js`` and ``packages/x/node_modules/y.js``).
+    Otherwise it's treated as a path-suffix match — useful for file
+    extensions like ``.pyc``.
+    """
+    parts = rel_path.split("/")
+    for p in patterns:
+        if p.endswith("/"):
+            if p[:-1] in parts:
+                return True
+        elif rel_path.endswith(p):
+            return True
+    return False
 
 
 class WorktreeCreateError(RuntimeError):
@@ -37,13 +87,55 @@ class WorktreeInfo:
 
 
 @dataclass
+class DetachResult:
+    """Outcome of :meth:`WorktreeManager.detach`.
+
+    ``removed`` mirrors the historical bool return (True = worktree
+    directory gone or never existed; False = removal aborted to preserve
+    uncommitted work).
+
+    ``artifacts_path`` points at the per-card snapshot dir if any
+    gitignored content was rescued before the worktree was deleted.
+    None when no artifacts existed, the snapshot was skipped (size cap
+    or disabled), or the worktree was never on disk.
+    """
+
+    removed: bool
+    artifacts_path: Path | None = None
+    artifacts_skipped_reason: str | None = None
+
+    def __bool__(self) -> bool:  # back-compat: ``if mgr.detach(...):``
+        return self.removed
+
+
+@dataclass
 class WorktreeManager:
     project_root: Path
     worktrees_root: Path
     base_ref: str = "HEAD"
+    # Where to snapshot gitignored worktree content before detach.
+    # ``workspace/`` is .gitignored in this project (and most projects
+    # using kanban), so a worker's deliverables under ``workspace/...``
+    # are invisible to ``_auto_commit`` and would be deleted with the
+    # worktree directory. The snapshot rescues them. None disables.
+    artifacts_root: Path | None = None
+    artifacts_retention: int = DEFAULT_ARTIFACTS_RETENTION
+    artifacts_max_bytes: int = DEFAULT_ARTIFACTS_MAX_BYTES
+    artifacts_denylist: tuple[str, ...] = DEFAULT_ARTIFACTS_DENYLIST
 
     def __post_init__(self) -> None:
         self._ensure_ignored()
+        # Env override applied per-instance so test fixtures and
+        # subprocesses can dial the cap without changing call sites.
+        env_cap = os.environ.get(ARTIFACTS_MAX_BYTES_ENV)
+        if env_cap:
+            try:
+                self.artifacts_max_bytes = int(env_cap)
+            except ValueError:
+                log.warning(
+                    "ignoring %s=%r (not an integer)",
+                    ARTIFACTS_MAX_BYTES_ENV, env_cap,
+                )
 
     def _git(self, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
@@ -219,25 +311,191 @@ class WorktreeManager:
             return entry.get("branch") == f"refs/heads/{branch}"
         return False
 
-    def detach(self, card_id: str) -> bool:
+    def detach(self, card_id: str) -> DetachResult:
         """Remove the worktree directory, keeping the branch.
 
-        Returns True if the worktree was removed (or never existed), False
-        if the removal was aborted to preserve uncommitted work.
+        Order of operations matters: gitignored deliverables are
+        snapshotted *before* ``git worktree remove --force`` because that
+        command deletes the directory tree, taking ignored files with
+        it. ``_auto_commit`` only catches tracked + untracked-not-ignored
+        paths, so anything written under a gitignored prefix
+        (commonly ``workspace/`` in this project) would otherwise be
+        unrecoverable.
+
+        Returns a :class:`DetachResult`. ``removed=False`` is reserved
+        for the auto-commit-failed branch where the worktree dir is
+        kept to preserve uncommitted work.
         """
         wt_path = self.worktrees_root / card_id
-        if wt_path.exists():
-            if not self._auto_commit(card_id, wt_path):
-                log.warning(
-                    "skipping worktree removal for %s — auto-commit failed",
-                    card_id,
-                )
-                return False
-            self._git("worktree", "remove", str(wt_path), "--force")
-            log.info("detached worktree %s (branch preserved)", wt_path)
-        else:
+        if not wt_path.exists():
             self._git("worktree", "prune", check=False)
-        return True
+            return DetachResult(removed=True)
+
+        artifacts_path: Path | None = None
+        skipped_reason: str | None = None
+        try:
+            artifacts_path, skipped_reason = self._save_artifacts(card_id, wt_path)
+        except Exception:  # noqa: BLE001 — never let snapshot abort detach
+            log.exception(
+                "artifact snapshot failed for %s; continuing with detach",
+                card_id,
+            )
+
+        if not self._auto_commit(card_id, wt_path):
+            log.warning(
+                "skipping worktree removal for %s — auto-commit failed",
+                card_id,
+            )
+            return DetachResult(
+                removed=False,
+                artifacts_path=artifacts_path,
+                artifacts_skipped_reason=skipped_reason,
+            )
+        self._git("worktree", "remove", str(wt_path), "--force")
+        log.info("detached worktree %s (branch preserved)", wt_path)
+        return DetachResult(
+            removed=True,
+            artifacts_path=artifacts_path,
+            artifacts_skipped_reason=skipped_reason,
+        )
+
+    def _save_artifacts(
+        self, card_id: str, wt_path: Path
+    ) -> tuple[Path | None, str | None]:
+        """Snapshot gitignored worktree content before detach.
+
+        Returns ``(snapshot_path, skipped_reason)``:
+
+        - ``(Path, None)`` when files were rescued (possibly partial)
+        - ``(None, "no-artifacts")`` when nothing was eligible
+        - ``(None, "<reason>")`` when nothing was rescued for a specific reason
+        - ``(None, None)`` when artifacts capture is disabled
+
+        Strategy is best-effort, not all-or-nothing:
+
+        1. Enumerate ignored files with ``git ls-files --others --ignored
+           --exclude-standard`` (the set ``_auto_commit`` cannot reach).
+        2. Drop paths matching :attr:`artifacts_denylist` (build caches,
+           ``node_modules``, ``__pycache__``, etc.) so a single bloated
+           cache directory never crowds out real deliverables.
+        3. Walk the rest in git's enumeration order, copying each file
+           that fits within the remaining size budget. Once the cap is
+           reached, subsequent files are skipped (not the whole snapshot).
+
+        Untracked-but-not-ignored files are already covered by
+        ``git add -A`` in ``_auto_commit`` and are intentionally *not*
+        included here to avoid duplicating what ends up in the rescue
+        commit.
+        """
+        if self.artifacts_root is None or self.artifacts_retention <= 0:
+            return None, None
+
+        ls = subprocess.run(
+            [
+                "git", "ls-files",
+                "--others", "--ignored", "--exclude-standard",
+                "-z",
+            ],
+            cwd=wt_path, capture_output=True, check=False,
+        )
+        if ls.returncode != 0:
+            log.warning(
+                "git ls-files failed in %s: %s",
+                wt_path, ls.stderr.decode(errors="replace").strip(),
+            )
+            return None, "ls-files-failed"
+        # Split on NUL (the -z form) and drop the trailing empty entry.
+        raw = ls.stdout.split(b"\x00")
+        rels = [r.decode("utf-8", errors="replace") for r in raw if r]
+        if not rels:
+            return None, "no-artifacts"
+
+        kept: list[tuple[Path, str, int]] = []
+        skipped_pattern = 0
+        skipped_oversize = 0
+        skipped_oversize_bytes = 0
+        total = 0
+        for rel in rels:
+            if _is_denylisted(rel, self.artifacts_denylist):
+                skipped_pattern += 1
+                continue
+            src = wt_path / rel
+            try:
+                st = src.lstat()
+            except OSError:
+                continue
+            size = st.st_size
+            if total + size > self.artifacts_max_bytes:
+                skipped_oversize += 1
+                skipped_oversize_bytes += size
+                continue
+            total += size
+            kept.append((src, rel, size))
+
+        if not kept:
+            if skipped_oversize > 0:
+                log.warning(
+                    "artifact snapshot for %s skipped %d file(s) totaling "
+                    "%d bytes; cap %d bytes. Raise %s or "
+                    "WorktreeManager.artifacts_max_bytes if you need them.",
+                    card_id, skipped_oversize, skipped_oversize_bytes,
+                    self.artifacts_max_bytes, ARTIFACTS_MAX_BYTES_ENV,
+                )
+                return None, "size-cap-exceeded"
+            return None, "no-artifacts"
+
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        card_dir = self.artifacts_root / card_id
+        snapshot = card_dir / f"artifacts-{stamp}"
+        snapshot.mkdir(parents=True, exist_ok=True)
+        wt_resolved = wt_path.resolve()
+        for src, rel_str, _ in kept:
+            try:
+                rel = src.resolve(strict=False).relative_to(wt_resolved)
+            except ValueError:
+                # Symlink resolved outside the worktree — copy it as a
+                # symlink at its declared relative path instead, so we
+                # never follow it out of the sandbox.
+                rel = Path(rel_str)
+            dst = snapshot / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                if src.is_symlink():
+                    target = src.readlink()
+                    if dst.exists() or dst.is_symlink():
+                        dst.unlink()
+                    dst.symlink_to(target)
+                else:
+                    shutil.copy2(src, dst, follow_symlinks=False)
+            except OSError as exc:
+                log.warning("could not snapshot %s: %s", src, exc)
+
+        # Retention: keep the most recent N artifact dirs per card.
+        existing = sorted(card_dir.glob("artifacts-*"))
+        for stale in existing[: -self.artifacts_retention]:
+            try:
+                shutil.rmtree(stale)
+            except OSError:
+                pass
+
+        if skipped_oversize > 0:
+            log.warning(
+                "snapshotted %d file(s) (%d bytes) for %s to %s; "
+                "skipped %d additional file(s) totaling %d bytes due to "
+                "size cap (%d). Raise %s or "
+                "WorktreeManager.artifacts_max_bytes to capture them.",
+                len(kept), total, card_id, snapshot,
+                skipped_oversize, skipped_oversize_bytes,
+                self.artifacts_max_bytes, ARTIFACTS_MAX_BYTES_ENV,
+            )
+        else:
+            log.info(
+                "snapshotted %d ignored file(s) (%d bytes) for %s to %s%s",
+                len(kept), total, card_id, snapshot,
+                f"; skipped {skipped_pattern} cache-pattern path(s)"
+                if skipped_pattern else "",
+            )
+        return snapshot, None
 
     def _auto_commit(self, card_id: str, wt_path: Path) -> bool:
         """Commit any uncommitted changes so they survive worktree removal.

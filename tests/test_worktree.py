@@ -291,7 +291,8 @@ def test_detach_preserved_when_autocommit_fails(tmp_path: Path):
     (info.path / "wip.txt").write_text("uncommitted\n")
 
     ok = mgr.detach("card-hookfail")
-    assert ok is False
+    assert ok.removed is False
+    assert bool(ok) is False
     # Worktree should NOT be removed because auto-commit failed
     assert (mgr.worktrees_root / "card-hookfail").exists()
     assert (mgr.worktrees_root / "card-hookfail" / "wip.txt").exists()
@@ -301,7 +302,226 @@ def test_detach_returns_true_on_success(tmp_path: Path):
     repo = _init_repo(tmp_path / "repo")
     mgr = _make_mgr(repo)
     mgr.create("card-ok")
-    assert mgr.detach("card-ok") is True
+    result = mgr.detach("card-ok")
+    assert result.removed is True
+    assert bool(result) is True
+
+
+# ---------- artifact rescue (gitignored deliverables) ----------
+
+
+def _mgr_with_artifacts(repo: Path) -> WorktreeManager:
+    """WorktreeManager configured to snapshot ignored content on detach."""
+    wt_root = repo / "workspace" / "worktrees"
+    wt_root.mkdir(parents=True, exist_ok=True)
+    return WorktreeManager(
+        project_root=repo,
+        worktrees_root=wt_root,
+        artifacts_root=repo / "workspace" / "raw",
+    )
+
+
+def _add_gitignore(repo: Path, pattern: str) -> None:
+    gi = repo / ".gitignore"
+    existing = gi.read_text() if gi.exists() else ""
+    gi.write_text(existing + pattern + "\n")
+    subprocess.run(["git", "add", ".gitignore"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "ignore"],
+        cwd=repo, check=True, capture_output=True,
+    )
+
+
+def test_detach_rescues_gitignored_deliverable(tmp_path: Path):
+    """The aed6a19e regression: a worker writes to workspace/reports/...,
+    that path is gitignored, _auto_commit can't see it, and the file
+    must survive detach via the artifacts snapshot.
+    """
+    repo = _init_repo(tmp_path / "repo")
+    _add_gitignore(repo, "workspace/")
+    mgr = _mgr_with_artifacts(repo)
+    info = mgr.create("card-deliv")
+
+    deliverable = info.path / "workspace" / "reports" / "ai-news.md"
+    deliverable.parent.mkdir(parents=True, exist_ok=True)
+    deliverable.write_text("# AI news\n\n- item 1\n- item 2\n", encoding="utf-8")
+
+    result = mgr.detach("card-deliv")
+    assert result.removed is True
+    assert result.artifacts_path is not None
+    saved = result.artifacts_path / "workspace" / "reports" / "ai-news.md"
+    assert saved.exists(), f"deliverable not snapshotted at {saved}"
+    assert "AI news" in saved.read_text(encoding="utf-8")
+    # Worktree dir is gone, but the snapshot persists outside it.
+    assert not (mgr.worktrees_root / "card-deliv").exists()
+
+
+def test_detach_no_artifacts_when_only_tracked_changes(tmp_path: Path):
+    """Untracked-not-ignored changes are caught by _auto_commit; we
+    intentionally don't duplicate them in the snapshot."""
+    repo = _init_repo(tmp_path / "repo")
+    mgr = _mgr_with_artifacts(repo)
+    info = mgr.create("card-tracked")
+    (info.path / "src.py").write_text("print('hi')\n")  # untracked, not ignored
+
+    result = mgr.detach("card-tracked")
+    assert result.removed is True
+    assert result.artifacts_path is None
+    assert result.artifacts_skipped_reason == "no-artifacts"
+
+
+def test_detach_partial_snapshot_under_size_cap(tmp_path: Path):
+    """Per-file accounting: keep what fits, skip the oversized rest.
+
+    Replaces the old all-or-nothing behavior. The whole point is that
+    a giant deliverable shouldn't crowd out smaller real outputs sitting
+    next to it.
+    """
+    repo = _init_repo(tmp_path / "repo")
+    _add_gitignore(repo, "workspace/")
+    wt_root = repo / "workspace" / "worktrees"
+    wt_root.mkdir(parents=True, exist_ok=True)
+    # Use a temp directory outside `workspace/` since the gitignore
+    # would otherwise let `workspace/data/` files be re-ignored when
+    # the worktree is created. Place gitignore on the literal path.
+    mgr = WorktreeManager(
+        project_root=repo,
+        worktrees_root=wt_root,
+        artifacts_root=repo / "workspace" / "raw",
+        artifacts_max_bytes=300,  # fits ~300 bytes, not 1 KiB
+        artifacts_denylist=(),    # disable denylist so size cap is the only filter
+    )
+    info = mgr.create("card-mixed")
+    small = info.path / "workspace" / "report.txt"
+    small.parent.mkdir(parents=True, exist_ok=True)
+    small.write_bytes(b"keepme\n")  # 7 bytes
+    big = info.path / "workspace" / "huge.bin"
+    big.write_bytes(b"x" * 1024)    # 1024 bytes — over remaining budget
+
+    result = mgr.detach("card-mixed")
+    assert result.removed is True
+    assert result.artifacts_path is not None  # partial save still wins
+    assert (result.artifacts_path / "workspace" / "report.txt").exists()
+    assert not (result.artifacts_path / "workspace" / "huge.bin").exists()
+
+
+def test_detach_size_cap_exceeded_when_nothing_fits(tmp_path: Path):
+    """If even the smallest file exceeds the cap, the snapshot is empty
+    and the reason is reported (regression for the original 'all-or-
+    nothing' contract on hopelessly small caps)."""
+    repo = _init_repo(tmp_path / "repo")
+    _add_gitignore(repo, "workspace/")
+    wt_root = repo / "workspace" / "worktrees"
+    wt_root.mkdir(parents=True, exist_ok=True)
+    mgr = WorktreeManager(
+        project_root=repo,
+        worktrees_root=wt_root,
+        artifacts_root=repo / "workspace" / "raw",
+        artifacts_max_bytes=8,  # smaller than any realistic file
+        artifacts_denylist=(),
+    )
+    info = mgr.create("card-tiny")
+    big = info.path / "workspace" / "out.bin"
+    big.parent.mkdir(parents=True, exist_ok=True)
+    big.write_bytes(b"x" * 256)
+
+    result = mgr.detach("card-tiny")
+    assert result.removed is True
+    assert result.artifacts_path is None
+    assert result.artifacts_skipped_reason == "size-cap-exceeded"
+
+
+def test_detach_denylist_skips_cache_dirs(tmp_path: Path):
+    """node_modules / __pycache__ / build caches must never count
+    against the size budget — they aren't deliverables."""
+    repo = _init_repo(tmp_path / "repo")
+    _add_gitignore(repo, "workspace/")
+    mgr = _mgr_with_artifacts(repo)
+    info = mgr.create("card-junk")
+
+    junk = info.path / "workspace" / "node_modules" / "lodash" / "index.js"
+    junk.parent.mkdir(parents=True, exist_ok=True)
+    junk.write_bytes(b"junk\n")
+    pyc = info.path / "workspace" / "src" / "__pycache__" / "mod.cpython-312.pyc"
+    pyc.parent.mkdir(parents=True, exist_ok=True)
+    pyc.write_bytes(b"\x00" * 64)
+    real = info.path / "workspace" / "report.md"
+    real.write_bytes(b"# real\n")
+
+    result = mgr.detach("card-junk")
+    assert result.artifacts_path is not None
+    saved = result.artifacts_path
+    assert (saved / "workspace" / "report.md").exists()
+    assert not (saved / "workspace" / "node_modules").exists()
+    assert not (saved / "workspace" / "src" / "__pycache__").exists()
+
+
+def test_artifacts_max_bytes_env_override(tmp_path: Path, monkeypatch):
+    """KANBAN_ARTIFACTS_MAX_BYTES overrides the dataclass default at
+    __post_init__ time, without touching call sites."""
+    monkeypatch.setenv("KANBAN_ARTIFACTS_MAX_BYTES", "1024")
+    repo = _init_repo(tmp_path / "repo")
+    mgr = _mgr_with_artifacts(repo)
+    assert mgr.artifacts_max_bytes == 1024
+
+
+def test_artifacts_max_bytes_env_invalid_ignored(
+    tmp_path: Path, monkeypatch, caplog
+):
+    monkeypatch.setenv("KANBAN_ARTIFACTS_MAX_BYTES", "not-a-number")
+    repo = _init_repo(tmp_path / "repo")
+    with caplog.at_level("WARNING", logger="kanban.worktree"):
+        mgr = _mgr_with_artifacts(repo)
+    # Falls back to the dataclass default rather than crashing.
+    from kanban.worktree import DEFAULT_ARTIFACTS_MAX_BYTES
+    assert mgr.artifacts_max_bytes == DEFAULT_ARTIFACTS_MAX_BYTES
+    assert any("KANBAN_ARTIFACTS_MAX_BYTES" in r.message for r in caplog.records)
+
+
+def test_detach_disabled_artifacts_root(tmp_path: Path):
+    """Without an artifacts_root, behavior matches the pre-rescue era:
+    no snapshot is created, the dataclass reports None silently."""
+    repo = _init_repo(tmp_path / "repo")
+    _add_gitignore(repo, "workspace/")
+    mgr = _make_mgr(repo)  # artifacts_root=None
+    info = mgr.create("card-noartroot")
+    deliverable = info.path / "workspace" / "out.txt"
+    deliverable.parent.mkdir(parents=True, exist_ok=True)
+    deliverable.write_text("doomed\n")
+
+    result = mgr.detach("card-noartroot")
+    assert result.removed is True
+    assert result.artifacts_path is None
+    assert result.artifacts_skipped_reason is None  # disabled, not skipped
+
+
+def test_detach_artifacts_retention(tmp_path: Path):
+    """Multiple terminal cycles for the same card keep at most N snapshots."""
+    repo = _init_repo(tmp_path / "repo")
+    _add_gitignore(repo, "workspace/")
+    wt_root = repo / "workspace" / "worktrees"
+    wt_root.mkdir(parents=True, exist_ok=True)
+    mgr = WorktreeManager(
+        project_root=repo,
+        worktrees_root=wt_root,
+        artifacts_root=repo / "workspace" / "raw",
+        artifacts_retention=2,
+    )
+    for i in range(4):
+        info = mgr.create("card-rotate")
+        (info.path / "workspace" / f"file-{i}.txt").parent.mkdir(
+            parents=True, exist_ok=True,
+        )
+        (info.path / "workspace" / f"file-{i}.txt").write_text(f"v{i}\n")
+        result = mgr.detach("card-rotate")
+        assert result.artifacts_path is not None
+        # Branch must be deleted between cycles so create() can reuse the id.
+        mgr.prune_branch("card-rotate", force=True)
+
+    snapshots = sorted(
+        (repo / "workspace" / "raw" / "card-rotate").glob("artifacts-*")
+    )
+    assert len(snapshots) == 2, [s.name for s in snapshots]
 
 
 def test_diff_summary_raises_on_missing_branch(tmp_path: Path):
@@ -462,7 +682,7 @@ def test_detach_without_user_config(tmp_path: Path):
     # Uncommitted edit — auto-commit must work without user config
     (info.path / "work.txt").write_text("work\n")
 
-    assert mgr.detach("card-nocfg") is True
+    assert mgr.detach("card-nocfg").removed is True
     assert not (mgr.worktrees_root / "card-nocfg").exists()
 
     # Branch has the auto-committed file

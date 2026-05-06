@@ -314,3 +314,63 @@ class TestDetachWorktreeOnTerminal:
         events = store.events_for_card(cid)
         types = [e.event_type for e in events if e.event_type]
         assert "worktree.detached" in types
+
+    def test_helper_emits_artifacts_saved_event_for_ignored_deliverable(
+        self, tmp_path: Path
+    ) -> None:
+        """End-to-end regression for the aed6a19e bug: a worker writes
+        a deliverable under a gitignored path, then DONE-detach must
+        snapshot the file *and* announce it via an event the operator
+        (or web UI) can find."""
+        repo = _init_repo(tmp_path / "repo")
+        # Add the gitignore the real project ships with.
+        (repo / ".gitignore").write_text("workspace/\n")
+        subprocess.run(
+            ["git", "add", ".gitignore"], cwd=repo, check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["git", "commit", "-m", "ignore"],
+            cwd=repo, check=True, capture_output=True,
+        )
+
+        board = repo / "workspace" / "board"
+        board.mkdir(parents=True, exist_ok=True)
+        store = MarkdownBoardStore(board)
+        wt_mgr = WorktreeManager(
+            project_root=repo,
+            worktrees_root=repo / "workspace" / "worktrees",
+            artifacts_root=repo / "workspace" / "raw",
+        )
+        (repo / "workspace" / "worktrees").mkdir(parents=True, exist_ok=True)
+        orch = KanbanOrchestrator(
+            store=store,
+            executor=MockAgentaoExecutor(),
+            worktree_mgr=wt_mgr,
+        )
+        card = orch.create_card("news", "g")
+        orch.tick()
+        orch.tick()
+        wt_path = wt_mgr.worktrees_root / card.id
+        assert wt_path.exists(), "worktree should exist after worker tick"
+
+        # Simulate a worker writing a deliverable in a gitignored path.
+        deliverable = wt_path / "workspace" / "reports" / "ai-news.md"
+        deliverable.parent.mkdir(parents=True, exist_ok=True)
+        deliverable.write_text("# AI news\nbody\n", encoding="utf-8")
+
+        from kanban.orchestrator import detach_worktree_on_terminal
+
+        detach_worktree_on_terminal(store, wt_mgr, card.id, CardStatus.DONE)
+        events = store.events_for_card(card.id)
+        types = [e.event_type for e in events if e.event_type]
+        assert "worktree.artifacts_saved" in types
+        assert "worktree.detached" in types
+
+        # Snapshot is on disk and contains the rescued file.
+        snapshots = sorted(
+            (repo / "workspace" / "raw" / card.id).glob("artifacts-*")
+        )
+        assert len(snapshots) == 1
+        rescued = snapshots[0] / "workspace" / "reports" / "ai-news.md"
+        assert rescued.exists()
+        assert "AI news" in rescued.read_text(encoding="utf-8")

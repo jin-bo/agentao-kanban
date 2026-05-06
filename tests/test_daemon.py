@@ -17,6 +17,7 @@ from kanban.daemon import (
     assert_no_daemon,
     clear_stale_lock,
     daemon_lock,
+    daemon_status,
     lock_path,
     read_lock,
 )
@@ -72,6 +73,35 @@ def test_assert_no_daemon_ignores_stale_lock(tmp_path: Path):
     )
     assert_no_daemon(tmp_path)  # no raise — stale lock cleared
     assert read_lock(tmp_path) is None
+
+
+def test_daemon_status_stopped_when_no_lock(tmp_path: Path):
+    s = daemon_status(tmp_path)
+    assert s["status"] == "stopped"
+    assert s["pid"] is None
+    assert s["started_at"] is None
+    assert s["lock_path"].endswith(".daemon.lock")
+
+
+def test_daemon_status_running_under_active_lock(tmp_path: Path):
+    with daemon_lock(tmp_path):
+        s = daemon_status(tmp_path)
+    assert s["status"] == "running"
+    assert s["pid"] == os.getpid()
+    assert isinstance(s["started_at"], float)
+
+
+def test_daemon_status_stale_when_pid_dead(tmp_path: Path):
+    lock_path(tmp_path).write_text(
+        json.dumps({"pid": 999999, "started_at": 1700000000.0}),
+        encoding="utf-8",
+    )
+    s = daemon_status(tmp_path)
+    assert s["status"] == "stale"
+    assert s["pid"] == 999999
+    assert s["started_at"] == 1700000000.0
+    # daemon_status must NOT clear the lock — that's a write op.
+    assert lock_path(tmp_path).exists()
 
 
 # ---------- daemon loop ----------

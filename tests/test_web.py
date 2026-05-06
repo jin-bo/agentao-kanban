@@ -14,9 +14,12 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+import json
+
+from kanban.daemon import daemon_lock, lock_path
 from kanban.models import Card, CardPriority, CardStatus
 from kanban.store_markdown import MarkdownBoardStore
-from kanban.web import COLUMN_ORDER, create_app
+from kanban.web import COLUMN_ORDER, check_writes_host_safety, create_app
 
 
 @pytest.fixture
@@ -165,3 +168,140 @@ def test_static_assets_served(client: TestClient) -> None:
     assert "fetchJSON" in r.text
     r = client.get("/static/styles.css")
     assert r.status_code == 200
+
+
+# ---------- write surface (--enable-writes) ----------
+
+
+def test_writes_disabled_by_default(client: TestClient) -> None:
+    # Default app: POST is rejected, healthz advertises it, /api/board too.
+    healthz = client.get("/healthz").json()
+    assert healthz["writes_enabled"] is False
+    board = client.get("/api/board").json()
+    assert board["writes_enabled"] is False
+    r = client.post("/api/cards", json={"title": "nope", "goal": "g"})
+    assert r.status_code == 405
+
+
+def test_writes_enabled_creates_card(board: Path) -> None:
+    app = create_app(board, enable_writes=True)
+    client = TestClient(app)
+    healthz = client.get("/healthz").json()
+    assert healthz["writes_enabled"] is True
+
+    r = client.post(
+        "/api/cards",
+        json={
+            "title": "From web",
+            "goal": "do the thing",
+            "priority": "HIGH",
+            "acceptance_criteria": ["it works", "  ", "tests pass"],
+        },
+    )
+    assert r.status_code == 201, r.text
+    created = r.json()
+    assert created["title"] == "From web"
+    assert created["priority"] == "HIGH"
+    assert created["status"] == "inbox"
+    assert created["acceptance_criteria"] == ["it works", "tests pass"]
+
+    # Card landed on disk and is visible through the read API.
+    listed = client.get("/api/board").json()
+    inbox = next(c for c in listed["columns"] if c["status"] == "inbox")
+    assert any(card["id"] == created["id"] for card in inbox["cards"])
+
+
+def test_writes_reject_blank_title(board: Path) -> None:
+    client = TestClient(create_app(board, enable_writes=True))
+    r = client.post("/api/cards", json={"title": "   "})
+    assert r.status_code == 400
+    assert "blank" in r.json()["detail"].lower()
+
+
+def test_writes_reject_bad_priority(board: Path) -> None:
+    client = TestClient(create_app(board, enable_writes=True))
+    r = client.post(
+        "/api/cards",
+        json={"title": "ok", "priority": "URGENT"},
+    )
+    assert r.status_code == 400
+    assert "priority" in r.json()["detail"].lower()
+
+
+def test_writes_reject_unknown_dependency(board: Path) -> None:
+    client = TestClient(create_app(board, enable_writes=True))
+    r = client.post(
+        "/api/cards",
+        json={"title": "ok", "depends_on": ["00000000-not-real"]},
+    )
+    assert r.status_code == 400
+    assert "depends_on" in r.json()["detail"]
+
+
+def test_writes_missing_title_returns_422(board: Path) -> None:
+    # Pydantic-level validation (missing field) stays at 422 — we only
+    # downgrade to 400 for semantic errors that pass the schema.
+    client = TestClient(create_app(board, enable_writes=True))
+    r = client.post("/api/cards", json={"goal": "no title"})
+    assert r.status_code == 422
+
+
+def test_check_writes_host_safety_loopback_ok() -> None:
+    # All loopback variants pass without --allow-remote-writes.
+    for host in ("127.0.0.1", "localhost", "::1", ""):
+        check_writes_host_safety(host, allow_remote_writes=False)
+
+
+def test_check_writes_host_safety_blocks_non_loopback() -> None:
+    with pytest.raises(SystemExit) as exc:
+        check_writes_host_safety("0.0.0.0", allow_remote_writes=False)
+    assert "loopback" in str(exc.value).lower()
+
+
+def test_check_writes_host_safety_override_allows() -> None:
+    # Operator explicitly accepts the risk (e.g. a reverse proxy in front).
+    check_writes_host_safety("0.0.0.0", allow_remote_writes=True)
+    check_writes_host_safety("10.0.0.5", allow_remote_writes=True)
+
+
+# ---------- daemon status surface ----------
+
+
+def test_board_includes_daemon_field_stopped(client: TestClient) -> None:
+    data = client.get("/api/board").json()
+    assert "daemon" in data
+    assert data["daemon"]["status"] == "stopped"
+    assert data["daemon"]["pid"] is None
+    assert data["daemon"]["lock_path"].endswith(".daemon.lock")
+
+
+def test_daemon_endpoint_stopped(client: TestClient) -> None:
+    data = client.get("/api/daemon").json()
+    assert data["status"] == "stopped"
+    assert data["pid"] is None
+    assert data["started_at"] is None
+
+
+def test_daemon_endpoint_running(board: Path) -> None:
+    app = create_app(board)
+    client = TestClient(app)
+    with daemon_lock(board):
+        data = client.get("/api/daemon").json()
+    assert data["status"] == "running"
+    assert data["pid"] is not None
+    assert isinstance(data["started_at"], float)
+
+
+def test_daemon_endpoint_stale(board: Path) -> None:
+    lock_path(board).write_text(
+        json.dumps({"pid": 999999, "started_at": 1700000000.0}),
+        encoding="utf-8",
+    )
+    app = create_app(board)
+    client = TestClient(app)
+    data = client.get("/api/daemon").json()
+    assert data["status"] == "stale"
+    assert data["pid"] == 999999
+    assert data["started_at"] == 1700000000.0
+    # Read-only contract: probing the endpoint must not clear the lock.
+    assert lock_path(board).exists()

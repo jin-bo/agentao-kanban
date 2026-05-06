@@ -73,7 +73,17 @@ def detach_worktree_on_terminal(
     card = store.get_card(card_id)
     if card.worktree_branch is None:
         return
-    if worktree_mgr.detach(card_id):
+    result = worktree_mgr.detach(card_id)
+    if getattr(result, "artifacts_path", None) is not None:
+        store.append_runtime_event(
+            card_id,
+            event_type="worktree.artifacts_saved",
+            message=(
+                f"Worktree artifacts saved to {result.artifacts_path}"
+            ),
+            worktree_branch=card.worktree_branch,
+        )
+    if result:
         store.append_runtime_event(
             card_id,
             event_type="worktree.detached",
@@ -851,7 +861,18 @@ class KanbanOrchestrator:
         if self.worktree_mgr is not None:
             card_obj = self.store.get_card(failed_claim.card_id)
             if card_obj.worktree_branch is not None:
-                if self.worktree_mgr.detach(failed_claim.card_id):
+                detach_result = self.worktree_mgr.detach(failed_claim.card_id)
+                if getattr(detach_result, "artifacts_path", None) is not None:
+                    self.store.append_runtime_event(
+                        failed_claim.card_id,
+                        event_type="worktree.artifacts_saved",
+                        message=(
+                            f"Worktree artifacts saved to "
+                            f"{detach_result.artifacts_path}"
+                        ),
+                        worktree_branch=card_obj.worktree_branch,
+                    )
+                if detach_result:
                     self.store.append_runtime_event(
                         failed_claim.card_id,
                         event_type="worktree.detached",

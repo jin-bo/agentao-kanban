@@ -6,8 +6,39 @@
 
 ## [Unreleased]
 
+### Added
+- **Web UI 可写入口**(opt-in):`kanban web --enable-writes` 暴露
+  `POST /api/cards`,在浏览器里以模态卡片形式创建 INBOX 卡。默认关闭以保留只读
+  契约;`--allow-remote-writes` 是 non-loopback 绑定下的显式逃生口,无此 flag
+  时拒绝在 `0.0.0.0` 上同时启用写入。卡片详情面板也改为模态弹窗(原右侧 panel
+  下线,grid 收成 5 列),Add Card 与 Card Detail 共享 `.card-modal` 视觉语言。
+- **Daemon 状态面板**:`kanban/daemon.py` 新增 `daemon_status()`(只读,不清理
+  stale lock);Web UI 在 Runtime 面板顶部显示三态(running / stopped / stale
+  lock)+ 颜色点 + `pid X, started Ym ago`。新增 `GET /api/daemon` 端点。
+- **Worktree artifact 抢救**:`WorktreeManager.detach()` 在 `git worktree remove`
+  之前快照 worktree 内被 gitignore 的文件到 `workspace/raw/<card-id>/artifacts-<ts>/`,
+  避免 worker 写到 gitignored 路径(常见的 `workspace/reports/...`)的交付物随
+  worktree 目录一起被删除。修复了一个真实的产物丢失场景。
+  - 默认每张卡保留 5 份快照,体积上限 500 MiB,可通过环境变量
+    `KANBAN_ARTIFACTS_MAX_BYTES` 调整。
+  - **按文件计帐 + denylist**:`node_modules/`、`__pycache__/`、`.venv/`、
+    `dist/`、`build/`、`target/`、`*.pyc` 等构建/缓存路径在计帐前先剔除;
+    剩余文件按 git 枚举顺序填入,直到耗尽预算——不再因为单个超大文件
+    全盘放弃。skip 项数和字节数会出现在 warning log 里。
+  - 新事件类型 `worktree.artifacts_saved` 在 events.log / Web UI 里可见。
+
 ### Changed
 - 开始 `0.1.6-dev` 开发周期。
+- `WorktreeManager.detach()` 返回值从 `bool` 改为 `DetachResult`(`removed` +
+  `artifacts_path` + `artifacts_skipped_reason`),保留 `__bool__` 以兼容
+  `if mgr.detach(...)` 这类用法。直接 `is True/False` 的调用点需要改为
+  `.removed`;库内已全量更新。
+- 依赖升级:`agentao>=0.3.0` → `agentao>=0.4.2`。0.4.0 起 agentao 拆分为 core
+  + 多个可选 extras,kanban 仅使用 core 内的 `agentao.acp_client`、
+  `agentao.embedding`、`Agentao` 构造器,无需声明 extras;0.4.2 把
+  `agentao.harness` 重命名为 `agentao.host`(旧名称作为带 `DeprecationWarning`
+  的别名继续可用),kanban 运行时与测试均未直接引用 `agentao.harness`,故无
+  导入路径修改。522 个测试在 agentao 0.4.2 下全部通过。
 
 ## [0.1.5] — 2026-05-01
 

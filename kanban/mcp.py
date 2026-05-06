@@ -235,6 +235,7 @@ def _detach_worktree_after_terminal(
     wt_mgr = WorktreeManager(
         project_root=project_root,
         worktrees_root=project_root / "workspace" / "worktrees",
+        artifacts_root=project_root / "workspace" / "raw",
     )
     detach_worktree_on_terminal(store, wt_mgr, card_id, card.status)
 
@@ -277,6 +278,7 @@ def _resolve_worktree_mgr(ctx: ServerContext):
     return WorktreeManager(
         project_root=project_root,
         worktrees_root=project_root / "workspace" / "worktrees",
+        artifacts_root=project_root / "workspace" / "raw",
     )
 
 

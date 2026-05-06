@@ -1,9 +1,16 @@
-"""Read-only HTTP board for the kanban project.
+"""HTTP board for the kanban project.
 
-The goal is a local/intranet observability window into a live board dir —
-no writes, no auth, no SSE. Run with::
+The goal is a local/intranet observability window into a live board dir.
+By default it is read-only — no writes, no auth, no SSE. Run with::
 
     uv run kanban web --board workspace/board
+
+A narrow write opt-in (`--enable-writes`) exposes ``POST /api/cards`` so
+operators can drop new INBOX cards from the browser. Card creation is
+the only mutation served here intentionally: it doesn't race the daemon
+(new cards have fresh UUIDs and the daemon doesn't write them before
+claiming) and it doesn't participate in ``.daemon.lock``. State changes
+(``move``/``block``/``unblock``) stay on the CLI/MCP write paths.
 
 Design notes:
 
@@ -21,15 +28,18 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from ipaddress import ip_address
 from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
 
+from .daemon import daemon_status
 from .mcp import card_to_dict, event_to_dict
-from .models import AgentRole, CardStatus
+from .models import AgentRole, Card, CardPriority, CardStatus
 from .store_markdown import MarkdownBoardStore
 
 
@@ -144,25 +154,47 @@ async def _lifespan(app: FastAPI):
     yield
 
 
+class CardCreateRequest(BaseModel):
+    """POST /api/cards body. Mirrors ``kanban card add`` arguments.
+
+    Pydantic validates the shape; semantic coercion (priority enum,
+    acceptance trimming) happens in the handler so we can return clean
+    400s with field-specific messages instead of pydantic's default
+    422 envelope for the enum case.
+    """
+
+    title: str = Field(min_length=1, max_length=500)
+    goal: str = Field(default="", max_length=4000)
+    priority: str = Field(default="MEDIUM")
+    acceptance_criteria: list[str] = Field(default_factory=list)
+    depends_on: list[str] = Field(default_factory=list)
+
+
 def create_app(
     board_dir: str | Path,
     *,
     poll_interval_ms: int = 5000,
+    enable_writes: bool = False,
 ) -> FastAPI:
-    """Build the read-only FastAPI app bound to a board directory.
+    """Build the FastAPI app bound to a board directory.
 
     ``board_dir`` is not required to exist yet. ``MarkdownBoardStore``
     no longer materializes ``cards/`` at construction time, so handlers
     can serve a missing board as an empty one without performing any
-    filesystem writes — preserving the read-only contract.
+    filesystem writes — preserving the read-only contract for read paths.
+
+    ``enable_writes`` is the single switch for the write surface
+    (currently just ``POST /api/cards``). Default off keeps the original
+    contract; turning it on is a deliberate operator choice.
     """
     board_path = Path(board_dir).resolve()
     app = FastAPI(
-        title="Kanban read-only board",
+        title="Kanban board",
         lifespan=_lifespan,
     )
     app.state.board_dir = board_path
     app.state.poll_interval_ms = max(int(poll_interval_ms), 250)
+    app.state.enable_writes = bool(enable_writes)
 
     assets_dir = _assets_dir()
 
@@ -175,6 +207,7 @@ def create_app(
             "status": "ok",
             "board_dir": str(board_path),
             "poll_interval_ms": app.state.poll_interval_ms,
+            "writes_enabled": app.state.enable_writes,
         }
 
     @app.get("/api/board")
@@ -221,10 +254,70 @@ def create_app(
             "generated_at": _iso_now(),
             "board_dir": str(board_path),
             "poll_interval_ms": app.state.poll_interval_ms,
+            "writes_enabled": app.state.enable_writes,
             "columns": columns,
             "recent_events": recent,
             "runtime": runtime,
+            "daemon": daemon_status(board_path),
         }
+
+    @app.get("/api/daemon")
+    def api_daemon() -> dict[str, Any]:
+        return daemon_status(board_path)
+
+    @app.post("/api/cards", status_code=201)
+    def api_create_card(payload: CardCreateRequest) -> dict[str, Any]:
+        if not app.state.enable_writes:
+            # 405 (not 403) so the surface advertises "writes are off",
+            # which the frontend uses to hide the form anyway.
+            raise HTTPException(
+                status_code=405,
+                detail=(
+                    "writes are disabled; start the server with "
+                    "--enable-writes to allow card creation"
+                ),
+            )
+        title = payload.title.strip()
+        if not title:
+            raise HTTPException(status_code=400, detail="title must not be blank")
+        try:
+            priority = CardPriority[payload.priority.upper()]
+        except KeyError:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"priority must be one of "
+                    f"{[p.name for p in CardPriority]}"
+                ),
+            )
+        acceptance = [c.strip() for c in payload.acceptance_criteria if c.strip()]
+        depends = [d.strip() for d in payload.depends_on if d.strip()]
+        # Card creation is intentionally not gated on .daemon.lock: the new
+        # card has a fresh UUID (no card-file overwrite race) and events.log
+        # appends are POSIX-atomic for short lines (see
+        # store_markdown._write_event_line). The daemon picks the card up on
+        # its next tick the same way it picks up CLI-created cards.
+        store = _store()
+        # Validate depends_on early so callers see a 400 instead of getting
+        # a half-created card with a stale dependency reference.
+        for dep in depends:
+            try:
+                store.get_card(dep)
+            except KeyError:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"depends_on references unknown card {dep!r}",
+                )
+        card = store.add_card(
+            Card(
+                title=title,
+                goal=payload.goal.strip(),
+                priority=priority,
+                acceptance_criteria=acceptance,
+                depends_on=depends,
+            )
+        )
+        return card_to_dict(card)
 
     @app.get("/api/cards/{card_id}")
     def api_card(card_id: str) -> dict[str, Any]:
@@ -303,16 +396,61 @@ def _priority_rank(name: str | None) -> int:
     return _PRIORITY_RANK.get(name.upper(), 0)
 
 
+def _is_loopback_host(host: str) -> bool:
+    """True if the bind host is unambiguously a loopback address.
+
+    ``"localhost"`` is special-cased rather than resolved: we don't want
+    to depend on /etc/hosts here, and the only sane configuration that
+    binds to "localhost" is loopback in practice. Numeric addresses are
+    parsed via :class:`ipaddress.ip_address` so IPv4-mapped-in-IPv6 like
+    ``"::1"`` is recognized.
+    """
+    if host in ("localhost", ""):
+        return True
+    try:
+        return ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def check_writes_host_safety(host: str, *, allow_remote_writes: bool) -> None:
+    """Refuse a non-loopback bind under ``--enable-writes`` without an explicit override.
+
+    Raised as :class:`SystemExit` with a clear message so the CLI fails
+    early rather than silently exposing an unauthenticated write
+    endpoint to the network.
+    """
+    if allow_remote_writes:
+        return
+    if _is_loopback_host(host):
+        return
+    raise SystemExit(
+        f"refusing to enable writes on non-loopback host {host!r}: "
+        f"the write endpoint has no authentication. "
+        f"Use 127.0.0.1 (default) or pass --allow-remote-writes if you "
+        f"have a reverse proxy or firewall in front of the server."
+    )
+
+
 def main(
     board_dir: str | Path,
     *,
     host: str = "127.0.0.1",
     port: int = 8000,
     poll_interval_ms: int = 5000,
+    enable_writes: bool = False,
+    allow_remote_writes: bool = False,
 ) -> int:
-    """Run the read-only web server via uvicorn. Returns the process rc."""
+    """Run the web server via uvicorn. Returns the process rc."""
     import uvicorn
 
-    app = create_app(board_dir, poll_interval_ms=poll_interval_ms)
+    if enable_writes:
+        check_writes_host_safety(host, allow_remote_writes=allow_remote_writes)
+
+    app = create_app(
+        board_dir,
+        poll_interval_ms=poll_interval_ms,
+        enable_writes=enable_writes,
+    )
     uvicorn.run(app, host=host, port=port, log_level="info")
     return 0
