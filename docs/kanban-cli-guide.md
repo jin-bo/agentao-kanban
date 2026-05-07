@@ -442,11 +442,95 @@ uv run kanban traces <card_id>
 
 通常先看 `events`,只有在需要还原 agent 原始响应时再看 `traces`。
 
-## 9. 命令速查
+## 9. Web 看板运维(`kanban web`)
+
+`kanban web` 是与 daemon / CLI / MCP 并行运行的 HTTP 观察面,**默认只读**;
+v0.1.6 起新增可选写入入口。它**不抢 `.daemon.lock`**,因此你可以在 daemon
+正常跑时随时启动一个 web 实例只读监控板面。
+
+### 9.1 三种启动模式
+
+```bash
+# 1) 只读(默认)。本地访问,不暴露任何写入 API。
+uv run kanban --board workspace/board web
+
+# 2) 可写入(loopback)。新增 POST /api/cards,允许浏览器创建 INBOX 卡。
+uv run kanban --board workspace/board web --enable-writes
+
+# 3) 可写入 + 暴露非 loopback。需要再加一个显式逃生口。
+uv run kanban --board workspace/board web \
+    --host 0.0.0.0 --enable-writes --allow-remote-writes
+```
+
+`--enable-writes` 是单一开关,只暴露 `POST /api/cards`(等价 `kanban card add`)
+一项写入面,其余 surface 保持只读。绑定到非 loopback 主机(`0.0.0.0`、
+`192.168.x.x` 等)且未带 `--allow-remote-writes` 时,server 启动直接拒绝,
+避免误开放写入面到内网。
+
+### 9.2 写入面与 `.daemon.lock` 的关系
+
+- 读类端点(`/api/board`、`/api/cards/{id}`、`/api/events`、`/api/daemon`)
+  **不受** `.daemon.lock` 影响,daemon 跑不跑都能看
+- `POST /api/cards` 在 daemon 持有 `.daemon.lock` 时会拒写,文案与 CLI / MCP
+  路径一致;daemon 停了或锁是 stale 时才允许新增卡
+- web 进程**不会**清理 stale lock — 那只在 `kanban daemon` 启动时由 daemon
+  自己接管(检查 pid 是否还活着,不活就清掉再起)
+
+实际工作流:daemon 跑着的时候,web 上的"加卡"按钮会被禁用并打提示,这
+不是 bug,是设计上的写入串行化保护。需要批量 INBOX 时,要么停 daemon、
+要么走 `kanban card add --force`(应急)。
+
+### 9.3 Daemon 状态面板
+
+Web UI 的 Runtime 面板顶部展示 daemon 三态,数据来自 `GET /api/daemon`:
+
+| 状态 | 颜色点 | 含义 |
+|---|---|---|
+| `running` | 绿 | `.daemon.lock` 存在且 pid 活着,daemon 正在工作 |
+| `stopped` | 灰 | `.daemon.lock` 不存在 |
+| `stale` | 黄 | `.daemon.lock` 存在但 pid 不活了,需要清理才能再启动 |
+
+`stale` 状态只是诊断信号,**web 进程不会自动清理**。处理方式:
+
+```bash
+uv run kanban daemon --once       # 启动时会检测并清掉 stale lock
+# 或者直接删掉锁文件
+rm workspace/board/.daemon.lock
+```
+
+`pid X, started Ym ago` 来自 lock 文件里的元数据,daemon 异常退出时该信息
+仍可作为事后取证的入口。
+
+### 9.4 Worktree artifact 在 web 上的可见性
+
+worker 写到 gitignored 路径(常见 `workspace/reports/...`)的产出物在卡进入
+DONE/BLOCKED 时会被 `WorktreeManager.detach()` 抢救到
+`workspace/raw/<card-id>/artifacts-<ts>/`,触发一条
+`worktree.artifacts_saved` 事件:
+
+- Web UI 的事件流里能直接看到该事件,带上快照路径
+- `events.log` 里也有同样一条结构化记录
+- 默认每张卡保留最近 5 份快照、500 MiB 上限,环境变量
+  `KANBAN_ARTIFACTS_MAX_BYTES` 可调
+
+如果你看到 worker 报告写了文件但卡完成后找不到,先去
+`workspace/raw/<card-id>/artifacts-*/` 翻最近一份,通常就在里面。
+
+### 9.5 部署与安全注意
+
+- 首版**不附带鉴权**(没有 token、没有 basic auth);敏感环境一律自行加
+  反代或防火墙
+- 没有缓存层、没有 SSE/WebSocket,前端按 `--poll-interval-ms`(默认 5000ms)
+  轮询;板很大或网络紧张时可调到 10000+ms
+- 所有 handler 每次请求新建一份 `MarkdownBoardStore`,daemon 或 CLI 的
+  out-of-band 写入在下一次轮询就可见
+- `--host 0.0.0.0` 是显式选择,日常开发只在 `127.0.0.1` 跑就够了
+
+## 10. 命令速查
 
 下面这张速查表按“我现在想做什么”组织。
 
-### 9.1 建卡和维护内容
+### 10.1 建卡和维护内容
 
 | 目的 | 命令 |
 |---|---|
@@ -458,7 +542,7 @@ uv run kanban traces <card_id>
 | 加 acceptance | `uv run kanban card acceptance add <card_id> --item "..."` |
 | 看 acceptance | `uv run kanban card acceptance list <card_id>` |
 
-### 9.2 调整状态
+### 10.2 调整状态
 
 | 目的 | 命令 |
 |---|---|
@@ -467,7 +551,7 @@ uv run kanban traces <card_id>
 | 解除阻塞 | `uv run kanban unblock <card_id> --to ready` |
 | 从失败现场恢复 | `uv run kanban requeue <card_id> --to ready --note "..."` |
 
-### 9.3 执行和观察
+### 10.3 执行和观察
 
 | 目的 | 命令 |
 |---|---|
@@ -479,8 +563,10 @@ uv run kanban traces <card_id>
 | 看事件 | `uv run kanban events <card_id>` |
 | 看原始 transcript | `uv run kanban traces <card_id>` |
 | 体检 | `uv run kanban doctor` |
+| 浏览器看板(只读) | `uv run kanban web` |
+| 浏览器看板(可写入) | `uv run kanban web --enable-writes` |
 
-### 9.4 并发运行时
+### 10.4 并发运行时
 
 | 目的 | 命令 |
 |---|---|
@@ -496,7 +582,7 @@ uv run kanban traces <card_id>
 `--detach` 必须在任何线程创建**之前**完成 fork(`all` 模式下父进程会双 fork 后再
 建 scheduler/worker 线程),否则子进程里拿不到正确的线程状态。
 
-## 10. 给新用户的最低可行命令集
+## 11. 给新用户的最低可行命令集
 
 如果团队里有人只需要先上手最核心能力,先学这 10 条就够了:
 
@@ -513,7 +599,7 @@ uv run kanban block <card_id> "reason"
 uv run kanban requeue <card_id> --to ready
 ```
 
-## 11. 文档放置建议
+## 12. 文档放置建议
 
 这个主题更适合作为独立文档,而不是继续扩充 README。
 
