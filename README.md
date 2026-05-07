@@ -1,6 +1,6 @@
 # kanban
 
-**当前版本:v0.1.6-dev**。完整变更见 [CHANGELOG.md](CHANGELOG.md)。
+**当前版本:v0.1.6**。完整变更见 [CHANGELOG.md](CHANGELOG.md)。
 
 一个最小可跑的多 Agent 看板,已经实现:
 
@@ -196,6 +196,26 @@ uv run kanban worktree prune --retention-days 14
 
 完整设计见 [`docs/worktree-isolation-design.md`](docs/worktree-isolation-design.md)。
 
+### Worktree artifact 抢救(v0.1.6)
+
+worker 经常会把交付物(报告、构建产物、临时文件)写到被 gitignore 的路径
+(如 `workspace/reports/...`)。`git worktree remove` 会把这些没提交也没追踪的
+文件一并删掉,导致卡到 DONE 后产物丢失。`WorktreeManager.detach()` 在执行
+`git worktree remove` 前会先把 worktree 内被 gitignore 的文件快照到:
+
+```
+workspace/raw/<card-id>/artifacts-<ts>/
+```
+
+并在 `events.log` 里记一条 `worktree.artifacts_saved`(Web UI 也能看到)。
+
+- 默认每张卡保留最近 5 份快照,体积上限 500 MiB,环境变量
+  `KANBAN_ARTIFACTS_MAX_BYTES` 可调。
+- 计帐前先剔除 `node_modules/`、`__pycache__/`、`.venv/`、`dist/`、`build/`、
+  `target/`、`*.pyc` 等构建/缓存路径(denylist),按文件计帐:剩余文件
+  按 git 枚举顺序填入预算,直到耗尽,**不再因为单个超大文件全盘放弃**;
+  skip 项数和字节数会出现在 warning log 里。
+
 ## 作为 MCP Server 暴露(`kanban-mcp`)
 
 把看板当成 Claude Code / Codex / 任意 MCP client 的"调度中心":
@@ -240,32 +260,50 @@ Resources(供 client 通过资源接口缓存读取):
 写类 tool 在 daemon 持有 `.daemon.lock` 时会拒绝,文案与 CLI `--force`
 路径一致;读类 tool / resource 不受守卫影响。
 
-## 只读 Web 看板(`kanban web`)
+## Web 看板(`kanban web`)
 
-本地/内网实时观察板面的只读 HTTP 服务,不做写入、不抢 `.daemon.lock`,
-与 CLI / MCP / daemon 并行运行。基于 FastAPI + uvicorn,前端原生 JS
-按固定间隔轮询 `/api/board`。
+本地/内网实时观察板面的 HTTP 服务,不抢 `.daemon.lock`,与 CLI / MCP /
+daemon 并行运行。基于 FastAPI + uvicorn,前端原生 JS 按固定间隔轮询
+`/api/board`。**默认只读**;v0.1.6 起新增可选写入入口,需要显式 opt-in。
 
 ```bash
-uv run kanban --board workspace/board web            # 默认 127.0.0.1:8000
+uv run kanban --board workspace/board web            # 默认 127.0.0.1:8000,只读
 uv run kanban --board workspace/board web \
     --host 0.0.0.0 --port 8080 --poll-interval-ms 3000
+
+# 可写入模式(loopback 默认安全)
+uv run kanban --board workspace/board web --enable-writes
+
+# non-loopback bind 同时启用写入需要再加 --allow-remote-writes 显式确认
+uv run kanban --board workspace/board web \
+    --host 0.0.0.0 --enable-writes --allow-remote-writes
 ```
 
 | 端点 | 说明 |
 |---|---|
-| `GET /` | 单页看板(7 列 + 事件尾 + runtime 面板) |
-| `GET /healthz` | `{status, board_dir, poll_interval_ms}` |
-| `GET /api/board` | 列聚合 + 最近 20 条事件 + claims/workers |
+| `GET /` | 单页看板(5 列 grid + 卡片详情模态 + 事件尾 + runtime 面板) |
+| `GET /healthz` | `{status, board_dir, poll_interval_ms, writes_enabled}` |
+| `GET /api/board` | 列聚合 + 最近 20 条事件 + claims/workers + `writes_enabled` |
 | `GET /api/cards/{id}` | 单卡完整 JSON + 最近 20 条本卡事件;未知卡 404 |
 | `GET /api/events?limit&card_id&role&execution_only` | 事件尾过滤 |
+| `GET /api/daemon` | daemon 三态(`running` / `stopped` / `stale`)+ pid + 启动时间 |
+| `POST /api/cards` | **`--enable-writes` 时启用**,创建 INBOX 卡;关闭时返回 403 |
 | `GET /static/*` | 前端资源(`app.js` / `styles.css` / `index.html`) |
 
 所有 handler 每次请求都新建一份 `MarkdownBoardStore`,因此 daemon 或
 CLI 的 out-of-band 写入在下一次轮询就可见。`runtime/` 目录缺失时
-(板从未被 daemon 接管过),`claims` / `workers` 返回空列表。首版
-不附带鉴权、缓存、SSE/WebSocket,`--host 0.0.0.0` 是显式选择;敏感
-环境请自行加反代或防火墙。
+(板从未被 daemon 接管过),`claims` / `workers` 返回空列表。
+
+**写入安全模型**:`--enable-writes` 仅暴露 `POST /api/cards`,其余 surface
+保持只读;daemon 持锁时该端点同样会拒写,与 CLI / MCP 一致。绑定到非
+loopback 主机(如 `0.0.0.0`)且未带 `--allow-remote-writes` 时,server
+启动直接拒绝以避免误开放写入面。首版不附带鉴权、缓存、SSE/WebSocket,
+敏感环境请自行加反代或防火墙。
+
+**Daemon 状态面板**:Web UI 的 Runtime 面板顶部展示 daemon 三态(running
+/ stopped / stale lock)+ 颜色点 + `pid X, started Ym ago`,数据来自
+`GET /api/daemon`;此端点是只读的,不会清理 stale lock(那是 `kanban
+daemon` 启动时的职责)。
 
 ## CLI Guide
 

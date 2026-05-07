@@ -4,7 +4,7 @@
 版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。1.0 前的 minor 版本视为
 可能包含破坏性变更的功能版本。
 
-## [Unreleased]
+## [0.1.6] — 2026-05-06
 
 ### Added
 - **Web UI 可写入口**(opt-in):`kanban web --enable-writes` 暴露
@@ -28,7 +28,6 @@
   - 新事件类型 `worktree.artifacts_saved` 在 events.log / Web UI 里可见。
 
 ### Changed
-- 开始 `0.1.6-dev` 开发周期。
 - `WorktreeManager.detach()` 返回值从 `bool` 改为 `DetachResult`(`removed` +
   `artifacts_path` + `artifacts_skipped_reason`),保留 `__bool__` 以兼容
   `if mgr.detach(...)` 这类用法。直接 `is True/False` 的调用点需要改为
