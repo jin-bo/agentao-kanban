@@ -4,6 +4,11 @@
 版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。1.0 前的 minor 版本视为
 可能包含破坏性变更的功能版本。
 
+## [Unreleased]
+
+### Changed
+- 开始 `0.1.7-dev` 开发周期。
+
 ## [0.1.6] — 2026-05-06
 
 ### Added
