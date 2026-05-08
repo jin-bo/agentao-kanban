@@ -127,5 +127,6 @@ profile,或让 router 选中,才会真正调 ACP 后端。此时额外要求:
 
 ```bash
 uv run pytest -q                                # 单元+集成测试
-uv run kanban doctor                            # 板健康体检
+uv run kanban doctor                            # 板 + 环境体检 (含 .kanban/、.daemon.lock 等)
+uv run kanban doctor --fix                      # 一键修复可恢复的环境问题
 ```

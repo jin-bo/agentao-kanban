@@ -188,7 +188,7 @@ class TestEventsTail:
 
     def test_limit_caps_results(self, ctx: ServerContext) -> None:
         c = _add(ctx)
-        for status in ("ready", "doing", "review", "verify", "done"):
+        for status in ("ready", "doing", "review", "done"):
             tool_card_move(ctx, card_id=c["id"], status=status)
         few = tool_events_tail(ctx, limit=2)
         assert len(few) == 2

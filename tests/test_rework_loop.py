@@ -1,16 +1,16 @@
-"""Integration tests for the reviewer/verifier rework loop.
+"""Integration tests for the reviewer rework loop.
 
 Contract under test:
 
-- Reviewer/verifier may attach a ``revision_request`` to an ``ok=False``
+- Reviewer may attach a ``revision_request`` to an ``ok=False``
   result. The orchestrator routes this to ``_apply_rework`` instead of
   BLOCKING the card.
 - Each accepted rework appends to ``card.revision_requests`` (cumulative),
-  bumps ``card.rework_iteration``, moves the card REVIEW/VERIFY → READY,
+  bumps ``card.rework_iteration``, moves the card REVIEW → READY,
   and keeps the worktree attached.
 - After ``RetryPolicy.rework`` accepted reworks, the next rework ask
   BLOCKs the card (worktree detached, normal terminal path).
-- Reviewer/verifier results without a ``revision_request`` retain the
+- Reviewer results without a ``revision_request`` retain the
   prior v0.1.3 behavior: card goes straight to BLOCKED.
 """
 
@@ -53,7 +53,7 @@ def _init_repo(path: Path) -> Path:
 
 
 class ScriptedRework(MockAgentaoExecutor):
-    """Inject a rework decision queue for reviewer/verifier.
+    """Inject a rework decision queue for reviewer.
 
     Each queued entry for a role is consumed on the next call:
 
@@ -68,7 +68,6 @@ class ScriptedRework(MockAgentaoExecutor):
         super().__init__()
         self.queue: dict[AgentRole, list] = {
             AgentRole.REVIEWER: [],
-            AgentRole.VERIFIER: [],
         }
         self.worker_calls = 0
 
@@ -76,7 +75,7 @@ class ScriptedRework(MockAgentaoExecutor):
         if role == AgentRole.WORKER:
             self.worker_calls += 1
             return super().run(role, card)
-        if role in (AgentRole.REVIEWER, AgentRole.VERIFIER) and self.queue[role]:
+        if role == AgentRole.REVIEWER and self.queue[role]:
             action = self.queue[role].pop(0)
             if isinstance(action, tuple) and action[0] == "rework":
                 _, summary, hints, failing = action
@@ -90,15 +89,10 @@ class ScriptedRework(MockAgentaoExecutor):
                 )
                 # Fallback next_status keeps the card safe if rework is ever
                 # ignored by a future orchestrator; _apply_rework rewrites it.
-                fallback = (
-                    CardStatus.REVIEW
-                    if role == AgentRole.REVIEWER
-                    else CardStatus.VERIFY
-                )
                 return AgentResult(
                     role=role,
                     summary=f"{role.value} requested rework: {summary}",
-                    next_status=fallback,
+                    next_status=CardStatus.REVIEW,
                     revision_request=revision,
                 )
             if isinstance(action, tuple) and action[0] == "block":
@@ -212,28 +206,28 @@ def test_reviewer_rework_accepted_three_times_then_blocks(tmp_path: Path):
     assert branch_exists.returncode == 0
 
 
-# ---------- verifier rework: same path ----------
+# ---------- reviewer rework ----------
 
 
-def test_verifier_rework_cycles_back_through_worker(tmp_path: Path):
+def test_reviewer_rework_cycles_back_through_worker(tmp_path: Path):
     repo = _init_repo(tmp_path / "repo")
     store, orch, wt_mgr, executor = _make_stack(repo)
 
-    card = orch.create_card("Verifier rework", "g")
-    executor.queue[AgentRole.VERIFIER].append(
+    card = orch.create_card("Reviewer rework", "g")
+    executor.queue[AgentRole.REVIEWER].append(
         ("rework", "missing file", [], ["create hello.py"])
     )
 
-    # planner, worker, reviewer(approves) → card reaches VERIFY
-    _tick_through(orch, 3)
-    assert store.get_card(card.id).status == CardStatus.VERIFY
+    # planner, worker → card reaches REVIEW
+    _tick_through(orch, 2)
+    assert store.get_card(card.id).status == CardStatus.REVIEW
 
-    # Verifier asks rework → card rewinds to READY
+    # Reviewer asks rework → card rewinds to READY
     orch.tick()
     got = store.get_card(card.id)
     assert got.status == CardStatus.READY
     assert got.rework_iteration == 1
-    assert got.revision_requests[0].from_role == AgentRole.VERIFIER
+    assert got.revision_requests[0].from_role == AgentRole.REVIEWER
     # Worker should increment its call count on the next tick.
     prior_calls = executor.worker_calls
     orch.tick()  # worker re-runs
@@ -309,7 +303,7 @@ def test_worker_prompt_includes_revision_requests(tmp_path: Path):
         ),
         RevisionRequest(
             at=datetime.now(timezone.utc),
-            from_role=AgentRole.VERIFIER,
+            from_role=AgentRole.REVIEWER,
             iteration=2,
             summary="test must actually run",
             hints=["uv run pytest tests/test_foo.py"],
@@ -321,7 +315,7 @@ def test_worker_prompt_includes_revision_requests(tmp_path: Path):
     assert "iteration 1 by REVIEWER" in prompt
     assert "add a test" in prompt
     assert "write tests/test_foo.py" in prompt
-    assert "iteration 2 by VERIFIER" in prompt
+    assert "iteration 2 by REVIEWER" in prompt
     assert "test must actually run" in prompt
 
 

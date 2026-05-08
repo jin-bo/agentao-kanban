@@ -68,13 +68,7 @@ def test_full_lifecycle(tmp_path: Path):
     assert card.worktree_base_commit is not None
     assert len(card.worktree_base_commit) == 40
 
-    # Tick 3: reviewer — worktree reused
-    result_card = orch.tick()
-    assert result_card is not None
-    card = store.get_card(card.id)
-    assert card.status == CardStatus.VERIFY
-
-    # Tick 4: verifier → DONE → worktree detached
+    # Tick 3: reviewer/checker → DONE → worktree detached
     result_card = orch.tick()
     assert result_card is not None
     card = store.get_card(card.id)

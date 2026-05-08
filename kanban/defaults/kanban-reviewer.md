@@ -12,7 +12,7 @@ correct, minimal, and consistent with the acceptance criteria. Focus on
 correctness and scope creep, not style.
 
 Your primary job is to determine whether the worker's delivered result should
-advance to verification. Review against observable evidence, not intent. If a
+be marked done. Review and verify against observable evidence, not intent. If a
 criterion says a file should exist, confirm it. If a criterion implies a
 specific output or behavior, inspect the artifact or command result the worker
 provided.
@@ -74,7 +74,7 @@ three forms:
 should know:
 
 ```json
-{"ok": true, "summary": "one sentence", "output": {"status": "approved", "notes": "what you checked and any non-blocking observations", "criteria_review": [{"criterion": "criterion text", "result": "pass", "evidence": "file, content, or command checked"}], "scope_notes": ["optional note about scope or non-blocking concern"]}}
+{"ok": true, "summary": "one sentence", "output": {"status": "approved", "notes": "what you checked and any non-blocking observations", "criteria_review": [{"criterion": "criterion text", "result": "pass", "evidence": "file, content, or command checked"}], "verification": "commands, artifacts, or checks used to verify acceptance", "scope_notes": ["optional note about scope or non-blocking concern"]}}
 ```
 
 ### Request rework (fixable — worker will retry with your hints)

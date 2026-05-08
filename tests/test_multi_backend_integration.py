@@ -91,11 +91,10 @@ def test_card_completes_end_to_end_with_rollout_routing(tmp_path: Path) -> None:
     reloaded = MarkdownBoardStore(tmp_path).get_card(card.id)
     assert reloaded.status == CardStatus.DONE
 
-    # ACP backend handled worker + reviewer; subagent handled planner + verifier.
+    # ACP backend handled worker + reviewer; subagent handled planner.
     assert AgentRole.WORKER in acp.acting_for
     assert AgentRole.REVIEWER in acp.acting_for
     assert AgentRole.PLANNER in subagent.acting_for
-    assert AgentRole.VERIFIER in subagent.acting_for
     assert AgentRole.WORKER not in subagent.acting_for
     assert AgentRole.REVIEWER not in subagent.acting_for
 
@@ -109,7 +108,6 @@ def test_card_completes_end_to_end_with_rollout_routing(tmp_path: Path) -> None:
     assert by_role[AgentRole.WORKER].session_id == "s-w"
     assert by_role[AgentRole.REVIEWER].agent_profile == "gemini-reviewer"
     assert by_role[AgentRole.REVIEWER].session_id == "s-r"
-    assert by_role[AgentRole.VERIFIER].agent_profile == "default-verifier"
     # Routing source is default for every role (no card override in this test).
     assert {e.routing_source for e in events if e.routing_source} == {"default"}
 
@@ -165,14 +163,14 @@ def test_workflow_fallback_on_acp_infra_failure_keeps_card_moving(tmp_path: Path
 
 def test_card_pinned_to_worker_profile_still_completes_all_stages(tmp_path: Path) -> None:
     """Regression: a card pinned to a role-specific profile like
-    ``gemini-worker`` must not block planning/review/verify stages.
+    ``gemini-worker`` must not block planning/review stages.
     The pin should only apply when the executor runs the matching role;
     other roles fall through to their defaults.
     """
     store = MarkdownBoardStore(tmp_path)
     acp = _ScriptedBackend(backend_type="acp")
     subagent = _ScriptedBackend(backend_type="subagent")
-    # Packaged defaults: planner/worker/reviewer/verifier all on subagent.
+    # Packaged defaults: planner/worker/reviewer all on subagent.
     # Pinning the card to gemini-worker (worker-only, acp) must not
     # cause the planner step to raise a role-mismatch error.
     executor = MultiBackendExecutor(
@@ -192,11 +190,10 @@ def test_card_pinned_to_worker_profile_still_completes_all_stages(tmp_path: Path
 
     events = store.list_execution_events(card_id=card.id)
     by_role = {e.role: e for e in events if e.role is not None}
-    # Planner/reviewer/verifier ran through subagent defaults.
+    # Planner/reviewer ran through subagent defaults.
     assert by_role[AgentRole.PLANNER].backend_type == "subagent"
     assert by_role[AgentRole.PLANNER].routing_source == "default"
     assert by_role[AgentRole.REVIEWER].backend_type == "subagent"
-    assert by_role[AgentRole.VERIFIER].backend_type == "subagent"
     # Worker honored the card pin.
     assert by_role[AgentRole.WORKER].backend_type == "acp"
     assert by_role[AgentRole.WORKER].agent_profile == "gemini-worker"

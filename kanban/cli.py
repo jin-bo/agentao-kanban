@@ -2,10 +2,15 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
+import subprocess
 import sys
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .daemon import (
+    DAEMON_LOG_FILENAME,
     CombinedDaemon,
     DaemonConfig,
     DaemonLockError,
@@ -13,8 +18,11 @@ from .daemon import (
     SchedulerDaemon,
     WorkerDaemon,
     assert_no_daemon,
+    clear_stale_lock,
     daemon_lock,
+    daemon_status,
     detach_to_background,
+    lock_path,
 )
 import json as _json
 
@@ -33,7 +41,33 @@ from .models import (
 from .orchestrator import KanbanOrchestrator
 from .store_markdown import MarkdownBoardStore
 
-DEFAULT_BOARD = Path("workspace/board")
+from .init import (  # noqa: E402 — keep close to use site
+    DEFAULT_BOARD_REL as DEFAULT_BOARD,
+    MARKER_DIR,
+    read_board_dir_override,
+)
+
+
+def _discover_board(cwd: Path | None = None) -> Path:
+    """Walk up from ``cwd`` looking for a ``kanban init`` marker.
+
+    Mirrors git's "first ancestor wins" semantics so a user in a deep
+    subdirectory hits the same board as one at the repo root. With no
+    marker we fall back to ``<cwd>/workspace/board`` to preserve the
+    pre-init "just clone and run" flow.
+    """
+    start = (cwd or Path.cwd()).resolve()
+    for candidate in (start, *start.parents):
+        marker = candidate / MARKER_DIR
+        if not marker.is_dir():
+            continue
+        cfg = marker / "config.yaml"
+        if cfg.is_file():
+            override = read_board_dir_override(cfg)
+            if override:
+                return (candidate / override).resolve()
+        return (candidate / "workspace" / "board").resolve()
+    return (start / DEFAULT_BOARD).resolve()
 
 
 def _apply_limit(items: list, limit: int | None) -> list:
@@ -81,7 +115,7 @@ def _resolve_card_id(store: MarkdownBoardStore, given: str) -> str:
         raise SystemExit(2)
     return given
 
-# Statuses an operator may force via `card edit --set-status`. doing/review/verify
+# Statuses an operator may force via `card edit --set-status`. doing/review
 # are excluded because they have an expected owner_role and would desync the
 # orchestrator — use `requeue` for recovery paths.
 _OPERATOR_STATUSES = (
@@ -97,8 +131,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--board",
         type=Path,
-        default=DEFAULT_BOARD,
-        help=f"Board directory (default: {DEFAULT_BOARD})",
+        default=None,
+        help=(
+            "Board directory. Default: walk up from cwd looking for a "
+            "`.kanban/` marker (created by `kanban init`); without a marker "
+            "fall back to `./workspace/board`."
+        ),
     )
     p.add_argument(
         "--executor",
@@ -122,7 +160,36 @@ def build_parser() -> argparse.ArgumentParser:
             "(exits if none), or --no-worktree to disable."
         ),
     )
-    sub = p.add_subparsers(dest="command", required=True)
+    sub = p.add_subparsers(dest="command", required=False)
+
+    # `init` and `demo` are first-run UX commands. We register `init`
+    # via the helper in kanban.init so the parser stays the single
+    # source of truth for help text.
+    from .init import add_init_subparser
+    add_init_subparser(sub)
+
+    demo_p = sub.add_parser(
+        "demo",
+        help="Seed the board with example cards and run a few orchestrator steps.",
+        description=(
+            "Seed 4 example cards on the file-backed board and (by default) run "
+            "the mock orchestrator until idle so you can see the full pipeline. "
+            "Refuses to seed when the board already has cards."
+        ),
+    )
+    demo_p.add_argument(
+        "--no-run",
+        action="store_true",
+        dest="no_run",
+        help="Just seed the cards; don't run the orchestrator.",
+    )
+    demo_p.add_argument(
+        "--max-steps",
+        type=int,
+        default=20,
+        dest="max_steps",
+        help="Cap orchestrator iterations when seeding into an empty board (default 20).",
+    )
 
     card = sub.add_parser("card", help="Card operations")
     card_sub = card.add_subparsers(dest="card_command", required=True)
@@ -151,7 +218,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--set-status",
         dest="set_status",
         choices=[s.value for s in _OPERATOR_STATUSES],
-        help="Operator override; disallowed for doing/review/verify (use requeue instead).",
+        help="Operator override; disallowed for doing/review (use requeue instead).",
     )
     blocked_group = edit.add_mutually_exclusive_group()
     blocked_group.add_argument(
@@ -214,6 +281,15 @@ def build_parser() -> argparse.ArgumentParser:
     acc_clear = acc_sub.add_parser("clear", help="Clear all criteria")
     acc_clear.add_argument("card_id")
 
+    acc_edit = acc_sub.add_parser(
+        "edit",
+        help=(
+            "Open the criteria in $EDITOR (one per line). Lines starting "
+            "with '#' and blank lines are dropped on save."
+        ),
+    )
+    acc_edit.add_argument("card_id")
+
     sub.add_parser("list", help="List cards grouped by status")
 
     show = sub.add_parser("show", help="Show a single card")
@@ -242,8 +318,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=CardStatus.INBOX.value,
     )
 
-    doctor = sub.add_parser("doctor", help="Run board integrity checks")
+    doctor = sub.add_parser("doctor", help="Run board + environment checks")
     doctor.add_argument("--json", dest="as_json", action="store_true", help="Emit machine-readable records")
+    doctor.add_argument(
+        "--fix",
+        action="store_true",
+        help=(
+            "Apply remediation for fixable environment issues "
+            "(stale/malformed `.daemon.lock`, missing board dir, missing "
+            "or malformed `.kanban/config.yaml`). Card-level findings are "
+            "never auto-fixed."
+        ),
+    )
 
     traces = sub.add_parser("traces", help="List retained raw agent transcripts")
     traces.add_argument("card_id")
@@ -340,10 +426,99 @@ def build_parser() -> argparse.ArgumentParser:
         help="Scheduler concurrency budget (default 2).",
     )
 
+    # Optional sub-subcommands. Adding them AFTER the run-mode flags keeps
+    # `kanban daemon --once` (no subcommand) parsing the same as before; a
+    # subcommand wins when present, e.g. `kanban daemon stop`.
+    daemon_sub = daemon.add_subparsers(dest="daemon_command", required=False)
+
+    d_stop = daemon_sub.add_parser(
+        "stop",
+        help="Send SIGTERM to the daemon recorded in .daemon.lock.",
+    )
+    d_stop.add_argument(
+        "--force",
+        dest="stop_force",
+        action="store_true",
+        help="Use SIGKILL instead of SIGTERM. Last resort.",
+    )
+    d_stop.add_argument(
+        "--timeout",
+        dest="stop_timeout",
+        type=float,
+        default=5.0,
+        help="Seconds to wait for the lock file to disappear after SIGTERM (default 5).",
+    )
+
+    d_status = daemon_sub.add_parser(
+        "status",
+        help="Print daemon lock state (running / stale / stopped).",
+    )
+    d_status.add_argument(
+        "--json",
+        dest="as_json",
+        action="store_true",
+        help="Emit a single JSON object instead of human-readable lines.",
+    )
+
+    d_logs = daemon_sub.add_parser(
+        "logs",
+        help="Tail the daemon log file at <board>/daemon.log.",
+    )
+    d_logs.add_argument(
+        "-f",
+        "--follow",
+        action="store_true",
+        help="Stream new lines as the daemon writes them.",
+    )
+    d_logs.add_argument(
+        "-n",
+        "--lines",
+        type=int,
+        default=50,
+        help="Number of trailing lines to print before following (default 50).",
+    )
+
     p.add_argument(
         "--force",
         action="store_true",
         help="Mutate the board even if a daemon holds the lock (for recovery only).",
+    )
+
+    # --- mcp subcommand (install helpers; the server itself is `kanban-mcp`) ---
+    mcp_p = sub.add_parser(
+        "mcp",
+        help="Helpers for registering kanban-mcp with MCP clients.",
+        description=(
+            "The kanban MCP server itself is the separate `kanban-mcp` entry "
+            "point. This subcommand only emits / executes the registration "
+            "command line for popular clients."
+        ),
+    )
+    mcp_sub = mcp_p.add_subparsers(dest="mcp_command", required=True)
+
+    mi = mcp_sub.add_parser(
+        "install",
+        help="Print (or run) the registration command for a client.",
+    )
+    mi.add_argument(
+        "--client",
+        choices=["claude", "codex", "print"],
+        default="print",
+        help=(
+            "Which client to target. `print` (default) emits a copy/paste "
+            "snippet for both. `claude` and `codex` emit a single command "
+            "line; combine with --run to execute it."
+        ),
+    )
+    mi.add_argument(
+        "--name",
+        default="kanban",
+        help="Server name registered with the client (default: kanban).",
+    )
+    mi.add_argument(
+        "--run",
+        action="store_true",
+        help="Execute the rendered command instead of just printing it.",
     )
 
     # --- web subcommand (read-only HTTP board) ---
@@ -429,8 +604,6 @@ def _find_git_root_optional(board: Path) -> Path | None:
     be found, or when the ``git`` binary itself is unavailable — callers
     decide whether that's a hard failure.
     """
-    import subprocess
-
     try:
         start = board.resolve(strict=False)
     except OSError:
@@ -1107,6 +1280,117 @@ def cmd_card_acceptance_clear(args: argparse.Namespace) -> int:
     return 0
 
 
+_ACCEPTANCE_EDIT_BANNER = (
+    "# Edit the acceptance criteria for this card, one per line.\n"
+    "# Lines starting with '#' and blank lines are ignored.\n"
+    "# Save and quit your editor to apply, or quit without saving to abort.\n"
+)
+
+
+def _open_in_editor(initial: str, *, suffix: str = ".txt") -> str | None:
+    """Hand a buffer to ``$EDITOR`` and return the saved contents.
+
+    Returns ``None`` if the buffer is unchanged (operator likely closed
+    without saving) so callers can treat that as "no-op, abort". Raises
+    :class:`SystemExit` with a clear message when ``$EDITOR`` is unset
+    or the editor exits non-zero — better to refuse than to silently
+    write an empty list.
+    """
+    import shlex
+    import tempfile
+
+    editor = os.environ.get("VISUAL") or os.environ.get("EDITOR")
+    if not editor:
+        raise SystemExit(
+            "No $EDITOR (or $VISUAL) set. Set one (e.g. `export EDITOR=vi`) "
+            "and re-run, or use `kanban card acceptance add/rm/clear`."
+        )
+
+    # shlex.split handles `EDITOR="code --wait"` and `EDITOR="vim -n"`,
+    # which are common when the editor needs flags to behave like a
+    # blocking foreground process.
+    editor_argv = shlex.split(editor)
+    if not editor_argv:
+        raise SystemExit("$EDITOR is empty after parsing; aborting.")
+
+    with tempfile.NamedTemporaryFile(
+        mode="w+", suffix=suffix, encoding="utf-8", delete=False
+    ) as fh:
+        fh.write(initial)
+        path = Path(fh.name)
+    try:
+        try:
+            rv = subprocess.run(editor_argv + [str(path)], check=False)
+        except OSError as exc:
+            # Catches FileNotFoundError when $EDITOR is set but its binary
+            # isn't on PATH (e.g. stale `EDITOR=code --wait` without code
+            # installed). Without this the user sees a traceback instead
+            # of a clean abort message.
+            raise SystemExit(
+                f"Failed to launch editor {editor_argv[0]!r}: {exc}. "
+                f"Set $EDITOR to an installed binary and re-run."
+            )
+        if rv.returncode != 0:
+            raise SystemExit(
+                f"Editor exited with rc={rv.returncode}; aborting without changes."
+            )
+        edited = path.read_text(encoding="utf-8")
+    finally:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+    if edited == initial:
+        return None
+    return edited
+
+
+def _parse_acceptance_buffer(text: str) -> list[str]:
+    """Strip comments + blanks, return one trimmed item per surviving line."""
+    items: list[str] = []
+    for raw in text.splitlines():
+        line = raw.rstrip()
+        stripped = line.lstrip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        items.append(line.strip())
+    return items
+
+
+def cmd_card_acceptance_edit(args: argparse.Namespace) -> int:
+    store = _make_store(args)
+    args.card_id = _resolve_card_id(store, args.card_id)
+    _require_card_writable(args, args.card_id)
+    try:
+        card = store.get_card(args.card_id)
+    except KeyError:
+        print(f"No card with id {args.card_id}", file=sys.stderr)
+        return 1
+
+    initial = _ACCEPTANCE_EDIT_BANNER + "\n".join(card.acceptance_criteria)
+    if card.acceptance_criteria:
+        initial += "\n"
+
+    edited = _open_in_editor(initial, suffix=".kanban-acceptance.txt")
+    if edited is None:
+        print("No changes (buffer unchanged); leaving criteria untouched.")
+        return 0
+
+    new_items = _parse_acceptance_buffer(edited)
+    if new_items == list(card.acceptance_criteria):
+        print("No changes (criteria identical after parse).")
+        return 0
+
+    store.update_card(card.id, acceptance_criteria=new_items)
+    fresh = store.get_card(card.id)
+    note = f"Acceptance criteria edited via $EDITOR ({len(new_items)} item(s))"
+    fresh.add_history(note, role="system")
+    store.update_card(fresh.id)
+    store.append_event(fresh.id, note)
+    print(note)
+    return 0
+
+
 def cmd_card_add(args: argparse.Namespace) -> int:
     _require_writable(args)
     store = _make_store(args)
@@ -1446,11 +1730,56 @@ def cmd_recover(args: argparse.Namespace) -> int:
     return 0
 
 
+def _doctor_project_root(board: Path) -> Path:
+    """Project root for environment checks.
+
+    Prefer a ``.kanban/`` ancestor of ``cwd`` so a user running ``doctor``
+    from inside their workspace gets diagnostics about *their* setup, not
+    a marker that happens to sit above ``--board``. Fall back to the
+    board-derived root, then cwd as last resort.
+    """
+    cwd = Path.cwd().resolve()
+    for candidate in (cwd, *cwd.parents):
+        if (candidate / MARKER_DIR).is_dir():
+            return candidate
+    derived = _project_root_for(board)
+    if (derived / MARKER_DIR).is_dir():
+        return derived
+    return cwd
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
     from . import doctor as _doctor
 
-    store = _make_store(args)
-    report = _doctor.run(store)
+    project_root = _doctor_project_root(args.board)
+    board_path = Path(args.board).resolve()
+
+    env_checks = _doctor.run_environment(project_root, board_path)
+    # Card-level checks need a readable board. Skip them when the board
+    # directory is missing — `_make_store` would create it as a side
+    # effect of the first read, masking the env finding.
+    card_checks: list = []
+    if board_path.is_dir():
+        store = _make_store(args)
+        card_checks = list(_doctor.run(store).checks)
+
+    report = _doctor.DoctorReport(checks=list(env_checks) + card_checks)
+
+    fixes_applied: list[tuple[str, str]] = []
+    if args.fix:
+        remaining: list = []
+        for check in report.checks:
+            if check.fix is None:
+                remaining.append(check)
+                continue
+            try:
+                description = check.fix()
+            except Exception as exc:  # noqa: BLE001 — surface to operator, keep going
+                description = f"fix raised {type(exc).__name__}: {exc}"
+                remaining.append(check)
+            else:
+                fixes_applied.append((check.rule, description))
+        report = _doctor.DoctorReport(checks=remaining)
 
     if args.as_json:
         payload = {
@@ -1460,17 +1789,32 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                     "rule": c.rule,
                     "card_id": c.card_id,
                     "message": c.message,
+                    "fixable": c.fix is not None,
                 }
                 for c in report.checks
-            ]
+            ],
+            "fixes_applied": [
+                {"rule": rule, "description": desc} for rule, desc in fixes_applied
+            ],
         }
         print(_json.dumps(payload, ensure_ascii=False))
     else:
+        if fixes_applied:
+            print("Applied fixes:")
+            for rule, desc in fixes_applied:
+                print(f"  - {rule}: {desc}")
         if not report.checks:
-            print("Board is healthy.")
+            if not fixes_applied:
+                print("Board is healthy.")
+            else:
+                print("Remaining issues: none.")
         else:
             for c in report.checks:
-                print(f"[{c.severity}] {c.rule}  {c.card_id[:8]}  {c.message}")
+                hint = " (fixable: rerun with --fix)" if c.fix is not None and not args.fix else ""
+                # Environment findings have no card id — drop the column so
+                # the output reads cleanly instead of "[warning] rule   message".
+                cid = f"  {c.card_id[:8]}" if c.card_id else ""
+                print(f"[{c.severity}] {c.rule}{cid}  {c.message}{hint}")
     return report.exit_code()
 
 
@@ -1582,7 +1926,247 @@ def cmd_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_daemon_status(args: argparse.Namespace) -> int:
+    """Print the lock-file state in the same shape as ``GET /api/daemon``."""
+    info = daemon_status(args.board)
+    if getattr(args, "as_json", False):
+        print(_json.dumps(info, ensure_ascii=False))
+        return 0
+
+    status = info.get("status", "unknown")
+    pid = info.get("pid")
+    started = info.get("started_at")
+    started_str = "-"
+    if started is not None:
+        try:
+            started_str = datetime.fromtimestamp(float(started), tz=timezone.utc).isoformat()
+        except (TypeError, ValueError):
+            started_str = str(started)
+
+    print(f"status:     {status}")
+    print(f"pid:        {pid if pid is not None else '-'}")
+    print(f"started_at: {started_str}")
+    print(f"lock_path:  {info.get('lock_path', '-')}")
+    log_path = Path(args.board) / DAEMON_LOG_FILENAME
+    if log_path.is_file():
+        print(f"log:        {log_path}")
+    return 0
+
+
+def _pid_command(pid: int) -> str | None:
+    """Return the COMMAND column for ``pid`` from ``ps``, or None.
+
+    Used to defend against PID reuse: a stale ``.daemon.lock`` whose pid
+    has been recycled by an unrelated process would otherwise let
+    ``daemon stop`` SIGTERM that process. ``ps`` is POSIX and present on
+    macOS + every common Linux. Errors → None so callers can decide.
+    """
+    try:
+        rv = subprocess.run(
+            ["ps", "-o", "command=", "-p", str(pid)],
+            capture_output=True, text=True, check=False,
+        )
+    except OSError:
+        return None
+    if rv.returncode != 0:
+        return None
+    out = rv.stdout.strip()
+    return out or None
+
+
+def _looks_like_kanban_daemon(pid: int) -> bool:
+    """Best-effort check that ``pid`` is a kanban daemon, not a recycled pid.
+
+    A bare substring match on "kanban" was too loose — `grep kanban`,
+    `vim kanban/cli.py`, and a developer's editor all matched. Instead
+    look for a kanban *launcher*: argv[0]'s basename is one of the
+    project's entry points, or argv[0] is a python/uv runner with a
+    later token that names the package.
+    """
+    import shlex
+
+    cmd = _pid_command(pid)
+    if not cmd:
+        return False
+    try:
+        tokens = shlex.split(cmd)
+    except ValueError:
+        tokens = cmd.split()
+    if not tokens:
+        return False
+
+    def _basename(tok: str) -> str:
+        return tok.rsplit("/", 1)[-1]
+
+    entry_points = ("kanban", "kanban-mcp")
+    if _basename(tokens[0]) in entry_points:
+        return True
+
+    launcher = _basename(tokens[0])
+    if launcher == "uv" or "python" in launcher:
+        for tok in tokens[1:]:
+            base = _basename(tok)
+            if base in entry_points:
+                return True
+            if tok == "kanban" or tok.startswith("kanban."):
+                return True
+            if "/kanban/" in tok or tok.endswith("/kanban"):
+                return True
+    return False
+
+
+def _force_remove_lock(path: Path, *, label: str) -> int:
+    """Delete a (possibly malformed) lock file. Returns shell-style rc."""
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as exc:
+        print(f"Failed to remove {label} at {path}: {exc}", file=sys.stderr)
+        return 1
+    print(f"Removed {label} at {path}.")
+    return 0
+
+
+def cmd_daemon_stop(args: argparse.Namespace) -> int:
+    """Send SIGTERM (or SIGKILL with --force) to the daemon and wait for the lock to clear."""
+    import signal as _signal
+
+    info = daemon_status(args.board)
+    status = info.get("status")
+    path = lock_path(args.board)
+    if status == "stopped":
+        # daemon_status() returns "stopped" both when the lock is absent
+        # AND when it exists but JSON-decode fails. Cover the malformed
+        # case here so `daemon stop` is the documented recovery path.
+        if path.exists():
+            return _force_remove_lock(path, label="malformed lock")
+        print("No daemon is running on this board.", file=sys.stderr)
+        return 1
+    if status == "stale":
+        try:
+            cleared = clear_stale_lock(args.board)
+        except (TypeError, ValueError):
+            # Non-numeric pid in the lock file would otherwise crash
+            # clear_stale_lock's int() coercion. Unlink directly.
+            return _force_remove_lock(path, label="malformed stale lock")
+        if not cleared:
+            print(f"Failed to remove stale lock at {path}", file=sys.stderr)
+            return 1
+        print(f"Cleared stale lock at {path}.")
+        return 0
+
+    pid = info.get("pid")
+    if not pid:
+        print("Daemon lock has no recorded pid; refusing to signal.", file=sys.stderr)
+        return 1
+
+    # Guard against PID reuse: a stale lock whose pid was later recycled
+    # by an unrelated process would otherwise be SIGTERM'd here. Refuse
+    # unless the recorded pid still looks like a kanban process.
+    if not _looks_like_kanban_daemon(int(pid)):
+        print(
+            f"Refusing to signal pid {pid}: process command does not look "
+            f"like a kanban daemon (likely a stale lock with a reused pid). "
+            f"Inspect manually, then `rm {lock_path(args.board)}` if safe.",
+            file=sys.stderr,
+        )
+        return 1
+
+    sig = _signal.SIGKILL if getattr(args, "stop_force", False) else _signal.SIGTERM
+    try:
+        os.kill(int(pid), sig)
+    except ProcessLookupError:
+        print(f"pid {pid} is gone; clearing the stale lock.")
+        clear_stale_lock(args.board)
+        return 0
+    except PermissionError as exc:
+        print(f"Cannot signal pid {pid}: {exc}", file=sys.stderr)
+        return 1
+
+    timeout = float(getattr(args, "stop_timeout", 5.0))
+    deadline = time.monotonic() + timeout
+    path = lock_path(args.board)
+    while time.monotonic() < deadline:
+        if not path.exists():
+            print(f"Daemon (pid {pid}) stopped.")
+            return 0
+        # SIGKILL bypasses the daemon's own lock cleanup, so once the
+        # pid is reaped we have to unlink the file ourselves.
+        # clear_stale_lock is a no-op while the pid is still alive, which
+        # also handles slow SIGTERM shutdown gracefully.
+        if clear_stale_lock(args.board):
+            print(f"Daemon (pid {pid}) stopped; cleared lock at {path}.")
+            return 0
+        time.sleep(0.1)
+
+    print(
+        f"Daemon (pid {pid}) did not release the lock within "
+        f"{timeout:.1f}s. Re-run with --force to SIGKILL.",
+        file=sys.stderr,
+    )
+    return 1
+
+
+def cmd_daemon_logs(args: argparse.Namespace) -> int:
+    """Print the tail of ``<board>/daemon.log``, optionally following."""
+    from collections import deque
+
+    log_path = Path(args.board) / DAEMON_LOG_FILENAME
+    try:
+        fh = log_path.open("r", encoding="utf-8", errors="replace")
+    except FileNotFoundError:
+        print(
+            f"No daemon log at {log_path}. Run `kanban daemon --detach` "
+            f"to create one.",
+            file=sys.stderr,
+        )
+        return 1
+    except OSError as exc:
+        print(f"Failed to read {log_path}: {exc}", file=sys.stderr)
+        return 1
+
+    with fh:
+        # deque keeps only the last N lines as we stream — bounds memory
+        # for arbitrarily large logs while still honoring -n. -n 0 means
+        # "no backlog" (useful with -f to watch only new entries); a
+        # negative value falls back to "all" for parity with `tail`.
+        if args.lines > 0:
+            tail: list[str] | deque[str] = deque(fh, maxlen=args.lines)
+        elif args.lines == 0:
+            tail = []
+            fh.read()  # advance to EOF for a clean -f start
+        else:
+            tail = fh.readlines()
+        for line in tail:
+            sys.stdout.write(line)
+
+        if not args.follow:
+            return 0
+
+        sys.stdout.flush()
+        try:
+            while True:
+                chunk = fh.read()
+                if chunk:
+                    sys.stdout.write(chunk)
+                    sys.stdout.flush()
+                else:
+                    time.sleep(0.25)
+        except KeyboardInterrupt:
+            return 0
+
+
 def cmd_daemon(args: argparse.Namespace) -> int:
+    # Sub-subcommand dispatch. When `kanban daemon stop` is invoked,
+    # argparse fills in `daemon_command` and we route to a one-shot
+    # handler instead of starting the loop.
+    daemon_command = getattr(args, "daemon_command", None)
+    if daemon_command == "stop":
+        return cmd_daemon_stop(args)
+    if daemon_command == "status":
+        return cmd_daemon_status(args)
+    if daemon_command == "logs":
+        return cmd_daemon_logs(args)
+
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -1747,6 +2331,135 @@ def cmd_worktree_diff(args: argparse.Namespace) -> int:
     return 0
 
 
+def _mcp_install_args(name: str, board: Path) -> tuple[list[str], list[str]]:
+    """Render the (program, argv) pair to register kanban-mcp with a client.
+
+    Picks the launcher based on whether we're running from a source
+    checkout (parent contains ``pyproject.toml``) or an installed
+    package. Source checkouts use ``uv run --project <repo>`` so the
+    installed agentao etc. resolve against the repo's lockfile;
+    installed packages use ``uvx --from agentao-kanban kanban-mcp``,
+    which works regardless of how the user's shell PATH is set up.
+
+    Always emits an absolute board path: MCP clients launch the server
+    later from their own cwd, so a relative path captured here would
+    silently point at a different (often empty) board on the client side.
+    """
+    board_abs = Path(board).resolve()
+    project = Path(__file__).resolve().parent.parent
+    if (project / "pyproject.toml").is_file():
+        server = [
+            "uv", "run", "--project", str(project),
+            "kanban-mcp", "--board", str(board_abs),
+        ]
+    else:
+        server = [
+            "uvx", "--from", "agentao-kanban",
+            "kanban-mcp", "--board", str(board_abs),
+        ]
+    claude = ["claude", "mcp", "add", name, "--"] + server
+    codex = ["codex", "mcp", "add", name, "--"] + server
+    return claude, codex
+
+
+def cmd_mcp_install(args: argparse.Namespace) -> int:
+    """Print or run the MCP registration command for a chosen client."""
+    import shlex
+
+    claude_argv, codex_argv = _mcp_install_args(args.name, args.board)
+    targets = {
+        "claude": claude_argv,
+        "codex": codex_argv,
+    }
+
+    if args.client == "print":
+        if args.run:
+            print(
+                "--run requires --client claude or --client codex.",
+                file=sys.stderr,
+            )
+            return 2
+        print("# Claude Code")
+        print(shlex.join(claude_argv))
+        print()
+        print("# Codex CLI")
+        print(shlex.join(codex_argv))
+        return 0
+
+    argv = targets[args.client]
+    if not args.run:
+        print(shlex.join(argv))
+        return 0
+
+    try:
+        proc = subprocess.run(argv, check=False)
+    except FileNotFoundError:
+        print(
+            f"Could not find the `{argv[0]}` CLI on PATH. Install it first, "
+            f"or rerun without --run to copy the command yourself.",
+            file=sys.stderr,
+        )
+        return 1
+    return proc.returncode
+
+
+def cmd_demo(args: argparse.Namespace) -> int:
+    """Seed the board with example cards and (by default) run them.
+
+    Refuses on a non-empty board *unless* the existing cards are exactly
+    the demo set (e.g. left over from ``kanban init --demo``), so the
+    documented init→demo flow round-trips cleanly without a second
+    ``rm -rf``.
+    """
+    _require_writable(args)
+    from .demo import is_demo_only, seed_demo_board
+
+    store = _make_store(args)
+    existing = store.list_cards()
+    if existing:
+        if not is_demo_only(existing):
+            print(
+                f"Board already has {len(existing)} non-demo card(s); refusing to seed. "
+                f"Use a different --board or remove the existing cards first.",
+                file=sys.stderr,
+            )
+            return 2
+        print(
+            f"Board already seeded ({len(existing)} demo card(s)); "
+            f"skipping seed and advancing what's there."
+        )
+    else:
+        result = seed_demo_board(store)
+        print(f"Seeded {result.created} demo cards onto {args.board}.")
+
+    if args.no_run:
+        print("Run `kanban run` to advance them, or `kanban web` to browse.")
+        return 0
+
+    # Use the mock executor regardless of --executor — demo is supposed
+    # to run offline. Drive a bounded number of ticks rather than the
+    # default cap so the output stays predictable for first-time users.
+    orchestrator = KanbanOrchestrator(
+        store=store,
+        executor=MockAgentaoExecutor(),
+        worktree_mgr=_resolve_worktree_mgr(args),
+    )
+    orchestrator.run_until_idle(max_steps=args.max_steps)
+
+    snapshot = store.board_snapshot()
+    print()
+    print("Final state:")
+    for status in CardStatus:
+        titles = snapshot.get(status.value, [])
+        if titles:
+            print(f"  {status.value:<8} {len(titles)} card(s)")
+    print()
+    print("Try next:")
+    print(f"  uv run kanban --board {args.board} list")
+    print(f"  uv run kanban --board {args.board} web         # browse the result")
+    return 0
+
+
 def cmd_web(args: argparse.Namespace) -> int:
     # Read-only endpoint: no ``_require_writable`` check so the daemon can
     # hold ``.daemon.lock`` while the UI observes it. The server mounts a
@@ -1764,9 +2477,65 @@ def cmd_web(args: argparse.Namespace) -> int:
     )
 
 
+def _print_banner(board: Path) -> None:
+    """No-args landing page. Show version, board, daemon, top 5 commands."""
+    from . import __version__ as kanban_version  # noqa: PLC0415 — local import keeps banner cheap
+
+    status = daemon_status(board)
+    daemon_line = status.get("status", "unknown")
+    if status.get("pid"):
+        daemon_line = f"{daemon_line} (pid {status['pid']})"
+
+    print(f"kanban v{kanban_version}")
+    print(f"  Board:  {board}")
+    print(f"  Daemon: {daemon_line}")
+    print()
+    print("Most-used commands:")
+    print('  kanban init                    scaffold a new project')
+    print('  kanban demo                    seed example cards + run them')
+    print('  kanban card add --title T --goal G')
+    print('  kanban list                    show cards by status')
+    print('  kanban daemon                  start the dispatcher')
+    print('  kanban web                     open the read-only board')
+    print()
+    print("Full help: kanban --help")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
+
+    # argcomplete: silently no-ops unless a shell completion handshake
+    # variable is set, so this stays free at runtime. Operators activate
+    # it via `eval "$(register-python-argcomplete kanban)"` in their
+    # shell rc — see README quickstart.
+    try:
+        import argcomplete  # noqa: PLC0415 — local import so missing dep degrades gracefully
+        argcomplete.autocomplete(parser)
+    except ImportError:
+        pass
+
     args = parser.parse_args(argv)
+
+    # Resolve --board after parsing so explicit values stay verbatim and
+    # the implicit default is computed against the real cwd at call time
+    # (test fixtures rely on per-call cwd).
+    if args.board is None:
+        args.board = _discover_board()
+
+    # No subcommand → friendly banner instead of argparse usage error.
+    if args.command is None:
+        _print_banner(args.board)
+        return 0
+
+    if args.command == "init":
+        from .init import cmd_init
+        return cmd_init(args)
+    if args.command == "demo":
+        return cmd_demo(args)
+    if args.command == "mcp":
+        if args.mcp_command == "install":
+            return cmd_mcp_install(args)
+        parser.error(f"Unknown mcp subcommand: {args.mcp_command}")
 
     if args.command == "card":
         if args.card_command == "add":
@@ -1787,6 +2556,7 @@ def main(argv: list[str] | None = None) -> int:
                 "add": cmd_card_acceptance_add,
                 "rm": cmd_card_acceptance_rm,
                 "clear": cmd_card_acceptance_clear,
+                "edit": cmd_card_acceptance_edit,
             }.get(args.acceptance_command)
             if handler is None:
                 parser.error(f"Unknown acceptance subcommand: {args.acceptance_command}")

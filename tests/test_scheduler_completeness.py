@@ -51,7 +51,7 @@ def _make(
 
 
 def test_scheduler_fills_capacity_behind_claimed_card(tmp_path: Path):
-    """Card A is in VERIFY with a live claim. Cards B and C are in READY
+    """Card A is in REVIEW with a live claim. Cards B and C are in READY
     and runnable. Before the fix, the scheduler would return None on A
     and stop. After the fix, it skips A and claims B (and C)."""
     store, orch = _make(tmp_path, doing_limit=10)
@@ -59,8 +59,8 @@ def test_scheduler_fills_capacity_behind_claimed_card(tmp_path: Path):
         Card(
             title="A",
             goal="g",
-            status=CardStatus.VERIFY,
-            owner_role=AgentRole.VERIFIER,
+            status=CardStatus.REVIEW,
+            owner_role=AgentRole.REVIEWER,
             priority=CardPriority.HIGH,
         )
     )

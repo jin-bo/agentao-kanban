@@ -22,7 +22,7 @@ from ..models import AgentResult, AgentRole, Card, CardStatus, RevisionRequest, 
 _NEXT_STATUS: dict[AgentRole, CardStatus] = {
     AgentRole.PLANNER: CardStatus.READY,
     AgentRole.WORKER: CardStatus.REVIEW,
-    AgentRole.REVIEWER: CardStatus.VERIFY,
+    AgentRole.REVIEWER: CardStatus.DONE,
     AgentRole.VERIFIER: CardStatus.DONE,
 }
 
@@ -36,7 +36,7 @@ _OUTPUT_KEY: dict[AgentRole, str] = {
 _NEXT_OWNER: dict[AgentRole, AgentRole | None] = {
     AgentRole.PLANNER: None,
     AgentRole.WORKER: AgentRole.REVIEWER,
-    AgentRole.REVIEWER: AgentRole.VERIFIER,
+    AgentRole.REVIEWER: None,
     AgentRole.VERIFIER: None,
 }
 
@@ -274,6 +274,8 @@ def _apply_parsed(
         key = _OUTPUT_KEY[role]
         outputs = dict(card.outputs)
         outputs[key] = output if output is not None else ""
+        if role == AgentRole.REVIEWER:
+            outputs["verification"] = output if output is not None else ""
         updates["outputs"] = outputs
 
     return AgentResult(
@@ -402,21 +404,18 @@ def _rework_result(
 ) -> AgentResult:
     """Wrap a rework request as an ``AgentResult``.
 
-    ``next_status`` is set to REVIEW (or VERIFY) to match the card's
-    current status so the value is a safe fallback if the orchestrator
-    ever misses the rework path — it won't spuriously advance the card.
-    The orchestrator's ``_apply_rework`` ignores ``next_status`` and
-    moves the card to READY itself.
+    ``next_status`` is set to REVIEW to match the card's current status
+    so the value is a safe fallback if the orchestrator ever misses the
+    rework path — it won't spuriously advance the card. The orchestrator's
+    ``_apply_rework`` ignores ``next_status`` and moves the card to READY
+    itself.
     """
-    fallback_status = (
-        CardStatus.REVIEW if role == AgentRole.REVIEWER else CardStatus.VERIFY
-    )
     return AgentResult(
         role=role,
         summary=_tagged(
             f"{role.value} requested rework: {revision.summary}", spec,
         ),
-        next_status=fallback_status,
+        next_status=CardStatus.REVIEW,
         updates={},
         prompt_version=spec.version if spec else "",
         duration_ms=duration_ms,

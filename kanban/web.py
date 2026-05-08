@@ -49,7 +49,6 @@ COLUMN_ORDER: tuple[CardStatus, ...] = (
     CardStatus.READY,
     CardStatus.DOING,
     CardStatus.REVIEW,
-    CardStatus.VERIFY,
     CardStatus.DONE,
     CardStatus.BLOCKED,
 )
@@ -59,7 +58,6 @@ COLUMN_TITLES: dict[CardStatus, str] = {
     CardStatus.READY: "Ready",
     CardStatus.DOING: "Doing",
     CardStatus.REVIEW: "Review",
-    CardStatus.VERIFY: "Verify",
     CardStatus.DONE: "Done",
     CardStatus.BLOCKED: "Blocked",
 }
@@ -214,7 +212,7 @@ def create_app(
     def api_board() -> dict[str, Any]:
         store = _store()
         by_status: dict[CardStatus, list[dict[str, Any]]] = {
-            s: [] for s in COLUMN_ORDER
+            s: [] for s in CardStatus
         }
         for card in store.list_cards():
             if card.status not in by_status:

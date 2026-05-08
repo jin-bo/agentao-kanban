@@ -29,6 +29,7 @@ from .models import (
     RevisionRequest,
     TraceInfo,
     WorkerPresence,
+    coerce_card_status,
     utc_now,
 )
 
@@ -128,7 +129,7 @@ class MarkdownBoardStore:
             elif key == "owner_role" and isinstance(value, str):
                 value = AgentRole(value)
             elif key == "status" and isinstance(value, str):
-                value = CardStatus(value)
+                value = coerce_card_status(value)
             setattr(card, key, value)
         card.updated_at = utc_now()
         self._write_card(card)
@@ -865,7 +866,7 @@ def _card_from_toml_dict(data: dict[str, Any]) -> Card:
         if key not in _CARD_FIELD_NAMES:
             continue
         if key == "status":
-            kwargs[key] = CardStatus(value)
+            kwargs[key] = coerce_card_status(value)
         elif key == "priority":
             kwargs[key] = CardPriority(int(value))
         elif key == "owner_role":
@@ -1057,7 +1058,7 @@ def _claim_from_json(data: dict[str, Any]) -> ExecutionClaim:
         card_id=str(data["card_id"]),
         claim_id=str(data["claim_id"]),
         role=AgentRole(data["role"]),
-        status_at_claim=CardStatus(data["status_at_claim"]),
+        status_at_claim=coerce_card_status(data["status_at_claim"]),
         attempt=int(data["attempt"]),
         claimed_at=_parse_iso(data["claimed_at"]),
         heartbeat_at=_parse_iso(data["heartbeat_at"]),
@@ -1111,7 +1112,7 @@ def _agent_result_from_json(data: dict[str, Any]) -> AgentResult:
     return AgentResult(
         role=AgentRole(data["role"]),
         summary=str(data["summary"]),
-        next_status=CardStatus(data["next_status"]),
+        next_status=coerce_card_status(data["next_status"]),
         updates=dict(data.get("updates", {})),
         prompt_version=str(data.get("prompt_version", "")),
         duration_ms=int(data.get("duration_ms", 0)),

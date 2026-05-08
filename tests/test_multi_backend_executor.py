@@ -322,12 +322,12 @@ def test_verifier_rework_request_produces_rework_result() -> None:
         agents_dir=REPO_AGENTS_DIR,
         backends={"subagent": _RecordingBackend("subagent", refused)},
     )
-    card = Card(title="t", goal="g", status=CardStatus.VERIFY)
-    result = exec_.run(AgentRole.VERIFIER, card)
+    card = Card(title="t", goal="g", status=CardStatus.REVIEW)
+    result = exec_.run(AgentRole.REVIEWER, card)
 
-    assert result.next_status == CardStatus.VERIFY
+    assert result.next_status == CardStatus.REVIEW
     assert result.revision_request is not None
-    assert result.revision_request.from_role == AgentRole.VERIFIER
+    assert result.revision_request.from_role == AgentRole.REVIEWER
     assert result.revision_request.summary == "run the test"
 
 

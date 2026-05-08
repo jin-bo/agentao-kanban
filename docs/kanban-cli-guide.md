@@ -425,6 +425,8 @@ uv run kanban doctor
 - 已被 `blocked`
 - 有 live claim 但 worker 还没提交结果
 - 数据损坏被 `doctor` 检出
+- 环境配置出错(目录被删、`.daemon.lock` 残留、`config.yaml` 损坏等),`doctor` 会标
+  记为 `cwd-*` 规则。多数环境问题可以用 `kanban doctor --fix` 一键修复。
 
 ## 8. 审计与留痕
 
@@ -471,14 +473,19 @@ uv run kanban --board workspace/board web \
 
 - 读类端点(`/api/board`、`/api/cards/{id}`、`/api/events`、`/api/daemon`)
   **不受** `.daemon.lock` 影响,daemon 跑不跑都能看
-- `POST /api/cards` 在 daemon 持有 `.daemon.lock` 时会拒写,文案与 CLI / MCP
-  路径一致;daemon 停了或锁是 stale 时才允许新增卡
+- `POST /api/cards` **不**与 `.daemon.lock` 串行化,daemon 跑着也能加卡。
+  这是有意为之的特例:新卡的 UUID 是全新的,不会与任何现有卡或 live claim
+  冲突,而 events.log 的短行 append 是 POSIX 原子操作。CLI / MCP 的
+  `card add` 仍走 `.daemon.lock`(沿用 v0.1.5 之前的 contract),web 路径
+  是唯一的 race-free 例外。理由见 `kanban/web.py` 的 `api_create_card`
+  注释
 - web 进程**不会**清理 stale lock — 那只在 `kanban daemon` 启动时由 daemon
   自己接管(检查 pid 是否还活着,不活就清掉再起)
 
-实际工作流:daemon 跑着的时候,web 上的"加卡"按钮会被禁用并打提示,这
-不是 bug,是设计上的写入串行化保护。需要批量 INBOX 时,要么停 daemon、
-要么走 `kanban card add --force`(应急)。
+实际工作流:daemon 跑着的时候,web 上的"加卡"按钮**仍可用**。需要批量
+INBOX 时直接在浏览器里加,daemon 下一轮 tick 自然会拣起。如果你确实想
+让 daemon 跑着时禁掉 web 写入,把 `--enable-writes` 关掉就行 — 这是单
+开关。
 
 ### 9.3 Daemon 状态面板
 
@@ -493,8 +500,9 @@ Web UI 的 Runtime 面板顶部展示 daemon 三态,数据来自 `GET /api/daemo
 `stale` 状态只是诊断信号,**web 进程不会自动清理**。处理方式:
 
 ```bash
-uv run kanban daemon --once       # 启动时会检测并清掉 stale lock
-# 或者直接删掉锁文件
+uv run kanban doctor --fix        # 推荐,顺带把其它 cwd-* 配置问题一并处理
+uv run kanban daemon --once       # 启动 daemon 时也会清掉 stale lock
+# 兜底:直接删锁文件
 rm workspace/board/.daemon.lock
 ```
 
@@ -563,6 +571,7 @@ DONE/BLOCKED 时会被 `WorktreeManager.detach()` 抢救到
 | 看事件 | `uv run kanban events <card_id>` |
 | 看原始 transcript | `uv run kanban traces <card_id>` |
 | 体检 | `uv run kanban doctor` |
+| 修复 cwd 配置 | `uv run kanban doctor --fix` |
 | 浏览器看板(只读) | `uv run kanban web` |
 | 浏览器看板(可写入) | `uv run kanban web --enable-writes` |
 

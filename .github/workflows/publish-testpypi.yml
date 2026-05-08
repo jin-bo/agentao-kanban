@@ -48,7 +48,7 @@ jobs:
     timeout-minutes: 10
     environment:
       name: testpypi
-      url: https://test.pypi.org/p/kanban
+      url: https://test.pypi.org/p/agentao-kanban
     permissions:
       id-token: write
     steps:
@@ -81,16 +81,24 @@ jobs:
           version="${ref#v}"
           echo "version=${version}" >> "$GITHUB_OUTPUT"
 
-      - name: Install from TestPyPI (with PyPI fallback for deps)
+      - name: Install from TestPyPI (with PyPI deps)
         run: |
           python -m venv /tmp/smoke
           /tmp/smoke/bin/pip install --upgrade pip
           for attempt in 1 2 3 4 5; do
-            if /tmp/smoke/bin/pip install \
+            rm -rf /tmp/smoke-dist
+            mkdir -p /tmp/smoke-dist
+            if /tmp/smoke/bin/pip download \
+                --no-deps \
+                --only-binary=:all: \
+                --dest /tmp/smoke-dist \
                 --index-url https://test.pypi.org/simple/ \
-                --extra-index-url https://pypi.org/simple/ \
-                "agentao-kanban==${{ steps.ver.outputs.version }}"; then
+                "agentao-kanban==${{ steps.ver.outputs.version }}" && \
+              /tmp/smoke/bin/pip install /tmp/smoke-dist/agentao_kanban-*.whl; then
               break
+            fi
+            if [ "$attempt" = "5" ]; then
+              exit 1
             fi
             echo "attempt ${attempt} failed, sleeping before retry (TestPyPI propagation)…"
             sleep 15

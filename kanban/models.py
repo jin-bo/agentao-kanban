@@ -16,9 +16,17 @@ class CardStatus(StrEnum):
     READY = "ready"
     DOING = "doing"
     REVIEW = "review"
-    VERIFY = "verify"
     DONE = "done"
     BLOCKED = "blocked"
+
+
+def coerce_card_status(value: CardStatus | str) -> CardStatus:
+    if isinstance(value, CardStatus):
+        return value
+    normalized = str(value).lower()
+    if normalized == "verify":
+        return CardStatus.REVIEW
+    return CardStatus(normalized)
 
 
 class CardPriority(IntEnum):

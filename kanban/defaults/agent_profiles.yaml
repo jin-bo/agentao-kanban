@@ -26,8 +26,7 @@ roles:
 
 router:
   # Roles for which the router is invoked. Other roles go directly to their
-  # role default. Rollout order: worker first, then reviewer / verifier /
-  # planner.
+  # role default. Rollout order: worker first, then reviewer / planner.
   enabled_roles: [worker]
   # Per-invocation timeout for the router agent call. Does not affect the
   # selected profile's own execution budget.
@@ -70,8 +69,9 @@ profiles:
       type: subagent
       target: kanban-reviewer
     description: >-
-      Built-in reviewer. Reads the worker output and acceptance criteria and
-      decides pass/fail with a short rationale. Safe default for any review.
+      Built-in reviewer/checker. Reads the worker output and acceptance
+      criteria, verifies completion, and decides pass/fail with a short
+      rationale. Safe default for any review.
 
   gemini-reviewer:
     role: reviewer
@@ -79,10 +79,11 @@ profiles:
       type: acp
       target: gemini-reviewer
     fallback: default-reviewer
-    capabilities: [review, diff-analysis]
+    capabilities: [review, verification, diff-analysis]
     description: >-
-      Gemini-backed reviewer. Prefer for diff-heavy reviews or cards whose
-      acceptance criteria require reasoning across multiple files.
+      Gemini-backed reviewer/checker. Prefer for diff-heavy reviews, acceptance
+      verification, or cards whose criteria require reasoning across multiple
+      files.
 
   default-verifier:
     role: verifier
@@ -90,5 +91,5 @@ profiles:
       type: subagent
       target: kanban-verifier
     description: >-
-      Built-in verifier. Runs acceptance checks against the worker output and
-      emits a pass/fail verdict. Safe default for any verification task.
+      Legacy compatibility profile. The default workflow no longer schedules a
+      verifier role; reviewer profiles now perform acceptance verification.

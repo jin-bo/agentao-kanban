@@ -38,11 +38,12 @@ class MockAgentaoExecutor:
         if role == AgentRole.REVIEWER:
             outputs = dict(card.outputs)
             outputs["review"] = "Review passed with no blocking issues."
+            outputs["verification"] = "Acceptance criteria verified during review."
             return AgentResult(
                 role=role,
-                summary="Reviewer approved the result.",
-                next_status=CardStatus.VERIFY,
-                updates={"outputs": outputs, "owner_role": AgentRole.VERIFIER},
+                summary="Reviewer approved and verified the result.",
+                next_status=CardStatus.DONE,
+                updates={"outputs": outputs, "owner_role": None},
             )
 
         if role == AgentRole.VERIFIER:

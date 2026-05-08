@@ -84,8 +84,8 @@ body {
   grid-template-columns: repeat(5, minmax(160px, 1fr));
   grid-template-rows: 1fr 1fr;
   grid-template-areas:
-    "inbox   ready    doing    done    runtime"
-    "blocked review   verify   done    events";
+    "inbox   ready    doing    review  runtime"
+    "blocked done     done     done    events";
   gap: 10px;
   padding: 14px;
   height: calc(100vh - 58px);
@@ -99,10 +99,9 @@ body {
 #col-inbox   { grid-area: inbox; }
 #col-ready   { grid-area: ready; }
 #col-doing   { grid-area: doing; }
+#col-review  { grid-area: review; }
 #col-done    { grid-area: done; }
 #col-blocked { grid-area: blocked; }
-#col-review  { grid-area: review; }
-#col-verify  { grid-area: verify; }
 .runtime-cell { grid-area: runtime; }
 .events-cell  { grid-area: events; }
 
@@ -623,12 +622,11 @@ body {
 @media (max-width: 1400px) {
   .layout {
     grid-template-columns: repeat(3, minmax(180px, 1fr)) minmax(260px, 1fr);
-    grid-template-rows: repeat(4, minmax(220px, 1fr));
+    grid-template-rows: repeat(3, minmax(220px, 1fr));
     grid-template-areas:
       "inbox   ready   doing   runtime"
-      "blocked review  verify  runtime"
-      "done    done    done    events"
-      "done    done    done    events";
+      "blocked review  done    runtime"
+      "blocked review  done    events";
     height: auto;
     min-height: calc(100vh - 58px);
   }
@@ -640,7 +638,7 @@ body {
     grid-template-rows: repeat(4, minmax(220px, auto));
     grid-template-areas:
       "inbox   ready   doing"
-      "blocked review  verify"
+      "blocked review  review"
       "done    done    done"
       "runtime runtime events";
     height: auto;
@@ -657,9 +655,8 @@ body {
       "inbox"
       "ready"
       "doing"
-      "blocked"
       "review"
-      "verify"
+      "blocked"
       "done"
       "runtime"
       "events";

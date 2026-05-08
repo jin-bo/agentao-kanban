@@ -69,11 +69,11 @@ def test_requests_against_missing_board_dont_create_directories(
     assert not board_dir.exists()
 
 
-def test_board_has_seven_columns_in_fixed_order(client: TestClient) -> None:
+def test_board_has_six_columns_in_fixed_order(client: TestClient) -> None:
     r = client.get("/api/board")
     assert r.status_code == 200
     data = r.json()
-    assert len(data["columns"]) == 7
+    assert len(data["columns"]) == 6
     statuses = [col["status"] for col in data["columns"]]
     assert statuses == [s.value for s in COLUMN_ORDER]
     for col in data["columns"]:

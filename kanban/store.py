@@ -15,6 +15,7 @@ from .models import (
     ExecutionResultEnvelope,
     TraceInfo,
     WorkerPresence,
+    coerce_card_status,
     utc_now,
 )
 
@@ -163,7 +164,7 @@ class InMemoryBoardStore:
             elif key == "owner_role" and isinstance(value, str):
                 value = AgentRole(value)
             elif key == "status" and isinstance(value, str):
-                value = CardStatus(value)
+                value = coerce_card_status(value)
             setattr(card, key, value)
         card.updated_at = utc_now()
         return card

@@ -22,9 +22,10 @@ def test_execution_event_records_role_and_timing(tmp_path: Path):
 
     events = _read_events(store)
     role_events = [e for e in events if e.get("role")]
-    # At least one event per role
+    # At least one event per active role.
     roles = {e["role"] for e in role_events}
-    assert {"planner", "worker", "reviewer", "verifier"} <= roles
+    assert {"planner", "worker", "reviewer"} <= roles
+    assert "verifier" not in roles
 
     for e in role_events:
         assert e["card_id"] == card.id

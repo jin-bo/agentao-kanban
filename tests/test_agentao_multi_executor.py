@@ -216,12 +216,11 @@ def test_summary_is_tagged_with_spec_version():
 # ---------- end-to-end ----------
 
 
-def test_end_to_end_one_card_through_all_four_roles():
+def test_end_to_end_one_card_through_planner_worker_reviewer():
     responses = {
         "kanban-planner": '```json\n{"ok": true, "summary": "p", "acceptance_criteria": ["crit"]}\n```',
         "kanban-worker": '```json\n{"ok": true, "summary": "w", "output": "impl"}\n```',
         "kanban-reviewer": '```json\n{"ok": true, "summary": "r", "output": "lgtm"}\n```',
-        "kanban-verifier": '```json\n{"ok": true, "summary": "v", "output": "verified"}\n```',
     }
 
     class RoleAwareAgent:
@@ -245,7 +244,7 @@ def test_end_to_end_one_card_through_all_four_roles():
     assert final.outputs == {
         "implementation": "impl",
         "review": "lgtm",
-        "verification": "verified",
+        "verification": "lgtm",
     }
 
 

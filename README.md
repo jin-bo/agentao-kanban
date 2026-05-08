@@ -42,18 +42,49 @@ main.py                     # demo 入口
 
 ## 快速开始
 
+不想 clone,只想一分钟看效果(需 `uv ≥ 0.4`):
+
+```bash
+mkdir my-kanban && cd my-kanban
+uvx --from agentao-kanban kanban init --demo    # 一键脚手架 + 4 张示例卡
+uvx --from agentao-kanban kanban demo           # 跑到 idle,全部进 DONE
+uvx --from agentao-kanban kanban web            # 浏览器看板(只读)
+```
+
+(命令也可写成 `pipx run --spec agentao-kanban kanban ...`,只是用 pipx 时
+要带 `--spec`。)
+
+想本地开发或改 kanban 自身:
+
 ```bash
 git clone https://github.com/jin-bo/agentao-kanban.git
 cd agentao-kanban
 uv sync
-uv run python main.py                           # 内存态演示,最短闭环
-uv run kanban card add --title T --goal G --priority HIGH
-uv run kanban run                               # 默认 mock executor 跑到 idle
+uv run kanban init --demo                       # 同上,但落在仓库根
+uv run kanban list
 uv run pytest -q                                # 自检
+```
+
+可选:打开 shell 补全(zsh/bash):
+
+```bash
+eval "$(register-python-argcomplete kanban)"
 ```
 
 要切到真实 agentao sub-agent 或远端 ACP backend,完整安装路径见
 [`docs/install.md`](docs/install.md)。
+
+## 一分钟上手三连
+
+| 子命令 | 做什么 |
+|---|---|
+| `kanban init [PATH] [--demo] [--copy-agents]` | 在当前目录建 `.kanban/`(项目根标记)+ `workspace/board/`,可选拷贝 agent 模板与种入示例卡 |
+| `kanban demo [--no-run]` | 把 4 张示例卡推到 INBOX→READY→DOING→...→DONE,看完整管线 |
+| `kanban` (无参) | 打印版本、当前板、daemon 状态与 5 条最常用命令 |
+
+`kanban init` 会写一个 `.kanban/config.yaml` 把 `board_dir` 钉死;之后从该
+目录及其任何子目录运行 `kanban list` / `kanban web` / `kanban daemon` 都
+能自动找回这块板,无需带 `--board`。
 
 ## CLI 与日常运维
 
@@ -70,8 +101,13 @@ uv run kanban list                              # 全板
 uv run kanban show <card_id>                    # 单卡
 uv run kanban move <card_id> ready              # 入队
 uv run kanban daemon                            # 前台 dispatcher
+uv run kanban daemon status                     # daemon 三态(running/stale/stopped)
+uv run kanban daemon stop                       # SIGTERM 给锁文件里记录的 pid
+uv run kanban daemon logs -f                    # 跟踪 <board>/daemon.log
 uv run kanban events <card_id>                  # 事件流
-uv run kanban doctor                            # 健康体检
+uv run kanban doctor [--fix]                    # 板 + 环境体检;--fix 修复 stale lock / 缺失 board 等
+uv run kanban card acceptance edit <card_id>    # $EDITOR 里改 acceptance
+uv run kanban mcp install --client claude       # 一键拿到 claude mcp add 命令
 ```
 
 所有写命令都遵守 `.daemon.lock`;加 `--force` 才能在守护进程运行期写入(仅

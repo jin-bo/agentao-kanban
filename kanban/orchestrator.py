@@ -35,7 +35,7 @@ class WipPolicy:
     doing_limit: int = 2
 
 
-_WIP_STATUSES = (CardStatus.DOING, CardStatus.REVIEW, CardStatus.VERIFY)
+_WIP_STATUSES = (CardStatus.DOING, CardStatus.REVIEW)
 
 # Sentinel used to distinguish "executor had no `working_directory` attribute"
 # from "executor had `working_directory = None`". Dataclass executors like
@@ -165,7 +165,7 @@ def advance_inbox_dependents(store: BoardStore, done_card_id: str) -> list[str]:
     Not recursive: only this card's direct reverse-dependencies are
     considered. Deeper chains advance naturally as each parent reaches
     DONE. Never touches non-INBOX candidates (BLOCKED / READY / DOING /
-    REVIEW / VERIFY / DONE keep their current state).
+    REVIEW / DONE keep their current state).
 
     Runs a single ``store.list_cards()`` scan, O(n) over the board. Fine
     at current board sizes and simpler than maintaining a reverse-dep
@@ -380,7 +380,7 @@ class KanbanOrchestrator:
         if card.worktree_branch is None and role in (
             AgentRole.REVIEWER, AgentRole.VERIFIER,
         ):
-            # Card reached REVIEW/VERIFY without a worktree — either the
+            # Card reached REVIEW without a worktree — either the
             # board pre-dates the worktree feature, or metadata was
             # cleared. Block rather than run unisolated against the
             # worker's (presumably modified) main checkout.
@@ -490,7 +490,7 @@ class KanbanOrchestrator:
                 # checkout.
                 reason = (
                     f"worktree branch {card.worktree_branch} missing; "
-                    "cannot review/verify deleted work"
+                    "cannot review deleted work"
                 )
                 self.store.update_card(card.id, blocked_reason=reason)
                 self.store.move_card(
@@ -828,7 +828,7 @@ class KanbanOrchestrator:
         """Apply retry matrix: either link a new claim or BLOCK the card.
 
         Invariant: a card is never left in an execution status (DOING /
-        REVIEW / VERIFY) without either a live claim or a completed
+        REVIEW) without either a live claim or a completed
         terminal transition to BLOCKED. Both paths below enforce this:
 
         - Retry: :meth:`retry_claim` clears → creates with rollback on
@@ -953,7 +953,7 @@ class KanbanOrchestrator:
         """Yield every actionable card in scheduler priority order.
 
         Order:
-          1. Finish-what-you-started: VERIFY, then REVIEW.
+          1. Finish-what-you-started: REVIEW.
           2. If WIP budget allows, READY (pulled into DOING on claim).
           3. Planning: INBOX (does not count against WIP).
 
@@ -961,8 +961,7 @@ class KanbanOrchestrator:
         that already have a live claim, so one claimed front card cannot
         starve the scheduler's remaining capacity.
         """
-        for status in (CardStatus.VERIFY, CardStatus.REVIEW):
-            yield from self._ready_cards(status)
+        yield from self._ready_cards(CardStatus.REVIEW)
 
         if self._wip_count() < self.wip_policy.doing_limit:
             yield from self._ready_cards(CardStatus.READY)
@@ -974,7 +973,6 @@ class KanbanOrchestrator:
             CardStatus.INBOX: AgentRole.PLANNER,
             CardStatus.READY: AgentRole.WORKER,
             CardStatus.REVIEW: AgentRole.REVIEWER,
-            CardStatus.VERIFY: AgentRole.VERIFIER,
         }
         return mapping[card.status]
 
@@ -1020,7 +1018,7 @@ class KanbanOrchestrator:
 
         Accepts up to ``retry_policy.rework`` reworks per card. Each accepted
         rework appends to ``card.revision_requests``, bumps
-        ``card.rework_iteration``, and moves the card REVIEW/VERIFY → READY
+        ``card.rework_iteration``, and moves the card REVIEW → READY
         so the worker is re-dispatched on the next scheduler tick. The
         worktree stays attached — the worker picks up where it left off.
 

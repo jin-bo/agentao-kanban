@@ -6,8 +6,59 @@
 
 ## [Unreleased]
 
+## [0.1.7] — 2026-05-07
+
+### Added
+- **`kanban init`** — 一键脚手架。建 `.kanban/`(项目根标记 + `config.yaml`,
+  里头记录 `board_dir`)、`workspace/board/`,可选 `--copy-agents` 把
+  `kanban/defaults/*.md` 复制到 `.agentao/agents/`,可选 `--demo` 顺手种入
+  示例卡。在 git 仓库内会提示 worktree 隔离默认开启。
+- **`kanban demo`** — 在文件级板上种入 4 张示例卡(覆盖不同 priority 与
+  acceptance 形态)并跑 mock orchestrator 到 idle,所有卡进 DONE,展示完
+  整管线;`--no-run` 只种不跑。`init --demo` 复用同一个 seed 函数,
+  非空板拒绝重复种入,避免污染真实工作板。
+- **项目根发现**:`--board` 不显式指定时,从 cwd 向上找 `.kanban/`,
+  按 `.kanban/config.yaml` 的 `board_dir` 解析(默认 `workspace/board`)。
+  没有 marker 时回落到 `<cwd>/workspace/board`,与 v0.1.6 之前行为一致。
+- **`kanban daemon` 子命令**:
+  - `kanban daemon status` — 与 `GET /api/daemon` 同源的三态(running /
+    stale / stopped)+ pid + 启动时间;`--json` 输出便于脚本消费。
+  - `kanban daemon stop` — 读 `.daemon.lock` 里的 pid,SIGTERM,等待最多
+    `--timeout`(默认 5s)看锁文件被释放。`--force` 用 SIGKILL。stale lock
+    走清理路径而不是发信号。
+  - `kanban daemon logs [-f] [-n N]` — tail / follow `<board>/daemon.log`,
+    无文件时打印一行排查提示。
+- **`kanban mcp install`** — 直接吐 `claude mcp add ...` / `codex mcp add ...`
+  命令行(默认两个都打);`--client claude|codex` 选其一,`--run` 直接执行。
+  服务端仍是单独的 `kanban-mcp` 二进制,这里只解决"运行命令长 + 易拼错"
+  的问题。
+- **`kanban card acceptance edit`** — 在 `$EDITOR` / `$VISUAL` 里编辑
+  acceptance 列表,行首 `#` 与空行自动剔除。`add/rm/list/clear` 仍保留
+  作为脚本路径。
+- **No-args banner**:`uv run kanban` 不带子命令时不再 argparse 报错退出,
+  改为打印版本、当前板、daemon 状态与 5 条常用命令,rc=0。
+- **shell 补全**:`pyproject.toml` 加 `argcomplete>=3.5`,parser 末尾
+  `argcomplete.autocomplete(parser)` 接入。一句 `eval "$(register-python-
+  argcomplete kanban)"` 即可在 zsh/bash 里获得子命令与 status 名补全。
+- `kanban/__init__.py` 暴露 `__version__`(`importlib.metadata` 取,
+  source-tree 回落读 `pyproject.toml`),供 banner 与下游脚本使用。
+- **`kanban doctor` 环境检查 + `--fix`**:在原有卡级检查之外,新增以
+  `cwd-` 为前缀的环境检查,覆盖 `<cwd>` 周围的常见配置故障——`.kanban/`
+  marker 缺 `config.yaml`(`cwd-marker-no-config`)、`config.yaml` 没有
+  可解析的 `board_dir:`(`cwd-config-no-board-dir`)、`--board` 指向不存
+  在的目录(`cwd-board-missing`)、`--board` 指向普通文件
+  (`cwd-board-not-a-dir`,无 fix)、`.daemon.lock` 不可解析或 pid 已死
+  (`cwd-malformed-lock` / `cwd-stale-lock`)。`--fix` 一键应用安全的
+  幂等修复(写默认 config、mkdir、unlink stale lock);卡级问题永远
+  不会自动改写,只有环境问题可修。`--json` 输出新增 `fixes_applied`
+  数组与每条 check 的 `fixable` 布尔。
+
 ### Changed
-- 开始 `0.1.7-dev` 开发周期。
+- README quickstart 顶端改为 `uvx --from agentao-kanban kanban init/demo/web`
+  三步,git clone 路径降级为"本地开发"小节。
+- 修正 `docs/kanban-cli-guide.md` §9.2 的 doc drift:`POST /api/cards`
+  并不与 `.daemon.lock` 串行化(代码自 v0.1.6 起就是 race-free 例外),
+  文档改为如实描述这点。
 
 ## [0.1.6] — 2026-05-06
 
@@ -160,7 +211,9 @@
   (planner / worker / reviewer / verifier)、本地 dispatcher daemon、基于
   `MockAgentaoExecutor` 的离线状态机。
 
-[Unreleased]: https://github.com/jin-bo/agentao-kanban/compare/v0.1.5...HEAD
+[Unreleased]: https://github.com/jin-bo/agentao-kanban/compare/v0.1.7...HEAD
+[0.1.7]: https://github.com/jin-bo/agentao-kanban/compare/v0.1.6...v0.1.7
+[0.1.6]: https://github.com/jin-bo/agentao-kanban/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/jin-bo/agentao-kanban/compare/v0.1.4-rc1...v0.1.5
 [0.1.4-rc1]: https://github.com/jin-bo/agentao-kanban/compare/v0.1.3...v0.1.4-rc1
 [0.1.3]: https://github.com/jin-bo/agentao-kanban/releases/tag/v0.1.3

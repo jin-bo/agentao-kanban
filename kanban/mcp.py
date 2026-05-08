@@ -36,6 +36,7 @@ from .models import (
     CardStatus,
     ContextRef,
     RevisionRequest,
+    coerce_card_status,
 )
 from .orchestrator import KanbanOrchestrator
 from .store_markdown import MarkdownBoardStore
@@ -296,7 +297,7 @@ def _coerce_priority(value: str) -> CardPriority:
 
 def _coerce_status(value: str) -> CardStatus:
     try:
-        return CardStatus(value.lower())
+        return coerce_card_status(value)
     except ValueError as exc:
         raise ValueError(
             f"status must be one of {_VALID_STATUSES}, got {value!r}"
@@ -534,7 +535,7 @@ def build_server(ctx: ServerContext) -> FastMCP:
     @mcp.tool(
         description=(
             "List cards, optionally filtered by status "
-            "(inbox/ready/doing/review/verify/done/blocked)."
+            "(inbox/ready/doing/review/done/blocked)."
         )
     )
     def card_list(status: str | None = None) -> list[dict[str, Any]]:

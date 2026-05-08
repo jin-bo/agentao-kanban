@@ -115,8 +115,8 @@ def test_daemon_processes_cards_until_idle(tmp_path: Path):
     daemon.run()
 
     assert orch.store.get_card(card.id).status == CardStatus.DONE
-    # Four roles + one READY→DOING transition = processed ticks
-    assert daemon.ticks_processed >= 4
+    # Three active roles after review/verify were merged.
+    assert daemon.ticks_processed >= 3
 
 
 def test_daemon_does_not_process_blocked_cards(tmp_path: Path):
