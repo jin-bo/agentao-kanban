@@ -27,10 +27,17 @@ def test_single_client_prints_one_line(tmp_path: Path, capsys):
 def test_renders_uvx_when_not_in_source_checkout(tmp_path: Path, monkeypatch):
     # Point the package-root probe at a directory with no pyproject.toml so
     # the helper picks the installed-package branch even though the test
-    # itself runs against the editable checkout.
+    # itself runs against the editable checkout. The probe lives in
+    # ``kanban.cli.commands.misc`` and walks ``parent.parent.parent.parent``
+    # to reach the project root (``misc.py → commands → cli → kanban →
+    # project_root``), so we patch the misc module's ``__file__``.
+    from kanban.cli.commands import misc
+
+    monkeypatch.setattr(
+        misc, "__file__", str(tmp_path / "kanban" / "cli" / "commands" / "misc.py")
+    )
     from kanban import cli
 
-    monkeypatch.setattr(cli, "__file__", str(tmp_path / "pkg" / "cli.py"))
     claude, codex = cli._mcp_install_args("kanban", tmp_path)
     assert claude[:6] == ["claude", "mcp", "add", "kanban", "--", "uvx"]
     assert codex[:6] == ["codex", "mcp", "add", "kanban", "--", "uvx"]
