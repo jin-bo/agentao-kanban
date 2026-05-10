@@ -289,9 +289,17 @@ worktree_branch: str | None = None   # present on worktree.* events
 - 顶层 parser 增加 `--worktree / --no-worktree` flag
 - 当 `--worktree` 时，构造 `WorktreeManager` 并注入 orchestrator + daemon
 - 新增子命令：
-  - `kanban worktree list` — 列出活跃 worktree（包括已 detach 但分支存在的）
+  - `kanban worktree list` — 列出活跃 worktree（**仅** on-disk 目录；
+    detach 后只有分支的卡不在这里出现，应通过 `kanban result <card_id>` 查看）
   - `kanban worktree prune` — 手动触发过期分支清理
   - `kanban worktree diff <card_id>` — 使用持久化的 base_commit diff
+    （active 与 detached 都可用；后者读分支 tip vs base）
+
+> 用户视角：`kanban worktree …` 是排障层。日常"这张卡产出了什么"应该走
+> `kanban result <card_id>`——它把 card 状态、worktree 状态（`active`/
+> `detached`/`missing`/`none`）、artifact 快照路径、retained transcripts 与
+> 建议的下一步命令统一汇总。`kanban show <card_id>` 也会在 YAML/JSON 顶层
+> 注入同样字段的 `result:` 区块。
 
 ### 7. 事件类型
 - `worktree.created` — worktree 创建成功

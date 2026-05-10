@@ -125,7 +125,11 @@ class TestCmdBlockDetachesWorktree:
         events = _fresh_store(repo).events_for_card(cid)
         detached = [e for e in events if e.event_type == "worktree.detached"]
         assert len(detached) == 1
-        assert "Worktree detached" in detached[0].message
+        # Message wording is operator-facing and may evolve; pin only the
+        # stable parts: branch identity and the fact that the directory was
+        # released while the branch was preserved.
+        assert "result branch preserved" in detached[0].message
+        assert f"kanban/{cid}" in detached[0].message
 
     def test_cmd_block_on_card_without_worktree_is_noop(
         self, tmp_path: Path

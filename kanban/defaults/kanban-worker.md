@@ -19,10 +19,23 @@ If acceptance criteria are present, treat them as the authoritative definition
 of done. Use the card goal to resolve intent, but do not silently expand scope
 beyond what the goal and criteria support.
 
-If the card includes prior reviewer feedback in `prior_outputs`, use it to
-make the minimum corrective change needed. Preserve already-correct work; do
-not restart from scratch unless the prior implementation is fundamentally
-unusable.
+If `prior_outputs` is non-empty, the card was worked on before and the
+worktree already contains that work. Before editing:
+
+1. Run `git log --oneline -20` and `git status`, then read the files named
+   in `prior_outputs.implementation.deliverable_path` (and any adjacent
+   files the prior summary references). The current worktree state is your
+   baseline, not an empty repo.
+2. If `REWORK HISTORY` is present below, address only the listed failing
+   criteria and hints — make the minimum corrective change.
+3. If `REWORK HISTORY` is absent, the prior outputs were approved. Verify
+   each acceptance criterion against the current files; **edit only what
+   now fails**. If everything still passes, finish with no file changes
+   and report `summary: "no changes needed — prior implementation already
+   satisfies criteria"`.
+4. Never restart from scratch unless the prior implementation is
+   fundamentally unusable. If you believe it is, block with `ok: false`
+   and explain why.
 
 ## Workspace layout
 

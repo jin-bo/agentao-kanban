@@ -79,7 +79,8 @@ def detach_worktree_on_terminal(
             card_id,
             event_type="worktree.artifacts_saved",
             message=(
-                f"Worktree artifacts saved to {result.artifacts_path}"
+                f"Ignored deliverables saved to {result.artifacts_path} "
+                "(see `kanban result`)."
             ),
             worktree_branch=card.worktree_branch,
         )
@@ -87,7 +88,11 @@ def detach_worktree_on_terminal(
         store.append_runtime_event(
             card_id,
             event_type="worktree.detached",
-            message=f"Worktree detached: {card.worktree_branch}",
+            message=(
+                f"Worktree directory removed; result branch preserved: "
+                f"{card.worktree_branch}. Use `kanban result <card-id>` "
+                "or `kanban worktree diff <card-id>`."
+            ),
             worktree_branch=card.worktree_branch,
         )
     else:
@@ -95,8 +100,8 @@ def detach_worktree_on_terminal(
             card_id,
             event_type="worktree.detach_failed",
             message=(
-                f"Worktree detach aborted (uncommitted changes preserved): "
-                f"{card.worktree_branch}"
+                f"Worktree directory kept (uncommitted changes); branch "
+                f"{card.worktree_branch} not finalized."
             ),
             worktree_branch=card.worktree_branch,
         )
@@ -867,8 +872,9 @@ class KanbanOrchestrator:
                         failed_claim.card_id,
                         event_type="worktree.artifacts_saved",
                         message=(
-                            f"Worktree artifacts saved to "
-                            f"{detach_result.artifacts_path}"
+                            f"Ignored deliverables saved to "
+                            f"{detach_result.artifacts_path} "
+                            "(see `kanban result`)."
                         ),
                         worktree_branch=card_obj.worktree_branch,
                     )
@@ -876,7 +882,12 @@ class KanbanOrchestrator:
                     self.store.append_runtime_event(
                         failed_claim.card_id,
                         event_type="worktree.detached",
-                        message=f"Worktree detached: {card_obj.worktree_branch}",
+                        message=(
+                            f"Worktree directory removed; result branch "
+                            f"preserved: {card_obj.worktree_branch}. Use "
+                            "`kanban result <card-id>` or "
+                            "`kanban worktree diff <card-id>`."
+                        ),
                         worktree_branch=card_obj.worktree_branch,
                     )
                 else:
@@ -884,8 +895,8 @@ class KanbanOrchestrator:
                         failed_claim.card_id,
                         event_type="worktree.detach_failed",
                         message=(
-                            f"Worktree detach aborted (uncommitted changes preserved): "
-                            f"{card_obj.worktree_branch}"
+                            f"Worktree directory kept (uncommitted changes); "
+                            f"branch {card_obj.worktree_branch} not finalized."
                         ),
                         worktree_branch=card_obj.worktree_branch,
                     )
