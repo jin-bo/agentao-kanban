@@ -26,6 +26,8 @@ Design notes:
 
 from __future__ import annotations
 
+import os
+import stat as stat_mod
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from ipaddress import ip_address
@@ -33,7 +35,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import HTMLResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -41,6 +43,7 @@ from .daemon import daemon_status
 from .mcp import card_to_dict, event_to_dict
 from .models import AgentRole, Card, CardPriority, CardStatus
 from .store_markdown import MarkdownBoardStore
+from .worktree import ARTIFACT_DIR_NAME_RE
 
 
 # Fixed column order for the frontend. Mirrors CardStatus declaration order.
@@ -64,6 +67,99 @@ COLUMN_TITLES: dict[CardStatus, str] = {
 
 _VALID_ROLES = tuple(r.value for r in AgentRole)
 _VALID_STATUSES = tuple(s.value for s in CardStatus)
+
+# Cap inline file responses. 8 MiB is generous for logs/text but small
+# enough to keep the loopback server snappy and memory-bounded. Operators
+# who need bigger payloads can copy from disk — the listing endpoint
+# always advertises the exact byte size so the cap is observable.
+_ARTIFACT_FILE_MAX_BYTES = 8 * 1024 * 1024
+
+# Defensive cap on per-snapshot file enumeration. A pathological worker
+# emitting tens of thousands of tiny files would still respect the
+# byte cap upstream but could blow out the JSON payload and the DOM.
+# Truncated listings advertise ``truncated: true`` + ``total_file_count``
+# so the UI can hint the operator to copy from disk.
+_ARTIFACT_LISTING_MAX_FILES = 5000
+
+
+def _artifacts_root_for(board_dir: Path) -> Path:
+    """Conventional artifacts root for a given board.
+
+    ``WorktreeManager`` (driven from the CLI) writes snapshots under
+    ``<git_root>/workspace/raw``. With the standard ``kanban init``
+    layout the board lives at ``<git_root>/workspace/board``, so
+    ``board_dir.parent / "raw"`` resolves to the same directory. For
+    non-conventional layouts the directory simply won't exist and the
+    artifacts surface stays empty rather than 500ing.
+    """
+    return board_dir.parent / "raw"
+
+
+def _list_artifact_snapshots(
+    card_id: str, root: Path
+) -> list[dict[str, Any]]:
+    """Enumerate ``raw/<card_id>/artifacts-*`` snapshots, newest first.
+
+    Symlinks and non-regular files are skipped — the file-fetch route
+    won't serve them anyway, so listing them would only confuse the UI.
+    Listings are capped at ``_ARTIFACT_LISTING_MAX_FILES`` per snapshot;
+    when truncated the record carries ``truncated: True`` and the full
+    count is reported in ``total_file_count``.
+    """
+    card_dir = root / card_id
+    if not card_dir.is_dir():
+        return []
+    snapshots: list[dict[str, Any]] = []
+    for snap in sorted(card_dir.glob("artifacts-*"), reverse=True):
+        if not snap.is_dir() or not ARTIFACT_DIR_NAME_RE.match(snap.name):
+            continue
+        files: list[dict[str, Any]] = []
+        total_bytes = 0
+        total_count = 0
+        truncated = False
+        # ``os.walk`` with ``followlinks=False`` plus a single ``lstat``
+        # per entry is ~3× cheaper than the equivalent ``Path.rglob`` +
+        # ``is_symlink``/``is_file``/``stat`` chain on snapshots with
+        # many small files.
+        for dirpath, _dirnames, filenames in os.walk(snap, followlinks=False):
+            dpath = Path(dirpath)
+            for name in filenames:
+                full = dpath / name
+                try:
+                    st = full.lstat()
+                except OSError:
+                    continue
+                if not stat_mod.S_ISREG(st.st_mode):
+                    continue
+                total_count += 1
+                total_bytes += st.st_size
+                if len(files) >= _ARTIFACT_LISTING_MAX_FILES:
+                    truncated = True
+                    continue
+                try:
+                    rel = full.relative_to(snap)
+                except ValueError:
+                    continue
+                files.append({"path": str(rel), "size": st.st_size})
+        try:
+            created = datetime.fromtimestamp(
+                snap.stat().st_mtime, tz=timezone.utc
+            ).isoformat()
+        except OSError:
+            created = None
+        files.sort(key=lambda f: f["path"])
+        record: dict[str, Any] = {
+            "snapshot": snap.name,
+            "created_at": created,
+            "file_count": len(files),
+            "total_file_count": total_count,
+            "total_bytes": total_bytes,
+            "files": files,
+        }
+        if truncated:
+            record["truncated"] = True
+        snapshots.append(record)
+    return snapshots
 
 
 def _iso_now() -> str:
@@ -199,6 +295,14 @@ def create_app(
     def _store() -> MarkdownBoardStore:
         return MarkdownBoardStore(board_path)
 
+    def _get_card_or_404(store: MarkdownBoardStore, card_id: str) -> Card:
+        try:
+            return store.get_card(card_id)
+        except KeyError:
+            raise HTTPException(
+                status_code=404, detail=f"card {card_id} not found"
+            )
+
     @app.get("/healthz")
     def healthz() -> dict[str, Any]:
         return {
@@ -320,18 +424,86 @@ def create_app(
     @app.get("/api/cards/{card_id}")
     def api_card(card_id: str) -> dict[str, Any]:
         store = _store()
-        try:
-            card = store.get_card(card_id)
-        except KeyError:
-            raise HTTPException(
-                status_code=404, detail=f"card {card_id} not found"
-            )
+        card = _get_card_or_404(store, card_id)
         payload = card_to_dict(card)
         payload["recent_events"] = [
             _annotate_event(event_to_dict(e))
             for e in store.events_for_card(card.id)[-20:]
         ]
         return payload
+
+    @app.get("/api/cards/{card_id}/artifacts")
+    def api_list_artifacts(card_id: str) -> dict[str, Any]:
+        # Validate the card exists so a typo'd id surfaces as 404 instead
+        # of an empty list — matches /api/cards/{card_id}'s contract.
+        _get_card_or_404(_store(), card_id)
+        snapshots = _list_artifact_snapshots(
+            card_id, _artifacts_root_for(board_path)
+        )
+        return {"card_id": card_id, "snapshots": snapshots}
+
+    @app.get("/api/cards/{card_id}/artifacts/{snapshot}/file")
+    def api_artifact_file(
+        card_id: str,
+        snapshot: str,
+        path: str = Query(..., min_length=1, max_length=2048),
+    ):
+        # Cheap syntactic checks first — reject malformed/probing
+        # requests before we touch the store or the filesystem.
+        # FastAPI path segments don't span '/' so card_id can't contain
+        # one via routing; backslash and '..' can still arrive
+        # url-decoded.
+        if "\\" in card_id or ".." in card_id:
+            raise HTTPException(status_code=400, detail="invalid card id")
+        if not ARTIFACT_DIR_NAME_RE.match(snapshot):
+            raise HTTPException(status_code=400, detail="invalid snapshot id")
+        if path.startswith(("/", "\\")):
+            raise HTTPException(status_code=400, detail="path must be relative")
+        parts = path.replace("\\", "/").split("/")
+        if any(p in ("", "..") for p in parts):
+            raise HTTPException(status_code=400, detail="invalid path")
+
+        _get_card_or_404(_store(), card_id)
+
+        root = _artifacts_root_for(board_path).resolve()
+        snap_dir = (root / card_id / snapshot).resolve()
+        try:
+            snap_dir.relative_to(root)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="invalid snapshot path")
+        if not snap_dir.is_dir():
+            raise HTTPException(status_code=404, detail="snapshot not found")
+
+        unresolved = snap_dir / path
+        # Refuse symlink leaves: WorktreeManager preserves symlinks in
+        # snapshots but the web surface is a read-only browser, and
+        # following them would change the trust boundary.
+        if unresolved.is_symlink():
+            raise HTTPException(status_code=403, detail="symlinks not served")
+        target = unresolved.resolve()
+        try:
+            target.relative_to(snap_dir)
+        except ValueError:
+            # An intermediate symlink resolved out of the snapshot.
+            raise HTTPException(status_code=400, detail="path escapes snapshot")
+        try:
+            st = target.stat()
+        except FileNotFoundError:
+            raise HTTPException(status_code=404, detail="file not found")
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail=f"stat failed: {exc}")
+        if not stat_mod.S_ISREG(st.st_mode):
+            raise HTTPException(status_code=400, detail="not a regular file")
+        if st.st_size > _ARTIFACT_FILE_MAX_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    f"file is {st.st_size} bytes; the inline cap is "
+                    f"{_ARTIFACT_FILE_MAX_BYTES}. Copy directly from "
+                    f"{target}."
+                ),
+            )
+        return FileResponse(target, filename=target.name)
 
     @app.get("/api/events")
     def api_events(

@@ -6,6 +6,27 @@
 
 ## [Unreleased]
 
+### Added
+- **Web UI:Add Card 模态支持 `depends_on`**。新增"Depends on"区:
+  chip 列表 + 搜索框 + native `<datalist>` 自动补全,候选来自最近一次
+  `/api/board` 快照(过滤掉 DONE),按短 ID + 标题展示。输入接受全 UUID
+  或唯一短前缀,Enter / "+ Add" 按钮提交,× 移除。后端 `CardCreateRequest.depends_on`
+  自 0.1.6 就在,缺的只是前端入口——之前 web 上建出来的卡都没法挂依赖,
+  必须切到 CLI 的 `kanban card add --depends`。后端 happy-path 测试同步补齐。
+
+- **Web UI:Artifacts 面板**。卡片详情模态框新增 Artifacts 区,展示每张
+  卡 `workspace/raw/<card-id>/artifacts-<ts>/` 下被 `WorktreeManager.detach()`
+  抢救出来的 gitignored 产物——文件路径 + 大小,点击直接打开。新端点
+  `GET /api/cards/{card_id}/artifacts`(列出快照与文件)与
+  `GET /api/cards/{card_id}/artifacts/{snapshot}/file?path=...`(取单文件)。
+  路径校验:snapshot 名必须匹配 `artifacts-<utc-stamp>`,`path` 不允许
+  `..`/绝对路径/leading slash,leaf 是 symlink 直接 403,intermediate
+  symlink 跳出 snapshot 走 400。单文件响应上限 8 MiB,超过返回 413
+  并提示磁盘路径。读侧契约不变:不需要 `--enable-writes`。
+  - 0.1.6 引入 artifacts 抢救之后,events.log 里只有 `worktree.artifacts_saved`
+    一行事件,产物本身需要打开终端 `ls workspace/raw/...` 才能看到。这次让
+    web 直接可见,补齐了那次大改在 UI 上缺失的最后一截。
+
 ## [0.1.7] — 2026-05-07
 
 ### Added

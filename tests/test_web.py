@@ -238,6 +238,36 @@ def test_writes_reject_unknown_dependency(board: Path) -> None:
     assert "depends_on" in r.json()["detail"]
 
 
+def test_writes_accept_valid_dependency(board: Path) -> None:
+    """Happy path for the depends_on field — pins the wire shape the
+    Add Card modal sends through ``/api/cards``. Mirrors the negative
+    case above so regressions in the validation order land here.
+    """
+    store = MarkdownBoardStore(board)
+    parent = store.add_card(
+        Card(title="parent", goal="g", priority=CardPriority.MEDIUM)
+    )
+    client = TestClient(create_app(board, enable_writes=True))
+    r = client.post(
+        "/api/cards",
+        json={
+            "title": "child",
+            "goal": "g",
+            "depends_on": [parent.id],
+        },
+    )
+    assert r.status_code == 201, r.text
+    body = r.json()
+    assert body["title"] == "child"
+    assert body["depends_on"] == [parent.id]
+    # Re-open the store so we read what the server actually persisted —
+    # the original `store` instance caches in memory and won't see
+    # writes that landed via TestClient.
+    fresh = {c.id: c for c in MarkdownBoardStore(board).list_cards()}
+    assert fresh[body["id"]].depends_on == [parent.id]
+    assert fresh[parent.id].depends_on == []
+
+
 def test_writes_missing_title_returns_422(board: Path) -> None:
     # Pydantic-level validation (missing field) stays at 422 — we only
     # downgrade to 400 for semantic errors that pass the schema.

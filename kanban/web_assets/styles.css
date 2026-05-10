@@ -81,11 +81,11 @@ body {
 
 .layout {
   display: grid;
-  grid-template-columns: repeat(5, minmax(160px, 1fr));
+  grid-template-columns: repeat(4, minmax(160px, 1fr));
   grid-template-rows: 1fr 1fr;
   grid-template-areas:
-    "inbox   ready    doing    review  runtime"
-    "blocked done     done     done    events";
+    "inbox   ready   doing  runtime"
+    "blocked review  done   events";
   gap: 10px;
   padding: 14px;
   height: calc(100vh - 58px);
@@ -619,29 +619,21 @@ body {
   font-style: italic;
 }
 
-@media (max-width: 1400px) {
+@media (max-width: 1100px) {
+  /* Two columns × four rows. Pairs each active column with its
+     terminal/observer counterpart so the eye can still scan the
+     workflow vertically: inbox→ready→doing on the left, blocked→
+     review→done on the right, with the two panels at the bottom. */
   .layout {
-    grid-template-columns: repeat(3, minmax(180px, 1fr)) minmax(260px, 1fr);
-    grid-template-rows: repeat(3, minmax(220px, 1fr));
-    grid-template-areas:
-      "inbox   ready   doing   runtime"
-      "blocked review  done    runtime"
-      "blocked review  done    events";
-    height: auto;
-    min-height: calc(100vh - 58px);
-  }
-}
-
-@media (max-width: 1000px) {
-  .layout {
-    grid-template-columns: repeat(3, minmax(160px, 1fr));
+    grid-template-columns: repeat(2, minmax(220px, 1fr));
     grid-template-rows: repeat(4, minmax(220px, auto));
     grid-template-areas:
-      "inbox   ready   doing"
-      "blocked review  review"
-      "done    done    done"
-      "runtime runtime events";
+      "inbox    blocked"
+      "ready    review"
+      "doing    done"
+      "runtime  events";
     height: auto;
+    min-height: calc(100vh - 58px);
   }
   .column, .panel { overflow: visible; }
   .column-body { overflow: visible; }
@@ -662,4 +654,129 @@ body {
       "events";
     height: auto;
   }
+}
+
+.artifact-snap {
+  margin: 0.4em 0;
+  padding: 0.3em 0.5em;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.artifact-snap > summary {
+  cursor: pointer;
+  font-family: var(--mono);
+  font-size: 0.85em;
+  color: var(--text-dim);
+}
+
+.artifact-snap[open] > summary {
+  margin-bottom: 0.4em;
+  color: var(--text);
+}
+
+.artifact-files {
+  list-style: none;
+  margin: 0;
+  padding: 0 0 0 0.5em;
+}
+
+.artifact-files li {
+  display: flex;
+  justify-content: space-between;
+  gap: 1em;
+  padding: 0.15em 0;
+  font-family: var(--mono);
+  font-size: 0.85em;
+}
+
+.artifact-files a {
+  color: var(--accent);
+  text-decoration: none;
+  word-break: break-all;
+}
+
+.artifact-files a:hover {
+  text-decoration: underline;
+}
+
+.artifact-size {
+  color: var(--text-dim);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.artifact-truncated {
+  color: var(--text-dim);
+  font-style: italic;
+}
+
+.artifacts-error {
+  color: var(--danger);
+}
+
+.depends-chips {
+  list-style: none;
+  margin: 0.3em 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3em;
+}
+
+.depends-chips:empty {
+  display: none;
+}
+
+.depends-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3em;
+  padding: 0.15em 0.5em;
+  background: rgba(110, 168, 255, 0.15);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  font-family: var(--mono);
+  font-size: 0.8em;
+}
+
+.depends-remove {
+  background: none;
+  border: 0;
+  color: var(--text-dim);
+  cursor: pointer;
+  font-size: 1em;
+  line-height: 1;
+  padding: 0 0.1em;
+}
+
+.depends-remove:hover {
+  color: var(--danger);
+}
+
+.depends-row {
+  display: flex;
+  gap: 0.4em;
+  align-items: stretch;
+}
+
+.depends-row .depends-input {
+  flex: 1;
+  min-width: 0;
+}
+
+.depends-add {
+  flex-shrink: 0;
+  padding: 0.4em 0.8em;
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 3px;
+  cursor: pointer;
+  font-size: 0.85em;
+}
+
+.depends-add:hover {
+  background: rgba(110, 168, 255, 0.1);
 }

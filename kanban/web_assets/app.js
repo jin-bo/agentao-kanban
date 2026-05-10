@@ -21,6 +21,18 @@
   let detailModalBody = null;
   let detailKeydownHandler = null;
   let writesEnabled = false;
+  // Artifacts are fetched once per detail-modal open (not on every 5s
+  // tick) — listings can be large and don't change while the modal is
+  // open under any normal workflow.
+  let detailLastCard = null;
+  let detailArtifacts = null;
+  let detailArtifactsState = "idle"; // idle | loading | loaded | error
+  let detailArtifactsError = "";
+  // Tracks which artifact snapshots the user has expanded. The detail
+  // modal re-renders on every 5s tick, so without this state any
+  // <details> the user opened would collapse back to default.
+  const expandedSnapshots = new Set();
+  let lastBoardCards = [];
 
   function el(tag, attrs, children) {
     const node = document.createElement(tag);
@@ -68,6 +80,11 @@
   function renderBoard(data) {
     boardDirEl.textContent = data.board_dir || "";
     writesEnabled = !!data.writes_enabled;
+    // Excludes DONE cards because depending on a closed card is rarely
+    // intentional. The API still accepts them if a full id is pasted.
+    lastBoardCards = (data.columns || [])
+      .filter((c) => c.status !== "done")
+      .flatMap((c) => c.cards || []);
     for (const col of data.columns) {
       const slot = document.getElementById(`col-${col.status}`);
       if (!slot) continue;
@@ -134,6 +151,112 @@
       rows: "3",
       class: "add-input",
     });
+
+    // Match by full id or unique short-id prefix.
+    const selectedDeps = new Set();
+    const dependsListEl = el("ul", { class: "depends-chips" });
+    const dependsListId = "kanban-depends-options";
+    const dependsDatalist = el("datalist", { id: dependsListId });
+    const dependsInput = el("input", {
+      type: "text",
+      class: "add-input depends-input",
+      list: dependsListId,
+      placeholder: "Type title or paste card id, then Enter",
+      autocomplete: "off",
+    });
+    const dependsAddBtn = el(
+      "button",
+      { type: "button", class: "depends-add" },
+      "+ Add",
+    );
+
+    function refreshDependsOptions() {
+      const opts = lastBoardCards
+        .filter((c) => !selectedDeps.has(c.id))
+        .map((c) =>
+          el(
+            "option",
+            { value: c.id },
+            `${shortId(c.id)} — ${c.title || "(untitled)"} [${c.status}]`,
+          ),
+        );
+      dependsDatalist.replaceChildren(...opts);
+    }
+
+    function renderDepsChips() {
+      const chips = Array.from(selectedDeps).map((id) => {
+        const meta = lastBoardCards.find((c) => c.id === id);
+        const label = meta
+          ? `${shortId(id)} — ${meta.title || "(untitled)"}`
+          : shortId(id);
+        return el("li", { class: "depends-chip", dataset: { dep: id } }, [
+          el("span", {}, label),
+          el(
+            "button",
+            {
+              type: "button",
+              class: "depends-remove",
+              "aria-label": `Remove ${label}`,
+              onclick: () => {
+                selectedDeps.delete(id);
+                renderDepsChips();
+                refreshDependsOptions();
+              },
+            },
+            "×",
+          ),
+        ]);
+      });
+      dependsListEl.replaceChildren(...chips);
+    }
+
+    function tryAddDep() {
+      const raw = dependsInput.value.trim();
+      if (!raw) return;
+      let match = lastBoardCards.find((c) => c.id === raw);
+      if (!match) {
+        const prefixed = lastBoardCards.filter((c) => c.id.startsWith(raw));
+        if (prefixed.length === 1) match = prefixed[0];
+      }
+      if (!match) {
+        errorEl.textContent = `No card matches "${raw}" — pick from the autocomplete list, or paste a full id from \`kanban list\`.`;
+        return;
+      }
+      if (selectedDeps.has(match.id)) {
+        // Silent no-op for re-adds — chip already visible.
+        dependsInput.value = "";
+        return;
+      }
+      selectedDeps.add(match.id);
+      dependsInput.value = "";
+      errorEl.textContent = "";
+      renderDepsChips();
+      refreshDependsOptions();
+    }
+
+    dependsInput.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter") {
+        // Stop the form's submit handler from firing on Enter inside
+        // the depends search box.
+        ev.preventDefault();
+        tryAddDep();
+      }
+    });
+    dependsInput.addEventListener("change", () => {
+      // Datalist selection lands as a "change" event with value=full
+      // uuid. Auto-add so the user doesn't also have to click "+ Add".
+      const v = dependsInput.value.trim();
+      if (v && lastBoardCards.some((c) => c.id === v)) {
+        tryAddDep();
+      }
+    });
+    dependsAddBtn.addEventListener("click", tryAddDep);
+
+    const dependsRow = el("div", { class: "depends-row" }, [
+      dependsInput,
+      dependsAddBtn,
+    ]);
+
     const errorEl = el("div", { class: "add-error", role: "alert" });
     const submitBtn = el(
       "button",
@@ -159,6 +282,10 @@
         goalInput,
         el("label", { class: "add-label" }, "Acceptance criteria"),
         acceptanceInput,
+        el("label", { class: "add-label" }, "Depends on (optional)"),
+        dependsListEl,
+        dependsRow,
+        dependsDatalist,
         errorEl,
         el("div", { class: "add-actions" }, [cancelBtn, submitBtn]),
       ],
@@ -185,6 +312,10 @@
       goalInput.value = "";
       prioritySelect.value = "MEDIUM";
       acceptanceInput.value = "";
+      dependsInput.value = "";
+      selectedDeps.clear();
+      renderDepsChips();
+      refreshDependsOptions();
       errorEl.textContent = "";
     }
 
@@ -203,6 +334,7 @@
         .split("\n")
         .map((s) => s.trim())
         .filter(Boolean);
+      const dependsOn = Array.from(selectedDeps);
       submitBtn.disabled = true;
       submitBtn.textContent = "Creating…";
       try {
@@ -217,6 +349,7 @@
             goal: goalInput.value.trim(),
             priority: prioritySelect.value,
             acceptance_criteria: acceptance,
+            depends_on: dependsOn,
           }),
         });
         if (!r.ok) {
@@ -244,6 +377,7 @@
 
     backdrop._reset = reset;
     backdrop._titleInput = titleInput;
+    backdrop._refreshDeps = refreshDependsOptions;
     addCardModal = backdrop;
     document.body.appendChild(addCardModal);
     return addCardModal;
@@ -252,6 +386,10 @@
   function openAddCardModal() {
     const modal = ensureAddCardModal();
     modal.classList.remove("hidden");
+    // Repopulate the depends_on dropdown from the latest tick — cards
+    // created since the modal was last opened should show up without
+    // a manual reload.
+    if (modal._refreshDeps) modal._refreshDeps();
     // Defer focus so the show transition doesn't fight the cursor.
     setTimeout(() => modal._titleInput.focus(), 0);
     if (!addCardKeydownHandler) {
@@ -574,7 +712,129 @@
       );
     }
 
+    sections.push(renderArtifactsSection(card.id));
+
     detailModalBody.replaceChildren(head, ...sections);
+  }
+
+  function fmtBytes(n) {
+    if (!Number.isFinite(n) || n < 0) return "?";
+    if (n < 1024) return `${n} B`;
+    if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KiB`;
+    if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MiB`;
+    return `${(n / 1024 / 1024 / 1024).toFixed(2)} GiB`;
+  }
+
+  function renderArtifactsSection(cardId) {
+    const wrap = el("div", { class: "card-detail-section" }, [
+      el("h3", {}, "Artifacts"),
+    ]);
+    if (detailArtifactsState === "loading") {
+      wrap.appendChild(el("p", { class: "hint" }, "Loading…"));
+      return wrap;
+    }
+    if (detailArtifactsState === "error") {
+      wrap.appendChild(
+        el(
+          "p",
+          { class: "hint artifacts-error" },
+          `Failed to load: ${detailArtifactsError}`,
+        ),
+      );
+      return wrap;
+    }
+    if (
+      detailArtifactsState !== "loaded" ||
+      !detailArtifacts ||
+      !detailArtifacts.snapshots ||
+      detailArtifacts.snapshots.length === 0
+    ) {
+      wrap.appendChild(
+        el(
+          "p",
+          { class: "hint" },
+          "(none — gitignored worker output is captured here when a worktree is detached)",
+        ),
+      );
+      return wrap;
+    }
+    for (const snap of detailArtifacts.snapshots) {
+      const fileCountLabel =
+        snap.truncated && snap.total_file_count
+          ? `${snap.file_count} of ${snap.total_file_count} files`
+          : `${snap.file_count} file${snap.file_count === 1 ? "" : "s"}`;
+      const summary = el(
+        "summary",
+        {},
+        `${snap.snapshot} · ${fileCountLabel} · ${fmtBytes(snap.total_bytes)}`,
+      );
+      const list = el("ul", { class: "artifact-files" });
+      for (const f of snap.files) {
+        const href = `/api/cards/${encodeURIComponent(cardId)}/artifacts/${encodeURIComponent(snap.snapshot)}/file?path=${encodeURIComponent(f.path)}`;
+        list.appendChild(
+          el("li", {}, [
+            el(
+              "a",
+              { href, target: "_blank", rel: "noopener" },
+              f.path,
+            ),
+            el("span", { class: "artifact-size" }, fmtBytes(f.size)),
+          ]),
+        );
+      }
+      if (snap.truncated) {
+        list.appendChild(
+          el(
+            "li",
+            { class: "artifact-truncated" },
+            `(${snap.total_file_count - snap.file_count} more files not shown — copy from disk)`,
+          ),
+        );
+      }
+      const isOpen = expandedSnapshots.has(snap.snapshot);
+      const det = el(
+        "details",
+        isOpen
+          ? { open: "open", class: "artifact-snap" }
+          : { class: "artifact-snap" },
+        [summary, list],
+      );
+      det.addEventListener("toggle", () => {
+        if (det.open) expandedSnapshots.add(snap.snapshot);
+        else expandedSnapshots.delete(snap.snapshot);
+      });
+      wrap.appendChild(det);
+    }
+    return wrap;
+  }
+
+  async function loadArtifacts(id) {
+    detailArtifactsState = "loading";
+    detailArtifactsError = "";
+    detailArtifacts = null;
+    if (selectedCardId === id && detailLastCard) {
+      renderDetailInto(detailLastCard);
+    }
+    try {
+      const data = await fetchJSON(
+        `/api/cards/${encodeURIComponent(id)}/artifacts`,
+      );
+      if (selectedCardId !== id) return;
+      detailArtifacts = data;
+      detailArtifactsState = "loaded";
+      // Default: expand the newest snapshot once after the listing
+      // lands. After that expandedSnapshots is owned by the user's
+      // toggle events.
+      const snaps = data && data.snapshots;
+      if (snaps && snaps.length) expandedSnapshots.add(snaps[0].snapshot);
+    } catch (err) {
+      if (selectedCardId !== id) return;
+      detailArtifactsState = "error";
+      detailArtifactsError = err.message;
+    }
+    if (selectedCardId === id && detailLastCard) {
+      renderDetailInto(detailLastCard);
+    }
   }
 
   async function fetchJSON(url) {
@@ -595,6 +855,7 @@
       // Guard against late responses arriving after the user closed the
       // modal or navigated to a different card.
       if (selectedCardId !== card.id) return;
+      detailLastCard = card;
       renderDetailInto(card);
     } catch (err) {
       if (!detailModalBody) return;
@@ -610,6 +871,11 @@
 
   function openDetailModal(id) {
     selectedCardId = id;
+    detailLastCard = null;
+    detailArtifacts = null;
+    detailArtifactsState = "loading";
+    detailArtifactsError = "";
+    expandedSnapshots.clear();
     const modal = ensureDetailModal();
     modal.classList.remove("hidden");
     if (!detailKeydownHandler) {
@@ -621,10 +887,15 @@
     // Show "Loading…" until the per-card fetch lands.
     renderDetailInto(null);
     refreshDetail();
+    loadArtifacts(id);
   }
 
   function closeDetailModal() {
     selectedCardId = null;
+    detailLastCard = null;
+    detailArtifacts = null;
+    detailArtifactsState = "idle";
+    detailArtifactsError = "";
     if (detailModal) detailModal.classList.add("hidden");
     if (detailKeydownHandler) {
       document.removeEventListener("keydown", detailKeydownHandler);

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass, field
@@ -23,6 +24,12 @@ BRANCH_PREFIX = "kanban/"
 DEFAULT_ARTIFACTS_RETENTION = 5
 DEFAULT_ARTIFACTS_MAX_BYTES = 500 * 1024 * 1024  # 500 MiB
 ARTIFACTS_MAX_BYTES_ENV = "KANBAN_ARTIFACTS_MAX_BYTES"
+
+# Pattern for snapshot directory names emitted by ``_save_artifacts``
+# (``f"artifacts-{strftime('%Y%m%dT%H%M%S%fZ')}"``). Lives next to the
+# writer so the format stays a single source of truth — readers (e.g.
+# ``kanban.web``) import this rather than re-deriving the pattern.
+ARTIFACT_DIR_NAME_RE = re.compile(r"^artifacts-\d{8}T\d{6}\d+Z$")
 # Path components or path suffixes that almost always represent build
 # caches / dependency stores rather than worker deliverables. Skipping
 # them keeps the snapshot focused on real outputs and (importantly)
