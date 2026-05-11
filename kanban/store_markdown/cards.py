@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import tomllib
 from dataclasses import fields
-from datetime import datetime, timezone as _tz
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -17,7 +17,6 @@ from ..models import (
 )
 from .toml_dump import _dump_toml
 
-_UTC = _tz.utc
 _LOG = logging.getLogger(__name__)
 
 FRONT_MATTER_DELIM = "+++"
@@ -173,7 +172,7 @@ def _coerce_revision_requests(
             if not isinstance(at, datetime):
                 raise ValueError(f"bad at: {at!r}")
             if at.tzinfo is None:
-                at = at.replace(tzinfo=_UTC)
+                at = at.replace(tzinfo=UTC)
             from_role = AgentRole(str(item["from_role"]))
             out.append(
                 RevisionRequest(

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import datetime, timezone as _tz
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -17,8 +17,6 @@ from ..models import (
     WorkerPresence,
     coerce_card_status,
 )
-
-_UTC = _tz.utc
 
 
 def _atomic_write_json(path: Path, data: dict[str, Any]) -> None:
@@ -39,7 +37,7 @@ def _iso(dt: datetime) -> str:
 def _parse_iso(raw: Any) -> datetime:
     dt = datetime.fromisoformat(str(raw))
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=_UTC)
+        dt = dt.replace(tzinfo=UTC)
     return dt
 
 

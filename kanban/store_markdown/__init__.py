@@ -5,8 +5,7 @@ import logging
 import os
 import tomllib
 from collections import defaultdict
-from datetime import datetime, timezone as _tz
-_UTC = _tz.utc
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -15,7 +14,6 @@ from ..models import (
     AgentRole,
     Card,
     CardEvent,
-    CardPriority,
     CardStatus,
     ClaimConflictError,
     ClaimMismatchError,
@@ -24,7 +22,6 @@ from ..models import (
     ExecutionResultEnvelope,
     FailureCategory,
     ResourceUsage,
-    RevisionRequest,
     TraceInfo,
     WorkerPresence,
     coerce_card_status,
@@ -336,10 +333,10 @@ class MarkdownBoardStore:
             stamp_str = stamp_with_ext[:-3]
             try:
                 at = datetime.strptime(stamp_str, "%Y%m%dT%H%M%S%fZ").replace(
-                    tzinfo=_UTC
+                    tzinfo=UTC
                 )
             except ValueError:
-                at = datetime.fromtimestamp(path.stat().st_mtime, tz=_UTC)
+                at = datetime.fromtimestamp(path.stat().st_mtime, tz=UTC)
             traces.append(
                 TraceInfo(
                     card_id=card_id,
