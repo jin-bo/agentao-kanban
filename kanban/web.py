@@ -26,8 +26,6 @@ Design notes:
 
 from __future__ import annotations
 
-import os
-import stat as stat_mod
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from ipaddress import ip_address
@@ -35,7 +33,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import FileResponse, HTMLResponse, Response
+from fastapi.responses import HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -46,6 +44,21 @@ from .models import AgentRole, Card, CardPriority, CardStatus
 from .result import summarize_card_result, worktree_state
 from .store_markdown import MarkdownBoardStore
 from .worktree import ARTIFACT_DIR_NAME_RE, WorktreeDiffError, WorktreeManager
+from .web_artifacts import (
+    ARTIFACT_FILE_MAX_BYTES,
+    artifacts_root_for,
+    list_artifact_snapshots,
+    serve_file_under_root,
+)
+from .web_serializers import (
+    annotate_event,
+    card_summary,
+    claim_to_dict,
+    display_path,
+    display_path_map,
+    priority_rank,
+    worker_to_dict,
+)
 
 
 # Fixed column order for the frontend. Mirrors CardStatus declaration order.
@@ -70,19 +83,6 @@ COLUMN_TITLES: dict[CardStatus, str] = {
 _VALID_ROLES = tuple(r.value for r in AgentRole)
 _VALID_STATUSES = tuple(s.value for s in CardStatus)
 
-# Cap inline file responses. 8 MiB is generous for logs/text but small
-# enough to keep the loopback server snappy and memory-bounded. Operators
-# who need bigger payloads can copy from disk — the listing endpoint
-# always advertises the exact byte size so the cap is observable.
-_ARTIFACT_FILE_MAX_BYTES = 8 * 1024 * 1024
-
-# Defensive cap on per-snapshot file enumeration. A pathological worker
-# emitting tens of thousands of tiny files would still respect the
-# byte cap upstream but could blow out the JSON payload and the DOM.
-# Truncated listings advertise ``truncated: true`` + ``total_file_count``
-# so the UI can hint the operator to copy from disk.
-_ARTIFACT_LISTING_MAX_FILES = 5000
-
 # Cap on the inline ``git diff --stat`` body the /diff route returns.
 # ``--stat`` is one line per changed file, so 1 MiB is already an
 # enormous changeset; past that the response is truncated and flagged so
@@ -106,232 +106,15 @@ _DIFF_STATE_MESSAGES = {
     ),
 }
 
-
-def _artifacts_root_for(board_dir: Path) -> Path:
-    """Conventional artifacts root for a given board.
-
-    ``WorktreeManager`` (driven from the CLI) writes snapshots under
-    ``<git_root>/workspace/raw``. With the standard ``kanban init``
-    layout the board lives at ``<git_root>/workspace/board``, so
-    ``board_dir.parent / "raw"`` resolves to the same directory. For
-    non-conventional layouts the directory simply won't exist and the
-    artifacts surface stays empty rather than 500ing.
-    """
-    return board_dir.parent / "raw"
-
-
-def _list_artifact_snapshots(
-    card_id: str, root: Path
-) -> list[dict[str, Any]]:
-    """Enumerate ``raw/<card_id>/artifacts-*`` snapshots, newest first.
-
-    Symlinks and non-regular files are skipped — the file-fetch route
-    won't serve them anyway, so listing them would only confuse the UI.
-    Listings are capped at ``_ARTIFACT_LISTING_MAX_FILES`` per snapshot;
-    when truncated the record carries ``truncated: True`` and the full
-    count is reported in ``total_file_count``.
-    """
-    card_dir = root / card_id
-    if not card_dir.is_dir():
-        return []
-    snapshots: list[dict[str, Any]] = []
-    for snap in sorted(card_dir.glob("artifacts-*"), reverse=True):
-        if not snap.is_dir() or not ARTIFACT_DIR_NAME_RE.match(snap.name):
-            continue
-        files: list[dict[str, Any]] = []
-        total_bytes = 0
-        total_count = 0
-        truncated = False
-        # ``os.walk`` with ``followlinks=False`` plus a single ``lstat``
-        # per entry is ~3× cheaper than the equivalent ``Path.rglob`` +
-        # ``is_symlink``/``is_file``/``stat`` chain on snapshots with
-        # many small files.
-        for dirpath, _dirnames, filenames in os.walk(snap, followlinks=False):
-            dpath = Path(dirpath)
-            for name in filenames:
-                full = dpath / name
-                try:
-                    st = full.lstat()
-                except OSError:
-                    continue
-                if not stat_mod.S_ISREG(st.st_mode):
-                    continue
-                total_count += 1
-                total_bytes += st.st_size
-                if len(files) >= _ARTIFACT_LISTING_MAX_FILES:
-                    truncated = True
-                    continue
-                try:
-                    rel = full.relative_to(snap)
-                except ValueError:
-                    continue
-                files.append({"path": str(rel), "size": st.st_size})
-        try:
-            created = datetime.fromtimestamp(
-                snap.stat().st_mtime, tz=timezone.utc
-            ).isoformat()
-        except OSError:
-            created = None
-        files.sort(key=lambda f: f["path"])
-        record: dict[str, Any] = {
-            "snapshot": snap.name,
-            # Absolute on-disk path so the UI can offer a "copy path"
-            # affordance (this is a local/intranet tool; `kanban result`
-            # already prints these paths).
-            "abs_path": str(snap.resolve()),
-            "created_at": created,
-            "file_count": len(files),
-            "total_file_count": total_count,
-            "total_bytes": total_bytes,
-            "files": files,
-        }
-        if truncated:
-            record["truncated"] = True
-        snapshots.append(record)
-    return snapshots
-
-
-def _serve_file_under_root(
-    unresolved: Path,
-    root: Path,
-    *,
-    media_type: str | None = None,
-    inline: bool = False,
-) -> FileResponse:
-    """Serve ``unresolved`` as a file response after checking it's a
-    regular file that lives under ``root``.
-
-    Shared by the artifact-file and transcript-file routes — both are
-    read-only browsers over directories that may contain symlinks, so the
-    leaf must not be a symlink and must not resolve out of ``root`` (an
-    intermediate symlink would). ``root`` must already be ``.resolve()``-d
-    by the caller. ``inline`` flips the ``Content-Disposition`` so the
-    browser renders the file in a tab instead of downloading it.
-    """
-    if unresolved.is_symlink():
-        raise HTTPException(status_code=403, detail="symlinks not served")
-    target = unresolved.resolve()
-    try:
-        target.relative_to(root)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="path escapes the served directory")
-    try:
-        st = target.stat()
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="file not found")
-    except OSError as exc:
-        raise HTTPException(status_code=500, detail=f"stat failed: {exc}")
-    if not stat_mod.S_ISREG(st.st_mode):
-        raise HTTPException(status_code=400, detail="not a regular file")
-    if st.st_size > _ARTIFACT_FILE_MAX_BYTES:
-        raise HTTPException(
-            status_code=413,
-            detail=(
-                f"file is {st.st_size} bytes; the inline cap is "
-                f"{_ARTIFACT_FILE_MAX_BYTES}. Copy directly from {target}."
-            ),
-        )
-    kwargs: dict[str, Any] = {"filename": target.name}
-    if media_type is not None:
-        kwargs["media_type"] = media_type
-    if inline:
-        kwargs["content_disposition_type"] = "inline"
-    return FileResponse(target, **kwargs)
-
-
-def _display_path(abs_path: str, *, board_dir: Path, git_root: Path | None) -> str:
-    """A human-friendly relative rendering of an absolute result path.
-
-    Tries the Git root first (so the standard layout yields
-    ``workspace/raw/<card>/...``), then the board's parent (yielding
-    ``raw/<card>/...`` for boards outside a repo). Falls back to the
-    absolute path if it lives under neither — callers should treat this
-    purely as a display aid, never as something to join against a root.
-    """
-    p = Path(abs_path)
-    roots = [board_dir.parent]
-    if git_root is not None:
-        roots.insert(0, git_root)
-    for root in roots:
-        try:
-            return str(p.relative_to(root))
-        except ValueError:
-            continue
-    return abs_path
-
-
-def _display_path_map(
-    abs_paths: list[str], *, board_dir: Path, git_root: Path | None
-) -> dict[str, str]:
-    return {
-        a: _display_path(a, board_dir=board_dir, git_root=git_root)
-        for a in abs_paths
-    }
+# Backward-compatible private names used by the current tests and by any
+# local scripts that reached into ``kanban.web`` before the helpers moved.
+_ARTIFACT_FILE_MAX_BYTES = ARTIFACT_FILE_MAX_BYTES
+_artifacts_root_for = artifacts_root_for
+_list_artifact_snapshots = list_artifact_snapshots
 
 
 def _iso_now() -> str:
     return datetime.now(timezone.utc).isoformat()
-
-
-def _card_summary(card_dict: dict[str, Any]) -> dict[str, Any]:
-    """Slim board-column record.
-
-    The card detail endpoint uses the full ``card_to_dict``; the board
-    snapshot only needs the fields the column renders, which keeps the
-    payload small on boards with many DONE cards.
-    """
-    keys = (
-        "id",
-        "title",
-        "status",
-        "priority",
-        "owner_role",
-        "blocked_reason",
-        "updated_at",
-        "created_at",
-        "depends_on",
-        "rework_iteration",
-        "agent_profile",
-    )
-    return {k: card_dict.get(k) for k in keys}
-
-
-def _claim_to_dict(claim) -> dict[str, Any]:
-    return {
-        "card_id": claim.card_id,
-        "claim_id": claim.claim_id,
-        "role": claim.role.value,
-        "status_at_claim": claim.status_at_claim.value,
-        "attempt": claim.attempt,
-        "worker_id": claim.worker_id,
-        "claimed_at": claim.claimed_at.isoformat(),
-        "lease_expires_at": claim.lease_expires_at.isoformat(),
-        "heartbeat_at": claim.heartbeat_at.isoformat(),
-    }
-
-
-def _worker_to_dict(worker) -> dict[str, Any]:
-    return {
-        "worker_id": worker.worker_id,
-        "pid": worker.pid,
-        "host": worker.host,
-        "started_at": worker.started_at.isoformat(),
-        "heartbeat_at": worker.heartbeat_at.isoformat(),
-    }
-
-
-def _display_tag(event_dict: dict[str, Any]) -> str:
-    """Short label for event coloring in the UI."""
-    if event_dict.get("event_type"):
-        return str(event_dict["event_type"])
-    if event_dict.get("role"):
-        return str(event_dict["role"])
-    return "info"
-
-
-def _annotate_event(event_dict: dict[str, Any]) -> dict[str, Any]:
-    event_dict["display_tag"] = _display_tag(event_dict)
-    return event_dict
 
 
 def _assets_dir() -> Path:
@@ -430,7 +213,7 @@ def create_app(
                 # Defensive: unknown status values would be dropped. In
                 # practice ``CardStatus`` is exhaustive on the store side.
                 continue
-            by_status[card.status].append(_card_summary(card_to_dict(card)))
+            by_status[card.status].append(card_summary(card_to_dict(card)))
         columns = []
         for status in COLUMN_ORDER:
             cards = by_status[status]
@@ -439,7 +222,7 @@ def create_app(
             # order matches ``kanban list``.
             cards.sort(
                 key=lambda c: (
-                    -_priority_rank(c.get("priority")),
+                    -priority_rank(c.get("priority")),
                     c.get("created_at") or "",
                 )
             )
@@ -452,12 +235,12 @@ def create_app(
                 }
             )
         recent = [
-            _annotate_event(event_to_dict(e))
+            annotate_event(event_to_dict(e))
             for e in store.list_events(limit=20)
         ]
         runtime = {
-            "claims": [_claim_to_dict(c) for c in store.list_claims()],
-            "workers": [_worker_to_dict(w) for w in store.list_workers()],
+            "claims": [claim_to_dict(c) for c in store.list_claims()],
+            "workers": [worker_to_dict(w) for w in store.list_workers()],
         }
         return {
             "generated_at": _iso_now(),
@@ -534,7 +317,7 @@ def create_app(
         card = _get_card_or_404(store, card_id)
         payload = card_to_dict(card)
         payload["recent_events"] = [
-            _annotate_event(event_to_dict(e))
+            annotate_event(event_to_dict(e))
             for e in store.events_for_card(card.id)[-20:]
         ]
         return payload
@@ -561,10 +344,10 @@ def create_app(
             if (artifacts or transcripts)
             else None
         )
-        payload["artifact_display_paths"] = _display_path_map(
+        payload["artifact_display_paths"] = display_path_map(
             artifacts, board_dir=board_path, git_root=git_root
         )
-        payload["transcript_display_paths"] = _display_path_map(
+        payload["transcript_display_paths"] = display_path_map(
             transcripts, board_dir=board_path, git_root=git_root
         )
         return payload
@@ -642,7 +425,7 @@ def create_app(
                     "role": t.role.value,
                     "at": t.at.isoformat(),
                     "path": t.path,
-                    "display_path": _display_path(
+                    "display_path": display_path(
                         t.path, board_dir=board_path, git_root=git_root
                     ),
                     "size": t.size,
@@ -670,7 +453,7 @@ def create_app(
             raise HTTPException(status_code=404, detail="trace not found")
         # text/plain + inline so "open in new tab" renders the transcript
         # in the browser instead of triggering a download.
-        return _serve_file_under_root(
+        return serve_file_under_root(
             Path(match.path),
             (store.raw_root / card_id).resolve(),
             media_type="text/plain; charset=utf-8",
@@ -682,8 +465,8 @@ def create_app(
         # Validate the card exists so a typo'd id surfaces as 404 instead
         # of an empty list — matches /api/cards/{card_id}'s contract.
         _get_card_or_404(_store(), card_id)
-        snapshots = _list_artifact_snapshots(
-            card_id, _artifacts_root_for(board_path)
+        snapshots = list_artifact_snapshots(
+            card_id, artifacts_root_for(board_path)
         )
         return {"card_id": card_id, "snapshots": snapshots}
 
@@ -710,7 +493,7 @@ def create_app(
 
         _get_card_or_404(_store(), card_id)
 
-        root = _artifacts_root_for(board_path).resolve()
+        root = artifacts_root_for(board_path).resolve()
         snap_dir = (root / card_id / snapshot).resolve()
         try:
             snap_dir.relative_to(root)
@@ -719,7 +502,7 @@ def create_app(
         if not snap_dir.is_dir():
             raise HTTPException(status_code=404, detail="snapshot not found")
 
-        return _serve_file_under_root(snap_dir / path, snap_dir)
+        return serve_file_under_root(snap_dir / path, snap_dir)
 
     @app.get("/api/events")
     def api_events(
@@ -753,7 +536,7 @@ def create_app(
         return {
             "generated_at": _iso_now(),
             "count": len(events),
-            "events": [_annotate_event(event_to_dict(e)) for e in events],
+            "events": [annotate_event(event_to_dict(e)) for e in events],
         }
 
     @app.get("/", response_class=HTMLResponse)
@@ -771,15 +554,6 @@ def create_app(
     )
 
     return app
-
-
-_PRIORITY_RANK = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1}
-
-
-def _priority_rank(name: str | None) -> int:
-    if name is None:
-        return 0
-    return _PRIORITY_RANK.get(name.upper(), 0)
 
 
 def _is_loopback_host(host: str) -> bool:
