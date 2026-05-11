@@ -175,6 +175,10 @@ def _list_artifact_snapshots(
         files.sort(key=lambda f: f["path"])
         record: dict[str, Any] = {
             "snapshot": snap.name,
+            # Absolute on-disk path so the UI can offer a "copy path"
+            # affordance (this is a local/intranet tool; `kanban result`
+            # already prints these paths).
+            "abs_path": str(snap.resolve()),
             "created_at": created,
             "file_count": len(files),
             "total_file_count": total_count,

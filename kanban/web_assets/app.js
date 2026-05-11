@@ -48,6 +48,13 @@
   // modal re-renders on every 5s tick, so without this state any
   // <details> the user opened would collapse back to default.
   const expandedSnapshots = new Set();
+  // Artifact browser polish: a client-side filename filter, plus inline
+  // previews — an open set + a content cache, both keyed by
+  // `${snapshot}\0${path}` so they survive the 5s detail re-render the
+  // same way expandedSnapshots does.
+  let artifactFilter = "";
+  const expandedPreviews = new Set();
+  const previewCache = new Map();
   let lastBoardCards = [];
 
   function el(tag, attrs, children) {
@@ -909,6 +916,94 @@
     return `${(n / 1024 / 1024 / 1024).toFixed(2)} GiB`;
   }
 
+  // Inline-preview ceilings: don't even offer "preview" for files bigger
+  // than this (open-in-tab still works), and clamp the rendered text so a
+  // big log doesn't bloat the DOM.
+  const ARTIFACT_PREVIEW_MAX_BYTES = 256 * 1024;
+  const ARTIFACT_PREVIEW_MAX_CHARS = 64 * 1024;
+
+  function fileKind(path) {
+    const m = /\.([a-z0-9_]+)$/i.exec(path);
+    const ext = m ? m[1].toLowerCase() : "";
+    if (["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "ico"].includes(ext))
+      return "image";
+    if (ext === "json" || ext === "jsonl") return "json";
+    if (
+      ["log", "txt", "md", "csv", "tsv", "yaml", "yml", "ini", "cfg", "conf", "toml", "env", "rst"].includes(ext)
+    )
+      return "text";
+    if (
+      ["py", "js", "ts", "tsx", "jsx", "sh", "bash", "zsh", "rb", "go", "rs", "c", "h", "cpp", "hpp", "java", "kt", "html", "css", "scss", "sql", "xml", "lua", "php"].includes(ext)
+    )
+      return "code";
+    if (ext === "") return "file";
+    return "binary";
+  }
+
+  function isPreviewableKind(kind) {
+    return kind === "text" || kind === "json" || kind === "code";
+  }
+
+  function previewKey(snapshot, path) {
+    // Just an opaque Set/Map key; the path is also stashed on the row's
+    // `data-path` so the filter never has to parse this back apart.
+    return snapshot + "|" + path;
+  }
+
+  function artifactPathMatches(path) {
+    const f = artifactFilter.trim().toLowerCase();
+    return !f || String(path).toLowerCase().includes(f);
+  }
+
+  async function loadPreview(cardId, snapshot, path) {
+    const key = previewKey(snapshot, path);
+    previewCache.set(key, { state: "loading" });
+    if (selectedCardId === cardId && detailLastCard) renderDetailInto(detailLastCard);
+    const url = `/api/cards/${encodeURIComponent(cardId)}/artifacts/${encodeURIComponent(snapshot)}/file?path=${encodeURIComponent(path)}`;
+    try {
+      const resp = await fetch(url);
+      if (!resp.ok) {
+        let detail = "";
+        try {
+          detail = (await resp.json()).detail || "";
+        } catch (_e) {
+          /* non-JSON error body */
+        }
+        previewCache.set(key, { state: "error", error: detail || `HTTP ${resp.status}` });
+      } else {
+        let text = await resp.text();
+        let truncated = false;
+        if (text.length > ARTIFACT_PREVIEW_MAX_CHARS) {
+          text = text.slice(0, ARTIFACT_PREVIEW_MAX_CHARS);
+          truncated = true;
+        }
+        previewCache.set(key, { state: "loaded", text, truncated });
+      }
+    } catch (err) {
+      previewCache.set(key, { state: "error", error: err.message });
+    }
+    if (selectedCardId === cardId && detailLastCard) renderDetailInto(detailLastCard);
+  }
+
+  function renderPreviewBlock(key, path) {
+    const ds = { path };
+    const entry = previewCache.get(key) || { state: "loading" };
+    if (entry.state === "loading")
+      return el("li", { class: "artifact-preview-li", dataset: ds }, [
+        el("pre", { class: "artifact-preview" }, "Loading…"),
+      ]);
+    if (entry.state === "error")
+      return el("li", { class: "artifact-preview-li", dataset: ds }, [
+        el("pre", { class: "artifact-preview artifacts-error" }, entry.error || "Failed to load"),
+      ]);
+    const children = [el("pre", { class: "artifact-preview" }, entry.text || "")];
+    if (entry.truncated)
+      children.push(
+        el("div", { class: "hint artifact-truncated" }, "(preview truncated — open in a new tab for the full file)"),
+      );
+    return el("li", { class: "artifact-preview-li", dataset: ds }, children);
+  }
+
   function renderArtifactsSection(cardId) {
     const wrap = el("div", {
       class: "card-detail-section",
@@ -947,29 +1042,103 @@
       );
       return wrap;
     }
+    // Filename filter. Typing toggles `hidden` on rows in place (no full
+    // re-render → no focus loss); the value rides in `artifactFilter` so
+    // it survives the 5s detail tick, where rows are re-rendered with the
+    // right initial `hidden` state.
+    const filterInput = el("input", {
+      type: "search",
+      class: "artifact-filter",
+      placeholder: "filter files…",
+      value: artifactFilter,
+      oninput: (ev) => {
+        artifactFilter = ev.target.value;
+        // File rows and their preview blocks both carry `data-path`, so a
+        // single pass hides/shows both. No re-render → the input keeps focus.
+        for (const li of wrap.querySelectorAll("li[data-path]")) {
+          li.hidden = !artifactPathMatches(li.dataset.path);
+        }
+      },
+    });
+    wrap.appendChild(el("div", { class: "artifact-filter-row" }, [filterInput]));
     for (const snap of detailArtifacts.snapshots) {
       const fileCountLabel =
         snap.truncated && snap.total_file_count
           ? `${snap.file_count} of ${snap.total_file_count} files`
           : `${snap.file_count} file${snap.file_count === 1 ? "" : "s"}`;
-      const summary = el(
-        "summary",
-        {},
-        `${snap.snapshot} · ${fileCountLabel} · ${fmtBytes(snap.total_bytes)}`,
-      );
+      const summaryChildren = [
+        document.createTextNode(
+          `${snap.snapshot} · ${fileCountLabel} · ${fmtBytes(snap.total_bytes)}`,
+        ),
+      ];
+      if (snap.abs_path)
+        summaryChildren.push(
+          el(
+            "button",
+            {
+              class: "linklike file-action",
+              type: "button",
+              title: "copy snapshot path",
+              onclick: (ev) => {
+                ev.preventDefault();
+                ev.stopPropagation();
+                copyText(snap.abs_path);
+              },
+            },
+            "copy path",
+          ),
+        );
+      const summary = el("summary", {}, summaryChildren);
       const list = el("ul", { class: "artifact-files" });
       for (const f of snap.files) {
         const href = `/api/cards/${encodeURIComponent(cardId)}/artifacts/${encodeURIComponent(snap.snapshot)}/file?path=${encodeURIComponent(f.path)}`;
-        list.appendChild(
-          el("li", {}, [
-            el(
-              "a",
-              { href, target: "_blank", rel: "noopener" },
-              f.path,
-            ),
+        const kind = fileKind(f.path);
+        const key = previewKey(snap.snapshot, f.path);
+        const absPath = snap.abs_path ? `${snap.abs_path}/${f.path}` : null;
+        const previewable = isPreviewableKind(kind) && f.size <= ARTIFACT_PREVIEW_MAX_BYTES;
+        const isPreviewOpen = expandedPreviews.has(key);
+        const row = el(
+          "li",
+          { dataset: { path: f.path }, hidden: artifactPathMatches(f.path) ? null : "hidden" },
+          [
+            el("span", { class: `file-kind kind-${kind}` }, kind),
+            el("a", { href, target: "_blank", rel: "noopener" }, f.path),
             el("span", { class: "artifact-size" }, fmtBytes(f.size)),
-          ]),
+            previewable
+              ? el(
+                  "button",
+                  {
+                    class: "linklike file-action",
+                    type: "button",
+                    onclick: () => {
+                      if (expandedPreviews.has(key)) {
+                        expandedPreviews.delete(key);
+                        renderDetailInto(detailLastCard);
+                      } else {
+                        expandedPreviews.add(key);
+                        if (previewCache.has(key)) renderDetailInto(detailLastCard);
+                        else loadPreview(cardId, snap.snapshot, f.path);
+                      }
+                    },
+                  },
+                  isPreviewOpen ? "hide" : "preview",
+                )
+              : null,
+            absPath
+              ? el(
+                  "button",
+                  { class: "linklike file-action", type: "button", title: "copy path", onclick: () => copyText(absPath) },
+                  "copy path",
+                )
+              : null,
+          ],
         );
+        list.appendChild(row);
+        if (isPreviewOpen) {
+          const block = renderPreviewBlock(key, f.path);
+          if (!artifactPathMatches(f.path)) block.hidden = true;
+          list.appendChild(block);
+        }
       }
       if (snap.truncated) {
         list.appendChild(
@@ -1233,6 +1402,9 @@
     detailDiffState = "loading";
     detailDiffError = "";
     expandedSnapshots.clear();
+    artifactFilter = "";
+    expandedPreviews.clear();
+    previewCache.clear();
     const modal = ensureDetailModal();
     modal.classList.remove("hidden");
     if (!detailKeydownHandler) {

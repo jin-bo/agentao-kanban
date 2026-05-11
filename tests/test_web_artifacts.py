@@ -104,6 +104,19 @@ def test_list_returns_files_and_totals(
     assert paths == ["logs/run.log", "report.md"]
 
 
+def test_list_includes_snapshot_abs_path(
+    client: TestClient, card_with_snapshot
+) -> None:
+    card_id, snap = card_with_snapshot
+    r = client.get(f"/api/cards/{card_id}/artifacts")
+    assert r.status_code == 200
+    rec = r.json()["snapshots"][0]
+    # Absolute, points at the snapshot dir, and the UI joins file paths
+    # onto it for the "copy path" affordance.
+    assert rec["abs_path"] == str(snap.resolve())
+    assert Path(rec["abs_path"]).is_absolute()
+
+
 def test_multiple_snapshots_listed_newest_first(
     client: TestClient, raw_root: Path, board: Path
 ) -> None:

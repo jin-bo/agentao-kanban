@@ -712,6 +712,75 @@ body {
   font-style: italic;
 }
 
+.artifact-filter-row {
+  margin: 0.3em 0 0.5em;
+}
+.artifact-filter {
+  width: 100%;
+  padding: 0.3em 0.5em;
+  background: var(--bg-elev-2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  font: inherit;
+  font-size: 0.85em;
+}
+.artifact-filter:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.file-kind {
+  flex-shrink: 0;
+  font-size: 0.7em;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  padding: 0 0.3em;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  color: var(--text-dim);
+}
+.file-kind.kind-image { border-color: var(--accent); color: var(--accent); }
+.file-kind.kind-json { border-color: var(--warn); color: var(--warn); }
+.file-kind.kind-text,
+.file-kind.kind-code { border-color: var(--ok); color: var(--ok); }
+.file-action {
+  flex-shrink: 0;
+  font-size: 0.8em;
+}
+.artifact-snap > summary .file-action {
+  margin-left: 0.6em;
+}
+.artifact-files li {
+  align-items: baseline;
+}
+.artifact-files li a {
+  flex: 1;
+  min-width: 0;
+}
+.artifact-files li.artifact-preview-li {
+  display: block;
+}
+/* The base `.artifact-files li` rule forces `display: flex`, which beats
+   the UA `[hidden] { display: none }`. Re-assert it for the filter. Keep
+   this after the preview-li rule so equal-specificity ties favor hide. */
+.artifact-files li[hidden] {
+  display: none;
+}
+.artifact-preview {
+  margin: 0.2em 0 0.4em;
+  padding: 0.5em 0.7em;
+  max-height: 18em;
+  overflow: auto;
+  background: var(--bg-elev-2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.4;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 .artifacts-error {
   color: var(--danger);
 }

@@ -7,6 +7,13 @@
 ## [Unreleased]
 
 ### Added
+- **Web UI:artifact 浏览器增强**。Artifacts 区:顶部加文件名过滤框(纯
+  客户端、即时,值存在 `artifactFilter` 里所以 5s 重渲染不丢);每个文件前面
+  按扩展名标类型(image / json / text / code / binary);text/json/code 且
+  ≤256 KiB 的文件可内联 **preview**(前 64 KiB,超出标注;413 等错误显示
+  服务端给的提示文案);snapshot 和每个文件都有 **copy path** 按钮复制绝对
+  路径(listing 端点新增 `abs_path` 字段)。打开的 preview 用和
+  `expandedSnapshots` 一样的模式(open set + 内容 cache)跨 5s 重渲染保留。
 - **Web UI:worktree diff(Changes)视图**。卡片详情新增 **Changes** 区
   (排在 Artifacts 之后):对 `active` / `detached` 分支显示
   `git diff --stat`(含 active worktree 的未提交/未跟踪改动);`none` /
