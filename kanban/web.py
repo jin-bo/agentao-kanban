@@ -191,6 +191,54 @@ def _list_artifact_snapshots(
     return snapshots
 
 
+def _serve_file_under_root(
+    unresolved: Path,
+    root: Path,
+    *,
+    media_type: str | None = None,
+    inline: bool = False,
+) -> FileResponse:
+    """Serve ``unresolved`` as a file response after checking it's a
+    regular file that lives under ``root``.
+
+    Shared by the artifact-file and transcript-file routes — both are
+    read-only browsers over directories that may contain symlinks, so the
+    leaf must not be a symlink and must not resolve out of ``root`` (an
+    intermediate symlink would). ``root`` must already be ``.resolve()``-d
+    by the caller. ``inline`` flips the ``Content-Disposition`` so the
+    browser renders the file in a tab instead of downloading it.
+    """
+    if unresolved.is_symlink():
+        raise HTTPException(status_code=403, detail="symlinks not served")
+    target = unresolved.resolve()
+    try:
+        target.relative_to(root)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="path escapes the served directory")
+    try:
+        st = target.stat()
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="file not found")
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"stat failed: {exc}")
+    if not stat_mod.S_ISREG(st.st_mode):
+        raise HTTPException(status_code=400, detail="not a regular file")
+    if st.st_size > _ARTIFACT_FILE_MAX_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"file is {st.st_size} bytes; the inline cap is "
+                f"{_ARTIFACT_FILE_MAX_BYTES}. Copy directly from {target}."
+            ),
+        )
+    kwargs: dict[str, Any] = {"filename": target.name}
+    if media_type is not None:
+        kwargs["media_type"] = media_type
+    if inline:
+        kwargs["content_disposition_type"] = "inline"
+    return FileResponse(target, **kwargs)
+
+
 def _display_path(abs_path: str, *, board_dir: Path, git_root: Path | None) -> str:
     """A human-friendly relative rendering of an absolute result path.
 
@@ -620,39 +668,13 @@ def create_app(
         )
         if match is None:
             raise HTTPException(status_code=404, detail="trace not found")
-        target = Path(match.path)
-        # Defence in depth: refuse symlinks and anything that resolves out
-        # of the per-card raw directory (mirrors the artifact file route).
-        if target.is_symlink():
-            raise HTTPException(status_code=403, detail="symlinks not served")
-        raw_card_dir = (store.raw_root / card_id).resolve()
-        try:
-            target.resolve().relative_to(raw_card_dir)
-        except ValueError:
-            raise HTTPException(status_code=400, detail="path escapes trace dir")
-        try:
-            st = target.stat()
-        except FileNotFoundError:
-            raise HTTPException(status_code=404, detail="trace not found")
-        except OSError as exc:
-            raise HTTPException(status_code=500, detail=f"stat failed: {exc}")
-        if not stat_mod.S_ISREG(st.st_mode):
-            raise HTTPException(status_code=400, detail="not a regular file")
-        if st.st_size > _ARTIFACT_FILE_MAX_BYTES:
-            raise HTTPException(
-                status_code=413,
-                detail=(
-                    f"transcript is {st.st_size} bytes; the inline cap is "
-                    f"{_ARTIFACT_FILE_MAX_BYTES}. Copy directly from {target}."
-                ),
-            )
         # text/plain + inline so "open in new tab" renders the transcript
         # in the browser instead of triggering a download.
-        return FileResponse(
-            target,
+        return _serve_file_under_root(
+            Path(match.path),
+            (store.raw_root / card_id).resolve(),
             media_type="text/plain; charset=utf-8",
-            filename=target.name,
-            content_disposition_type="inline",
+            inline=True,
         )
 
     @app.get("/api/cards/{card_id}/artifacts")
@@ -697,36 +719,7 @@ def create_app(
         if not snap_dir.is_dir():
             raise HTTPException(status_code=404, detail="snapshot not found")
 
-        unresolved = snap_dir / path
-        # Refuse symlink leaves: WorktreeManager preserves symlinks in
-        # snapshots but the web surface is a read-only browser, and
-        # following them would change the trust boundary.
-        if unresolved.is_symlink():
-            raise HTTPException(status_code=403, detail="symlinks not served")
-        target = unresolved.resolve()
-        try:
-            target.relative_to(snap_dir)
-        except ValueError:
-            # An intermediate symlink resolved out of the snapshot.
-            raise HTTPException(status_code=400, detail="path escapes snapshot")
-        try:
-            st = target.stat()
-        except FileNotFoundError:
-            raise HTTPException(status_code=404, detail="file not found")
-        except OSError as exc:
-            raise HTTPException(status_code=500, detail=f"stat failed: {exc}")
-        if not stat_mod.S_ISREG(st.st_mode):
-            raise HTTPException(status_code=400, detail="not a regular file")
-        if st.st_size > _ARTIFACT_FILE_MAX_BYTES:
-            raise HTTPException(
-                status_code=413,
-                detail=(
-                    f"file is {st.st_size} bytes; the inline cap is "
-                    f"{_ARTIFACT_FILE_MAX_BYTES}. Copy directly from "
-                    f"{target}."
-                ),
-            )
-        return FileResponse(target, filename=target.name)
+        return _serve_file_under_root(snap_dir / path, snap_dir)
 
     @app.get("/api/events")
     def api_events(

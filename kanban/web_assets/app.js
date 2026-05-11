@@ -1257,101 +1257,67 @@
     return wrap;
   }
 
-  async function loadTraces(id) {
-    detailTracesState = "loading";
-    detailTracesError = "";
-    detailTraces = null;
-    if (selectedCardId === id && detailLastCard) {
-      renderDetailInto(detailLastCard);
-    }
-    try {
-      const data = await fetchJSON(
-        `/api/cards/${encodeURIComponent(id)}/traces`,
-      );
-      if (selectedCardId !== id) return;
-      detailTraces = data;
-      detailTracesState = "loaded";
-    } catch (err) {
-      if (selectedCardId !== id) return;
-      detailTracesState = "error";
-      detailTracesError = err.message;
-    }
-    if (selectedCardId === id && detailLastCard) {
-      renderDetailInto(detailLastCard);
-    }
-  }
+  // The four "fetched once per detail-modal open" sections share one
+  // loader; each entry just names its endpoint and how to write its slice
+  // of module state (the render* functions read those vars directly).
+  const DETAIL_SECTIONS = {
+    result: {
+      url: (id) => `/api/cards/${encodeURIComponent(id)}/result`,
+      set: (data, state, error) => {
+        detailResult = data;
+        detailResultState = state;
+        detailResultError = error;
+      },
+    },
+    artifacts: {
+      url: (id) => `/api/cards/${encodeURIComponent(id)}/artifacts`,
+      set: (data, state, error) => {
+        detailArtifacts = data;
+        detailArtifactsState = state;
+        detailArtifactsError = error;
+      },
+      // Expand the newest snapshot once when the listing first lands;
+      // after that expandedSnapshots is owned by the user's toggles.
+      onLoaded: (data) => {
+        const snaps = data && data.snapshots;
+        if (snaps && snaps.length) expandedSnapshots.add(snaps[0].snapshot);
+      },
+    },
+    traces: {
+      url: (id) => `/api/cards/${encodeURIComponent(id)}/traces`,
+      set: (data, state, error) => {
+        detailTraces = data;
+        detailTracesState = state;
+        detailTracesError = error;
+      },
+    },
+    diff: {
+      url: (id) => `/api/cards/${encodeURIComponent(id)}/diff`,
+      set: (data, state, error) => {
+        detailDiff = data;
+        detailDiffState = state;
+        detailDiffError = error;
+      },
+    },
+  };
 
-  async function loadDiff(id) {
-    detailDiffState = "loading";
-    detailDiffError = "";
-    detailDiff = null;
-    if (selectedCardId === id && detailLastCard) {
-      renderDetailInto(detailLastCard);
-    }
+  async function loadDetailSection(id, key) {
+    const spec = DETAIL_SECTIONS[key];
+    const rerenderIfCurrent = () => {
+      if (selectedCardId === id && detailLastCard) renderDetailInto(detailLastCard);
+    };
+    spec.set(null, "loading", "");
+    rerenderIfCurrent();
     try {
-      const data = await fetchJSON(`/api/cards/${encodeURIComponent(id)}/diff`);
+      const data = await fetchJSON(spec.url(id));
       if (selectedCardId !== id) return;
-      detailDiff = data;
-      detailDiffState = "loaded";
+      spec.set(data, "loaded", "");
+      if (spec.onLoaded) spec.onLoaded(data);
     } catch (err) {
       if (selectedCardId !== id) return;
-      detailDiffState = "error";
-      detailDiffError = err.message;
+      spec.set(null, "error", err.message);
     }
-    if (selectedCardId === id && detailLastCard) {
-      renderDetailInto(detailLastCard);
-    }
-  }
-
-  async function loadArtifacts(id) {
-    detailArtifactsState = "loading";
-    detailArtifactsError = "";
-    detailArtifacts = null;
-    if (selectedCardId === id && detailLastCard) {
-      renderDetailInto(detailLastCard);
-    }
-    try {
-      const data = await fetchJSON(
-        `/api/cards/${encodeURIComponent(id)}/artifacts`,
-      );
-      if (selectedCardId !== id) return;
-      detailArtifacts = data;
-      detailArtifactsState = "loaded";
-      // Default: expand the newest snapshot once after the listing
-      // lands. After that expandedSnapshots is owned by the user's
-      // toggle events.
-      const snaps = data && data.snapshots;
-      if (snaps && snaps.length) expandedSnapshots.add(snaps[0].snapshot);
-    } catch (err) {
-      if (selectedCardId !== id) return;
-      detailArtifactsState = "error";
-      detailArtifactsError = err.message;
-    }
-    if (selectedCardId === id && detailLastCard) {
-      renderDetailInto(detailLastCard);
-    }
-  }
-
-  async function loadResult(id) {
-    detailResultState = "loading";
-    detailResultError = "";
-    detailResult = null;
-    if (selectedCardId === id && detailLastCard) {
-      renderDetailInto(detailLastCard);
-    }
-    try {
-      const data = await fetchJSON(`/api/cards/${encodeURIComponent(id)}/result`);
-      if (selectedCardId !== id) return;
-      detailResult = data;
-      detailResultState = "loaded";
-    } catch (err) {
-      if (selectedCardId !== id) return;
-      detailResultState = "error";
-      detailResultError = err.message;
-    }
-    if (selectedCardId === id && detailLastCard) {
-      renderDetailInto(detailLastCard);
-    }
+    rerenderIfCurrent();
   }
 
   async function fetchJSON(url) {
@@ -1416,10 +1382,7 @@
     // Show "Loading…" until the per-card fetch lands.
     renderDetailInto(null);
     refreshDetail();
-    loadResult(id);
-    loadArtifacts(id);
-    loadTraces(id);
-    loadDiff(id);
+    for (const key of Object.keys(DETAIL_SECTIONS)) loadDetailSection(id, key);
   }
 
   function closeDetailModal() {
