@@ -905,3 +905,18 @@ body {
   border-radius: 3px;
   padding: 0 0.3em;
 }
+
+/* --- Card detail: Changes (worktree diff) section --- */
+.diff-body {
+  margin: 0.4em 0 0;
+  padding: 0.5em 0.7em;
+  max-height: 22em;
+  overflow: auto;
+  background: var(--bg-elev-2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.4;
+  white-space: pre;
+}

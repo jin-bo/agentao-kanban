@@ -7,6 +7,20 @@
 ## [Unreleased]
 
 ### Added
+- **Web UI:worktree diff(Changes)视图**。卡片详情新增 **Changes** 区
+  (排在 Artifacts 之后):对 `active` / `detached` 分支显示
+  `git diff --stat`(含 active worktree 的未提交/未跟踪改动);`none` /
+  `not-git` / `missing` 返回 200 + 说明文案(不 500),`missing` 在 UI 里按
+  错误样式显示。Result 区在 worktree 为 active/detached 时多一行跳转链接。
+  - 新端点 `GET /api/cards/{card_id}/diff`(只读):先用共享的
+    `worktree_state` 判定状态,只有 active/detached 才调 `WorktreeManager.diff_summary`
+    (用 `manage_exclude=False` 的只读 manager,不碰 `.git/info/exclude`);
+    `WorktreeDiffError`(缺 base_commit / ref 不存在 / git 失败 / 超时)被
+    收成 `{diff: null, message}`;diff body 超过 1 MiB 截断并标 `truncated`。
+  - `WorktreeManager.diff_summary` 现在给它 spawn 的所有 `git` 子进程都加了
+    超时(新字段 `git_diff_timeout_s`,默认 30s),`subprocess.TimeoutExpired`
+    包成 `WorktreeDiffError` —— web `/diff` 跑在 FastAPI 线程池上,卡死的仓库
+    否则会一直占着 worker。
 - **Web UI:transcript(原始记录)浏览**。卡片详情新增 **Transcripts** 区
   (排在 Artifacts 之后),列出该卡保留的原始 agent transcript,按时间倒序
   (最新在前并标 `LATEST`),每条带角色、时间、字节数,点文件名在新标签页

@@ -43,9 +43,9 @@ from .daemon import daemon_status
 from .gitutil import find_git_root_optional
 from .mcp import card_to_dict, event_to_dict
 from .models import AgentRole, Card, CardPriority, CardStatus
-from .result import summarize_card_result
+from .result import summarize_card_result, worktree_state
 from .store_markdown import MarkdownBoardStore
-from .worktree import ARTIFACT_DIR_NAME_RE
+from .worktree import ARTIFACT_DIR_NAME_RE, WorktreeDiffError, WorktreeManager
 
 
 # Fixed column order for the frontend. Mirrors CardStatus declaration order.
@@ -82,6 +82,29 @@ _ARTIFACT_FILE_MAX_BYTES = 8 * 1024 * 1024
 # Truncated listings advertise ``truncated: true`` + ``total_file_count``
 # so the UI can hint the operator to copy from disk.
 _ARTIFACT_LISTING_MAX_FILES = 5000
+
+# Cap on the inline ``git diff --stat`` body the /diff route returns.
+# ``--stat`` is one line per changed file, so 1 MiB is already an
+# enormous changeset; past that the response is truncated and flagged so
+# the UI can point the operator at ``kanban worktree diff`` for the full
+# output.
+_DIFF_MAX_BYTES = 1 * 1024 * 1024
+
+# Operator-facing copy for the worktree states that can't produce a diff.
+# ``missing`` is rendered as an actionable error by the UI; the others are
+# clean empty states. Keeps the /diff route from ever 500ing on a card
+# that simply has no worktree.
+_DIFF_STATE_MESSAGES = {
+    "none": "No worktree was attached to this card, so there is nothing to diff.",
+    "not-git": (
+        "Board is not inside a Git repository; worktree isolation — and "
+        "therefore a worktree diff — is unavailable."
+    ),
+    "missing": (
+        "The recorded worktree branch no longer resolves. Run "
+        "`kanban worktree prune` to clear the stale metadata."
+    ),
+}
 
 
 def _artifacts_root_for(board_dir: Path) -> Path:
@@ -493,6 +516,58 @@ def create_app(
             transcripts, board_dir=board_path, git_root=git_root
         )
         return payload
+
+    @app.get("/api/cards/{card_id}/diff")
+    def api_card_diff(card_id: str) -> dict[str, Any]:
+        # Web equivalent of `kanban worktree diff <card-id>`: a read-only
+        # `git diff --stat` of the card's branch vs its base, plus any
+        # uncommitted changes in an active worktree. States that can't
+        # produce a diff (none / not-git / missing) return 200 with a
+        # message rather than an error so the route never 500s.
+        store = _store()
+        card = _get_card_or_404(store, card_id)
+        state, _path = worktree_state(board_path, card)
+        base: dict[str, Any] = {
+            "card_id": card.id,
+            "state": state,
+            "branch": card.worktree_branch,
+            "base_commit": card.worktree_base_commit,
+            "diff": None,
+            "truncated": False,
+            "message": None,
+        }
+        if state not in ("active", "detached"):
+            base["message"] = _DIFF_STATE_MESSAGES.get(
+                state, f"worktree state {state!r} has no diff"
+            )
+            return base
+        git_root = find_git_root_optional(board_path)
+        if git_root is None:
+            # worktree_state already classifies this as not-git, but be
+            # defensive against a layout where the probe disagrees.
+            base["state"] = "not-git"
+            base["message"] = _DIFF_STATE_MESSAGES["not-git"]
+            return base
+        # Read-only manager: never touch `.git/info/exclude`. `diff_summary`
+        # only shells out to `git` (with a timeout) — no repo mutation.
+        mgr = WorktreeManager.for_project(git_root, manage_exclude=False)
+        try:
+            diff = mgr.diff_summary(card.id, card.worktree_base_commit or "")
+        except WorktreeDiffError as exc:
+            base["message"] = str(exc)
+            return base
+        encoded = diff.encode("utf-8", "replace")
+        if len(encoded) > _DIFF_MAX_BYTES:
+            base["diff"] = encoded[:_DIFF_MAX_BYTES].decode("utf-8", "ignore")
+            base["truncated"] = True
+            base["message"] = (
+                f"diff is {len(encoded)} bytes; showing the first "
+                f"{_DIFF_MAX_BYTES}. Run `kanban worktree diff "
+                f"{card.id[:8]}` for the full output."
+            )
+        else:
+            base["diff"] = diff
+        return base
 
     @app.get("/api/cards/{card_id}/traces")
     def api_list_traces(card_id: str) -> dict[str, Any]:

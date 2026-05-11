@@ -39,6 +39,11 @@
   let detailTraces = null;
   let detailTracesState = "idle"; // idle | loading | loaded | error
   let detailTracesError = "";
+  // `git diff --stat` of the card's worktree branch (the "Changes"
+  // section). Same fetch-once-per-open lifecycle.
+  let detailDiff = null;
+  let detailDiffState = "idle"; // idle | loading | loaded | error
+  let detailDiffError = "";
   // Tracks which artifact snapshots the user has expanded. The detail
   // modal re-renders on every 5s tick, so without this state any
   // <details> the user opened would collapse back to default.
@@ -646,6 +651,7 @@
 
     sections.push(renderResultSection());
     sections.push(renderArtifactsSection(card.id));
+    sections.push(renderChangesSection(card.id));
     sections.push(renderTranscriptsSection(card.id));
 
     if (card.recent_events && card.recent_events.length) {
@@ -815,6 +821,20 @@
     );
     if (wt.branch) row("branch", el("code", {}, wt.branch));
     if (wt.path) row("worktree path", el("code", {}, wt.path));
+    if (wt.state === "active" || wt.state === "detached") {
+      row(
+        "changes",
+        el(
+          "button",
+          {
+            class: "linklike",
+            type: "button",
+            onclick: () => jumpToSection("detail-changes"),
+          },
+          "view diff →",
+        ),
+      );
+    }
     const outputs = r.outputs || [];
     if (outputs.length) {
       const ul = el("ul", { class: "result-list" });
@@ -977,6 +997,47 @@
     return wrap;
   }
 
+  function renderChangesSection(cardId) {
+    const wrap = el(
+      "div",
+      { class: "card-detail-section", id: "detail-changes" },
+      [el("h3", {}, "Changes")],
+    );
+    if (detailDiffState === "loading" || detailDiffState === "idle") {
+      wrap.appendChild(el("p", { class: "hint" }, "Loading…"));
+      return wrap;
+    }
+    if (detailDiffState === "error") {
+      wrap.appendChild(
+        el(
+          "p",
+          { class: "hint artifacts-error" },
+          `Failed to load: ${detailDiffError}`,
+        ),
+      );
+      return wrap;
+    }
+    const d = detailDiff || {};
+    // `diff: null` ⇒ a non-diffable worktree state (none / not-git /
+    // missing); the message explains which. `missing` reads as an error.
+    if (d.diff === null || d.diff === undefined) {
+      const cls = d.state === "missing" ? "hint artifacts-error" : "hint";
+      wrap.appendChild(
+        el("p", { class: cls }, d.message || "(no diff available)"),
+      );
+      return wrap;
+    }
+    if (d.message) wrap.appendChild(el("p", { class: "hint" }, d.message));
+    if (!d.diff.trim()) {
+      wrap.appendChild(
+        el("p", { class: "hint" }, "No changes on this branch yet."),
+      );
+      return wrap;
+    }
+    wrap.appendChild(el("pre", { class: "diff-body" }, d.diff));
+    return wrap;
+  }
+
   function renderTranscriptsSection(cardId) {
     const wrap = el(
       "div",
@@ -1045,6 +1106,28 @@
       if (selectedCardId !== id) return;
       detailTracesState = "error";
       detailTracesError = err.message;
+    }
+    if (selectedCardId === id && detailLastCard) {
+      renderDetailInto(detailLastCard);
+    }
+  }
+
+  async function loadDiff(id) {
+    detailDiffState = "loading";
+    detailDiffError = "";
+    detailDiff = null;
+    if (selectedCardId === id && detailLastCard) {
+      renderDetailInto(detailLastCard);
+    }
+    try {
+      const data = await fetchJSON(`/api/cards/${encodeURIComponent(id)}/diff`);
+      if (selectedCardId !== id) return;
+      detailDiff = data;
+      detailDiffState = "loaded";
+    } catch (err) {
+      if (selectedCardId !== id) return;
+      detailDiffState = "error";
+      detailDiffError = err.message;
     }
     if (selectedCardId === id && detailLastCard) {
       renderDetailInto(detailLastCard);
@@ -1146,6 +1229,9 @@
     detailTraces = null;
     detailTracesState = "loading";
     detailTracesError = "";
+    detailDiff = null;
+    detailDiffState = "loading";
+    detailDiffError = "";
     expandedSnapshots.clear();
     const modal = ensureDetailModal();
     modal.classList.remove("hidden");
@@ -1161,6 +1247,7 @@
     loadResult(id);
     loadArtifacts(id);
     loadTraces(id);
+    loadDiff(id);
   }
 
   function closeDetailModal() {
@@ -1175,6 +1262,9 @@
     detailTraces = null;
     detailTracesState = "idle";
     detailTracesError = "";
+    detailDiff = null;
+    detailDiffState = "idle";
+    detailDiffError = "";
     if (detailModal) detailModal.classList.add("hidden");
     if (detailKeydownHandler) {
       document.removeEventListener("keydown", detailKeydownHandler);

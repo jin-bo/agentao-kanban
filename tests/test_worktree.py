@@ -246,6 +246,62 @@ def test_diff_summary_includes_uncommitted(tmp_path: Path):
     assert "Uncommitted" in diff
 
 
+def test_diff_summary_missing_base_commit(tmp_path: Path):
+    from kanban.worktree import WorktreeDiffError
+
+    repo = _init_repo(tmp_path / "repo")
+    mgr = _make_mgr(repo)
+    mgr.create("card-nb")
+    with pytest.raises(WorktreeDiffError) as ei:
+        mgr.diff_summary("card-nb", "")
+    assert "base_commit" in str(ei.value)
+
+
+def test_diff_summary_passes_timeout_to_git(tmp_path: Path, monkeypatch):
+    """Every ``git`` subprocess ``diff_summary`` spawns must carry the
+    configured timeout — a hung repo would otherwise pin the caller (the
+    web ``/diff`` route runs on a threadpool)."""
+    import kanban.worktree as wt_mod
+
+    repo = _init_repo(tmp_path / "repo")
+    mgr = _make_mgr(repo)
+    info = mgr.create("card-to")
+    # An active worktree so the uncommitted-changes branch (the direct
+    # subprocess.run calls) runs too, not just the self._git() calls.
+    (info.path / "draft.txt").write_text("draft\n")
+
+    seen_timeouts: list = []
+    real_run = wt_mod.subprocess.run
+
+    def spy(*args, **kwargs):
+        seen_timeouts.append(kwargs.get("timeout"))
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr(wt_mod.subprocess, "run", spy)
+    mgr.diff_summary("card-to", info.base_commit)
+    assert seen_timeouts, "expected diff_summary to shell out to git"
+    assert all(t == mgr.git_diff_timeout_s for t in seen_timeouts)
+
+
+def test_diff_summary_wraps_timeout_as_diff_error(tmp_path: Path, monkeypatch):
+    import kanban.worktree as wt_mod
+    from kanban.worktree import WorktreeDiffError
+
+    repo = _init_repo(tmp_path / "repo")
+    mgr = _make_mgr(repo)
+    info = mgr.create("card-hang")
+
+    def boom(*args, **kwargs):
+        raise subprocess.TimeoutExpired(
+            cmd=args[0] if args else "git", timeout=kwargs.get("timeout") or 0.0
+        )
+
+    monkeypatch.setattr(wt_mod.subprocess, "run", boom)
+    with pytest.raises(WorktreeDiffError) as ei:
+        mgr.diff_summary("card-hang", info.base_commit)
+    assert "timed out" in str(ei.value)
+
+
 def test_create_without_preexisting_worktrees_dir(tmp_path: Path):
     repo = _init_repo(tmp_path / "repo")
     wt_root = repo / "workspace" / "worktrees"

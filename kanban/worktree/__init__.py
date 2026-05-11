@@ -51,6 +51,11 @@ class WorktreeManager:
     # rendering behind the read-only web endpoint) that must not touch
     # the repository at all.
     manage_exclude: bool = True
+    # Wall-clock cap on the ``git`` subprocesses ``diff_summary`` spawns.
+    # The web ``/diff`` route runs on the FastAPI threadpool; a hung or
+    # pathologically slow repo would otherwise pin a worker indefinitely.
+    # Generous enough never to bite a real ``git diff`` on a normal repo.
+    git_diff_timeout_s: float = 30.0
 
     @classmethod
     def for_project(
@@ -87,13 +92,16 @@ class WorktreeManager:
                     ARTIFACTS_MAX_BYTES_ENV, env_cap,
                 )
 
-    def _git(self, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+    def _git(
+        self, *args: str, check: bool = True, timeout: float | None = None,
+    ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             ["git", *args],
             cwd=self.project_root,
             capture_output=True,
             text=True,
             check=check,
+            timeout=timeout,
         )
 
     def _ensure_ignored(self) -> None:
@@ -554,40 +562,48 @@ class WorktreeManager:
         # an empty diff that masks missing branch or base commits.
         if not base_commit:
             raise WorktreeDiffError("missing base_commit")
-        for ref in (base_commit, f"refs/heads/{branch}"):
-            probe = self._git("rev-parse", "--verify", ref, check=False)
-            if probe.returncode != 0:
+        t = self.git_diff_timeout_s
+        try:
+            for ref in (base_commit, f"refs/heads/{branch}"):
+                probe = self._git("rev-parse", "--verify", ref, check=False, timeout=t)
+                if probe.returncode != 0:
+                    raise WorktreeDiffError(
+                        f"ref not found: {ref} ({probe.stderr.strip()})"
+                    )
+            # Committed changes vs base
+            result = self._git(
+                "diff", f"{base_commit}...{branch}", "--stat", check=False, timeout=t,
+            )
+            parts: list[str] = []
+            if result.returncode != 0:
                 raise WorktreeDiffError(
-                    f"ref not found: {ref} ({probe.stderr.strip()})"
+                    f"git diff failed: {result.stderr.strip()}"
                 )
-        # Committed changes vs base
-        result = self._git("diff", f"{base_commit}...{branch}", "--stat", check=False)
-        parts: list[str] = []
-        if result.returncode != 0:
+            if result.stdout.strip():
+                parts.append(result.stdout)
+            # Uncommitted changes in the active worktree
+            if wt_path.exists():
+                wt_diff = subprocess.run(
+                    ["git", "diff", "HEAD", "--stat"],
+                    cwd=wt_path, capture_output=True, text=True, check=False, timeout=t,
+                )
+                untracked = subprocess.run(
+                    ["git", "ls-files", "--others", "--exclude-standard"],
+                    cwd=wt_path, capture_output=True, text=True, check=False, timeout=t,
+                )
+                uncommitted_lines: list[str] = []
+                if wt_diff.returncode == 0 and wt_diff.stdout.strip():
+                    uncommitted_lines.append(wt_diff.stdout.rstrip())
+                if untracked.returncode == 0 and untracked.stdout.strip():
+                    for f in untracked.stdout.strip().splitlines():
+                        uncommitted_lines.append(f" {f} (untracked)")
+                if uncommitted_lines:
+                    parts.append("Uncommitted changes:\n" + "\n".join(uncommitted_lines))
+            return "\n".join(parts)
+        except subprocess.TimeoutExpired as exc:
             raise WorktreeDiffError(
-                f"git diff failed: {result.stderr.strip()}"
-            )
-        if result.stdout.strip():
-            parts.append(result.stdout)
-        # Uncommitted changes in the active worktree
-        if wt_path.exists():
-            wt_diff = subprocess.run(
-                ["git", "diff", "HEAD", "--stat"],
-                cwd=wt_path, capture_output=True, text=True, check=False,
-            )
-            untracked = subprocess.run(
-                ["git", "ls-files", "--others", "--exclude-standard"],
-                cwd=wt_path, capture_output=True, text=True, check=False,
-            )
-            uncommitted_lines: list[str] = []
-            if wt_diff.returncode == 0 and wt_diff.stdout.strip():
-                uncommitted_lines.append(wt_diff.stdout.rstrip())
-            if untracked.returncode == 0 and untracked.stdout.strip():
-                for f in untracked.stdout.strip().splitlines():
-                    uncommitted_lines.append(f" {f} (untracked)")
-            if uncommitted_lines:
-                parts.append("Uncommitted changes:\n" + "\n".join(uncommitted_lines))
-        return "\n".join(parts)
+                f"git timed out after {exc.timeout:g}s while computing the diff"
+            ) from exc
 
     def list_active(self) -> list[WorktreeInfo]:
         entries = self._parse_worktree_list()
