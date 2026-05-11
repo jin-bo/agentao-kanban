@@ -3,16 +3,14 @@ from __future__ import annotations
 import json
 import logging
 import os
-import re
 import tomllib
 from collections import defaultdict
-from dataclasses import fields
 from datetime import datetime, timezone as _tz
 _UTC = _tz.utc
 from pathlib import Path
 from typing import Any
 
-from .models import (
+from ..models import (
     AgentResult,
     AgentRole,
     Card,
@@ -32,11 +30,44 @@ from .models import (
     coerce_card_status,
     utc_now,
 )
+from .cards import (  # noqa: F401
+    FRONT_MATTER_DELIM,
+    _card_from_toml_dict,
+    _card_to_toml_dict,
+    _coerce_revision_requests,
+    _extract_front_matter,
+    _read_card,
+    _render_body,
+    _render_card,
+)
+from .events import _decode_event_line  # noqa: F401
+from .runtime import (  # noqa: F401
+    _agent_result_from_json,
+    _agent_result_to_json,
+    _atomic_write_json,
+    _claim_from_json,
+    _claim_to_json,
+    _iso,
+    _parse_iso,
+    _resource_from_json,
+    _resource_to_json,
+    _result_from_json,
+    _result_to_json,
+    _revision_request_from_json,
+    _revision_request_to_json,
+    _worker_from_json,
+    _worker_to_json,
+)
+from .toml_dump import (  # noqa: F401
+    _dump_toml,
+    _toml_inline_table,
+    _toml_key,
+    _toml_string,
+    _toml_value,
+)
 
-FRONT_MATTER_DELIM = "+++"
 DEFAULT_RAW_RETENTION = 5
 
-_BARE_KEY_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 _LOG = logging.getLogger(__name__)
 
 
@@ -704,515 +735,3 @@ class MarkdownBoardStore:
         content = _render_card(card)
         tmp.write_text(content, encoding="utf-8")
         os.replace(tmp, path)
-
-
-# ---------- event decoding ----------
-
-
-def _decode_event_line(line: str) -> CardEvent | None:
-    if line.startswith("{"):
-        try:
-            data = json.loads(line)
-            role_str = data.get("role")
-            role = AgentRole(role_str) if role_str else None
-            return CardEvent(
-                card_id=str(data["card_id"]),
-                message=str(data["message"]),
-                at=datetime.fromisoformat(str(data["at"])),
-                role=role,
-                prompt_version=data.get("prompt_version"),
-                duration_ms=data.get("duration_ms"),
-                attempt=data.get("attempt"),
-                raw_path=data.get("raw_path"),
-                event_type=data.get("event_type"),
-                claim_id=data.get("claim_id"),
-                worker_id=data.get("worker_id"),
-                failure_reason=data.get("failure_reason"),
-                failure_category=data.get("failure_category"),
-                retry_of_claim_id=data.get("retry_of_claim_id"),
-                agent_profile=data.get("agent_profile"),
-                backend_type=data.get("backend_type"),
-                backend_target=data.get("backend_target"),
-                routing_source=data.get("routing_source"),
-                routing_reason=data.get("routing_reason"),
-                fallback_from_profile=data.get("fallback_from_profile"),
-                session_id=data.get("session_id"),
-                router_prompt_version=data.get("router_prompt_version"),
-                backend_metadata=(
-                    dict(data["backend_metadata"])
-                    if isinstance(data.get("backend_metadata"), dict)
-                    else {}
-                ),
-                worktree_branch=data.get("worktree_branch"),
-                rework_iteration=data.get("rework_iteration"),
-            )
-        except (json.JSONDecodeError, KeyError, ValueError):
-            return None
-    # Backward compat: legacy TSV lines `<iso>\t<card_id>\t<message>`.
-    parts = line.split("\t", 2)
-    if len(parts) != 3:
-        return None
-    ts, card_id, message = parts
-    try:
-        at = datetime.fromisoformat(ts)
-    except ValueError:
-        return None
-    return CardEvent(card_id=card_id, message=message, at=at)
-
-
-# ---------- serialization helpers ----------
-
-_CARD_FIELD_NAMES = {f.name for f in fields(Card)}
-
-
-def _render_card(card: Card) -> str:
-    fm = _dump_toml(_card_to_toml_dict(card))
-    body = _render_body(card)
-    return f"{FRONT_MATTER_DELIM}\n{fm}{FRONT_MATTER_DELIM}\n\n{body}"
-
-
-def _card_to_toml_dict(card: Card) -> dict[str, Any]:
-    data: dict[str, Any] = {
-        "id": card.id,
-        "title": card.title,
-        "status": card.status.value,
-        "priority": int(card.priority),
-        "goal": card.goal,
-        "acceptance_criteria": list(card.acceptance_criteria),
-        "context_refs": [
-            {"path": r.path, "kind": r.kind, "note": r.note} for r in card.context_refs
-        ],
-        "depends_on": list(card.depends_on),
-        "history": list(card.history),
-        "created_at": card.created_at,
-        "updated_at": card.updated_at,
-    }
-    if card.blocked_at is not None:
-        data["blocked_at"] = card.blocked_at
-    if card.owner_role is not None:
-        data["owner_role"] = card.owner_role.value
-    if card.blocked_reason is not None:
-        data["blocked_reason"] = card.blocked_reason
-    if card.agent_profile is not None:
-        data["agent_profile"] = card.agent_profile
-    if card.agent_profile_source is not None:
-        data["agent_profile_source"] = card.agent_profile_source
-    if card.outputs:
-        data["outputs"] = dict(card.outputs)
-    if card.worktree_branch is not None:
-        data["worktree_branch"] = card.worktree_branch
-    if card.worktree_base_commit is not None:
-        data["worktree_base_commit"] = card.worktree_base_commit
-    if card.revision_requests:
-        data["revision_requests"] = [
-            {
-                "at": r.at,
-                "from_role": r.from_role.value,
-                "iteration": int(r.iteration),
-                "summary": r.summary,
-                "hints": list(r.hints),
-                "failing_criteria": list(r.failing_criteria),
-            }
-            for r in card.revision_requests
-        ]
-    if card.rework_iteration:
-        data["rework_iteration"] = int(card.rework_iteration)
-    return data
-
-
-def _render_body(card: Card) -> str:
-    lines: list[str] = [f"# {card.title}", "", "## Goal", "", card.goal, ""]
-    if card.acceptance_criteria:
-        lines += ["## Acceptance Criteria", ""]
-        lines += [f"- {item}" for item in card.acceptance_criteria]
-        lines.append("")
-    if card.context_refs:
-        lines += ["## Context", ""]
-        for ref in card.context_refs:
-            suffix = f" — {ref.note}" if ref.note else ""
-            lines.append(f"- [{ref.kind}] `{ref.path}`{suffix}")
-        lines.append("")
-    if card.outputs:
-        lines += ["## Outputs", ""]
-        for key, value in card.outputs.items():
-            lines += [f"### {key}", "", str(value), ""]
-    if card.history:
-        lines += ["## History", ""]
-        lines += [f"- {item}" for item in card.history]
-        lines.append("")
-    return "\n".join(lines)
-
-
-def _read_card(path: Path) -> Card:
-    text = path.read_text(encoding="utf-8")
-    fm = _extract_front_matter(text, path)
-    data = tomllib.loads(fm)
-    return _card_from_toml_dict(data)
-
-
-def _extract_front_matter(text: str, path: Path) -> str:
-    lines = text.splitlines()
-    if not lines or lines[0].strip() != FRONT_MATTER_DELIM:
-        raise ValueError(f"Missing front-matter opener in {path}")
-    for i in range(1, len(lines)):
-        if lines[i].strip() == FRONT_MATTER_DELIM:
-            return "\n".join(lines[1:i]) + "\n"
-    raise ValueError(f"Unclosed front-matter in {path}")
-
-
-def _card_from_toml_dict(data: dict[str, Any]) -> Card:
-    kwargs: dict[str, Any] = {}
-    for key, value in data.items():
-        if key not in _CARD_FIELD_NAMES:
-            continue
-        if key == "status":
-            kwargs[key] = coerce_card_status(value)
-        elif key == "priority":
-            kwargs[key] = CardPriority(int(value))
-        elif key == "owner_role":
-            kwargs[key] = AgentRole(value) if value is not None else None
-        elif key == "context_refs":
-            coerced: list[ContextRef] = []
-            for raw in value:
-                ref = ContextRef.try_coerce(raw)
-                if ref is None:
-                    _LOG.warning(
-                        "Dropping malformed context_ref in card %s: %r",
-                        data.get("id", "<unknown>"),
-                        raw,
-                    )
-                    continue
-                coerced.append(ref)
-            kwargs[key] = coerced
-        elif key == "revision_requests":
-            kwargs[key] = _coerce_revision_requests(
-                value, card_id=data.get("id", "<unknown>"),
-            )
-        else:
-            kwargs[key] = value
-    return Card(**kwargs)
-
-
-def _coerce_revision_requests(
-    raw: Any, *, card_id: str,
-) -> list[RevisionRequest]:
-    if not isinstance(raw, list):
-        return []
-    out: list[RevisionRequest] = []
-    for item in raw:
-        if not isinstance(item, dict):
-            _LOG.warning(
-                "Dropping malformed revision_request in card %s: %r",
-                card_id, item,
-            )
-            continue
-        try:
-            at = item.get("at")
-            if isinstance(at, str):
-                at = datetime.fromisoformat(at)
-            if not isinstance(at, datetime):
-                raise ValueError(f"bad at: {at!r}")
-            if at.tzinfo is None:
-                at = at.replace(tzinfo=_UTC)
-            from_role = AgentRole(str(item["from_role"]))
-            out.append(
-                RevisionRequest(
-                    at=at,
-                    from_role=from_role,
-                    iteration=int(item.get("iteration", 0)),
-                    summary=str(item.get("summary", "")),
-                    hints=[str(h) for h in (item.get("hints") or [])],
-                    failing_criteria=[
-                        str(c) for c in (item.get("failing_criteria") or [])
-                    ],
-                )
-            )
-        except (KeyError, ValueError, TypeError) as exc:
-            _LOG.warning(
-                "Dropping malformed revision_request in card %s: %r (%s)",
-                card_id, item, exc,
-            )
-    return out
-
-
-# ---------- minimal TOML dumper (covers the types we use) ----------
-
-
-def _dump_toml(data: dict[str, Any]) -> str:
-    top: list[str] = []
-    tables: list[tuple[str, dict[str, Any]]] = []
-    for key, value in data.items():
-        if isinstance(value, dict):
-            tables.append((key, value))
-        else:
-            top.append(f"{_toml_key(key)} = {_toml_value(value)}")
-    out = "\n".join(top)
-    if out:
-        out += "\n"
-    for name, table in tables:
-        out += f"\n[{_toml_key(name)}]\n"
-        for k, v in table.items():
-            out += f"{_toml_key(k)} = {_toml_value(v)}\n"
-    return out
-
-
-def _toml_key(name: str) -> str:
-    """Return a TOML-safe key: bare if it matches [A-Za-z0-9_-]+, quoted otherwise.
-
-    Agent-supplied outputs can carry dict keys with dots, unicode, or spaces
-    (e.g. filenames like "test_report.xlsx"), which break bare-key syntax and
-    create dotted-key nesting. Quoting keeps round-trip stable.
-    """
-    if _BARE_KEY_RE.match(name):
-        return name
-    return _toml_string(name, inline=True)
-
-
-def _toml_value(value: Any, *, inline: bool = False) -> str:
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, int):
-        return str(value)
-    if isinstance(value, float):
-        return repr(value)
-    if isinstance(value, datetime):
-        return value.isoformat()
-    if isinstance(value, dict):
-        # Inline tables must stay single-line per TOML 1.0.
-        return _toml_inline_table(value)
-    if isinstance(value, list):
-        return "[" + ", ".join(_toml_value(item, inline=inline) for item in value) + "]"
-    if isinstance(value, str):
-        return _toml_string(value, inline=inline)
-    return _toml_string(str(value), inline=inline)
-
-
-def _toml_inline_table(data: dict[str, Any]) -> str:
-    parts = [
-        f"{_toml_key(k)} = {_toml_value(v, inline=True)}" for k, v in data.items()
-    ]
-    return "{ " + ", ".join(parts) + " }"
-
-
-def _toml_string(value: str, *, inline: bool = False) -> str:
-    if "\n" in value and not inline:
-        escaped = value.replace("\\", "\\\\").replace('"""', '\\"\\"\\"')
-        return f'"""\n{escaped}"""'
-    escaped = (
-        value.replace("\\", "\\\\")
-        .replace("\"", "\\\"")
-        .replace("\n", "\\n")
-        .replace("\r", "\\r")
-        .replace("\t", "\\t")
-    )
-    return f'"{escaped}"'
-
-
-# ---------- v0.1.2 runtime JSON (claims / results / workers) ----------
-
-
-def _atomic_write_json(path: Path, data: dict[str, Any]) -> None:
-    """Write JSON via tmp + os.replace so readers never see a torn file."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(
-        json.dumps(data, ensure_ascii=False, sort_keys=True),
-        encoding="utf-8",
-    )
-    os.replace(tmp, path)
-
-
-def _iso(dt: datetime) -> str:
-    return dt.isoformat()
-
-
-def _parse_iso(raw: Any) -> datetime:
-    dt = datetime.fromisoformat(str(raw))
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=_UTC)
-    return dt
-
-
-def _claim_to_json(claim: ExecutionClaim) -> dict[str, Any]:
-    data: dict[str, Any] = {
-        "card_id": claim.card_id,
-        "claim_id": claim.claim_id,
-        "worker_id": claim.worker_id,
-        "role": claim.role.value,
-        "status_at_claim": claim.status_at_claim.value,
-        "attempt": claim.attempt,
-        "retry_count": claim.retry_count,
-        "retry_of_claim_id": claim.retry_of_claim_id,
-        "claimed_at": _iso(claim.claimed_at),
-        "heartbeat_at": _iso(claim.heartbeat_at),
-        "lease_expires_at": _iso(claim.lease_expires_at),
-        "timeout_s": claim.timeout_s,
-    }
-    if claim.worktree_path is not None:
-        data["worktree_path"] = claim.worktree_path
-    return data
-
-
-def _claim_from_json(data: dict[str, Any]) -> ExecutionClaim:
-    return ExecutionClaim(
-        card_id=str(data["card_id"]),
-        claim_id=str(data["claim_id"]),
-        role=AgentRole(data["role"]),
-        status_at_claim=coerce_card_status(data["status_at_claim"]),
-        attempt=int(data["attempt"]),
-        claimed_at=_parse_iso(data["claimed_at"]),
-        heartbeat_at=_parse_iso(data["heartbeat_at"]),
-        lease_expires_at=_parse_iso(data["lease_expires_at"]),
-        timeout_s=int(data["timeout_s"]),
-        worker_id=data.get("worker_id"),
-        retry_count=int(data.get("retry_count", 0)),
-        retry_of_claim_id=data.get("retry_of_claim_id"),
-        worktree_path=data.get("worktree_path"),
-    )
-
-
-def _resource_to_json(usage: ResourceUsage) -> dict[str, Any]:
-    return {
-        "pid": usage.pid,
-        "rss_bytes": usage.rss_bytes,
-        "cpu_seconds": usage.cpu_seconds,
-        "workdir_size_bytes": usage.workdir_size_bytes,
-    }
-
-
-def _resource_from_json(data: dict[str, Any]) -> ResourceUsage:
-    return ResourceUsage(
-        pid=data.get("pid"),
-        rss_bytes=data.get("rss_bytes"),
-        cpu_seconds=data.get("cpu_seconds"),
-        workdir_size_bytes=data.get("workdir_size_bytes"),
-    )
-
-
-def _agent_result_to_json(result: AgentResult) -> dict[str, Any]:
-    # Normalized copy per open-questions decision — drop raw_response to keep
-    # envelopes small; raw text still lives under workspace/raw/.
-    data: dict[str, Any] = {
-        "role": result.role.value,
-        "summary": result.summary,
-        "next_status": result.next_status.value,
-        "updates": dict(result.updates),
-        "prompt_version": result.prompt_version,
-        "duration_ms": result.duration_ms,
-        "attempt": result.attempt,
-    }
-    if result.revision_request is not None:
-        data["revision_request"] = _revision_request_to_json(result.revision_request)
-    return data
-
-
-def _agent_result_from_json(data: dict[str, Any]) -> AgentResult:
-    rr_raw = data.get("revision_request")
-    revision = _revision_request_from_json(rr_raw) if rr_raw else None
-    return AgentResult(
-        role=AgentRole(data["role"]),
-        summary=str(data["summary"]),
-        next_status=coerce_card_status(data["next_status"]),
-        updates=dict(data.get("updates", {})),
-        prompt_version=str(data.get("prompt_version", "")),
-        duration_ms=int(data.get("duration_ms", 0)),
-        attempt=int(data.get("attempt", 1)),
-        revision_request=revision,
-    )
-
-
-def _revision_request_to_json(r: RevisionRequest) -> dict[str, Any]:
-    return {
-        "at": _iso(r.at),
-        "from_role": r.from_role.value,
-        "iteration": int(r.iteration),
-        "summary": r.summary,
-        "hints": list(r.hints),
-        "failing_criteria": list(r.failing_criteria),
-    }
-
-
-def _revision_request_from_json(data: dict[str, Any]) -> RevisionRequest:
-    return RevisionRequest(
-        at=_parse_iso(data["at"]),
-        from_role=AgentRole(data["from_role"]),
-        iteration=int(data.get("iteration", 0)),
-        summary=str(data.get("summary", "")),
-        hints=[str(h) for h in (data.get("hints") or [])],
-        failing_criteria=[str(c) for c in (data.get("failing_criteria") or [])],
-    )
-
-
-def _result_to_json(envelope: ExecutionResultEnvelope) -> dict[str, Any]:
-    out: dict[str, Any] = {
-        "card_id": envelope.card_id,
-        "claim_id": envelope.claim_id,
-        "worker_id": envelope.worker_id,
-        "role": envelope.role.value,
-        "attempt": envelope.attempt,
-        "started_at": _iso(envelope.started_at),
-        "finished_at": _iso(envelope.finished_at),
-        "duration_ms": envelope.duration_ms,
-        "ok": envelope.ok,
-        "failure_reason": envelope.failure_reason,
-        "failure_category": (
-            envelope.failure_category.value
-            if envelope.failure_category is not None
-            else None
-        ),
-    }
-    if envelope.agent_result is not None:
-        out["agent_result"] = _agent_result_to_json(envelope.agent_result)
-    if envelope.resource_usage is not None:
-        out["resource_usage"] = _resource_to_json(envelope.resource_usage)
-    return out
-
-
-def _result_from_json(data: dict[str, Any]) -> ExecutionResultEnvelope:
-    agent_result = (
-        _agent_result_from_json(data["agent_result"])
-        if data.get("agent_result") is not None
-        else None
-    )
-    resource_usage = (
-        _resource_from_json(data["resource_usage"])
-        if data.get("resource_usage") is not None
-        else None
-    )
-    raw_cat = data.get("failure_category")
-    failure_category = FailureCategory(raw_cat) if raw_cat else None
-    return ExecutionResultEnvelope(
-        card_id=str(data["card_id"]),
-        claim_id=str(data["claim_id"]),
-        role=AgentRole(data["role"]),
-        attempt=int(data["attempt"]),
-        started_at=_parse_iso(data["started_at"]),
-        finished_at=_parse_iso(data["finished_at"]),
-        duration_ms=int(data["duration_ms"]),
-        ok=bool(data["ok"]),
-        agent_result=agent_result,
-        worker_id=data.get("worker_id"),
-        failure_reason=data.get("failure_reason"),
-        failure_category=failure_category,
-        resource_usage=resource_usage,
-    )
-
-
-def _worker_to_json(presence: WorkerPresence) -> dict[str, Any]:
-    return {
-        "worker_id": presence.worker_id,
-        "pid": presence.pid,
-        "started_at": _iso(presence.started_at),
-        "heartbeat_at": _iso(presence.heartbeat_at),
-        "host": presence.host,
-    }
-
-
-def _worker_from_json(data: dict[str, Any]) -> WorkerPresence:
-    return WorkerPresence(
-        worker_id=str(data["worker_id"]),
-        pid=int(data["pid"]),
-        started_at=_parse_iso(data["started_at"]),
-        heartbeat_at=_parse_iso(data["heartbeat_at"]),
-        host=data.get("host"),
-    )
