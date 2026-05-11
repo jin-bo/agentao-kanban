@@ -780,3 +780,91 @@ body {
 .depends-add:hover {
   background: rgba(110, 168, 255, 0.1);
 }
+
+/* --- Card detail: Result section --- */
+.result-section .result-dl {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 3px 10px;
+  font-size: 12px;
+  margin: 0;
+}
+.result-section .result-dl dt {
+  color: var(--text-dim);
+}
+.result-section .result-dl dd {
+  margin: 0;
+  word-break: break-word;
+}
+.result-section .result-dl dd code {
+  font-family: var(--mono);
+  font-size: 11px;
+}
+.result-section .badge.wt-state {
+  text-transform: lowercase;
+}
+.badge.wt-active { border-color: var(--accent); color: var(--accent); }
+.badge.wt-detached { border-color: var(--ok); color: var(--ok); }
+.badge.wt-missing,
+.badge.wt-not-git { border-color: var(--warn); color: var(--warn); }
+.result-list {
+  margin: 0;
+  padding-left: 16px;
+  font-size: 11px;
+}
+.result-list li {
+  font-family: var(--mono);
+  word-break: break-word;
+}
+.result-next {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.result-next-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  color: var(--text-dim);
+  font-weight: 600;
+}
+.next-steps {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.next-steps li code.copyable {
+  display: block;
+  background: var(--bg-elev-2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 4px 8px;
+  font-family: var(--mono);
+  font-size: 11px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  cursor: pointer;
+}
+.next-steps li code.copyable:hover {
+  border-color: var(--accent);
+}
+.next-steps li.next-comment {
+  font-size: 11px;
+  color: var(--text-dim);
+  font-style: italic;
+}
+.linklike {
+  background: none;
+  border: 0;
+  color: var(--accent);
+  cursor: pointer;
+  font: inherit;
+  padding: 0;
+}
+.linklike:hover {
+  text-decoration: underline;
+}

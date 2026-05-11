@@ -46,9 +46,35 @@ class WorktreeManager:
     artifacts_retention: int = DEFAULT_ARTIFACTS_RETENTION
     artifacts_max_bytes: int = DEFAULT_ARTIFACTS_MAX_BYTES
     artifacts_denylist: tuple[str, ...] = DEFAULT_ARTIFACTS_DENYLIST
+    # When False, skip the ``.git/info/exclude`` bookkeeping in
+    # ``__post_init__``. Set this for read-only probes (e.g. result
+    # rendering behind the read-only web endpoint) that must not touch
+    # the repository at all.
+    manage_exclude: bool = True
+
+    @classmethod
+    def for_project(
+        cls,
+        project_root: Path,
+        *,
+        base_ref: str = "HEAD",
+        manage_exclude: bool = True,
+    ) -> WorktreeManager:
+        """Build a manager for the conventional layout: worktrees under
+        ``<project_root>/workspace/worktrees`` and artifact snapshots under
+        ``<project_root>/workspace/raw``. Pass ``manage_exclude=False`` for
+        a side-effect-free, read-only manager."""
+        return cls(
+            project_root=project_root,
+            worktrees_root=project_root / "workspace" / "worktrees",
+            artifacts_root=project_root / "workspace" / "raw",
+            base_ref=base_ref,
+            manage_exclude=manage_exclude,
+        )
 
     def __post_init__(self) -> None:
-        self._ensure_ignored()
+        if self.manage_exclude:
+            self._ensure_ignored()
         # Env override applied per-instance so test fixtures and
         # subprocesses can dial the cap without changing call sites.
         env_cap = os.environ.get(ARTIFACTS_MAX_BYTES_ENV)

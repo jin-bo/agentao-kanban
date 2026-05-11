@@ -3,6 +3,12 @@
 > Status: proposed for `0.1.8-dev`. This plan follows the latest CLI
 > result/worktree/artifacts updates and defines how the Web UI should expose
 > the same operator model.
+>
+> **Scope note (post-review):** the goal is narrow — promote the Web UI from
+> "artifact browser" to "result entry point". Anything that changes the CLI
+> JSON contract, the worktree layer, the card-detail dependency surface, or adds
+> write actions is **out of scope here** and tracked in its own plan (see
+> "Out of scope / follow-ups" at the end). P0 is read-only and self-contained.
 
 ## Context
 
@@ -41,7 +47,22 @@ Web UI 已经开始补齐这条路径：
 GET /api/cards/{card_id}/result
 ```
 
-响应应与 CLI `kanban result --json` 对齐：
+响应携带与 CLI `kanban result --json` 相同的字段语义。**Payload shape is fixed
+for P0** — no flexible alternatives:
+
+- `branch` is the full `kanban/<uuid>`.
+- `artifacts` / `transcripts` stay **absolute-path string arrays** (this is what
+  the CLI summarizer already returns: `TraceInfo.path` is `str(path)`, and
+  `MarkdownBoardStore.raw_root` defaults to `board_dir.parent / "raw"`, with the
+  board dir `resolve()`d — so don't *imply* a `workspace/raw/...` literal).
+- For the UI, add **sibling maps** `artifact_display_paths` /
+  `transcript_display_paths` keyed by the absolute path, value = path relative to
+  the board / git-root. These are Web-API-only; the CLI JSON is untouched.
+- `next_steps` reuses the CLI summarizer's command strings (see
+  `_summarize_card_result` in `kanban/cli/rendering.py` — the
+  `"kanban worktree diff <id>  # ..."` list). This plan **does not change the
+  CLI JSON contract**; if the UI wants structured actions, derive a separate
+  `actions` field in the Web API layer without touching the CLI output.
 
 ```json
 {
@@ -52,26 +73,50 @@ GET /api/cards/{card_id}/result
   "summary": "...",
   "outputs": ["..."],
   "worktree": {
-    "branch": "kanban/<card-id>",
+    "branch": "kanban/<uuid>",
     "base_commit": "...",
     "state": "detached",
     "path": null
   },
-  "artifacts": ["workspace/raw/<card-id>/artifacts-..."],
-  "transcripts": ["workspace/raw/<card-id>/worker-...md"],
-  "next_steps": ["kanban worktree diff <card-id>", "..."]
+  "artifacts": ["/abs/.../workspace/raw/<uuid>/artifacts-..."],
+  "transcripts": ["/abs/.../workspace/raw/<uuid>/<role>-<ts>.md"],
+  "artifact_display_paths": {"/abs/.../workspace/raw/<uuid>/artifacts-...": "workspace/raw/<uuid>/artifacts-..."},
+  "transcript_display_paths": {"/abs/.../workspace/raw/<uuid>/<role>-<ts>.md": "workspace/raw/<uuid>/<role>-<ts>.md"},
+  "next_steps": ["kanban worktree diff <id>  # review changes on the preserved branch", "..."]
 }
 ```
 
 Implementation notes:
 
-- Prefer extracting the shared summarizer from `kanban/cli.py` into a small
-  reusable module instead of duplicating logic in `kanban/web.py`.
+- **Extract a lightweight shared summarizer first**, but keep the CLI output
+  byte-for-byte the same. `_summarize_card_result` / `_worktree_state` /
+  `_list_artifact_dirs` currently live in `kanban/cli/rendering.py` and take an
+  `argparse.Namespace` (they read `args.board`). Refactor them to take a
+  `board_dir: Path` (or a tiny context object) and move them into a new
+  `kanban/result.py`; `kanban/cli/rendering.py` imports from there and is
+  expected to produce identical `kanban result` / `kanban show` output (add a
+  regression test if one doesn't already cover it).
+- **Artifacts-root resolution rule for P0** — there are two roots in the codebase
+  today: the CLI/`_worktree_state` path uses `git_root / "workspace" / "raw"`,
+  while `MarkdownBoardStore.raw_root` (used by the store's `list_traces`) and
+  `web.py:_artifacts_root_for` use `board_dir.parent / "raw"`. To avoid both a
+  CLI regression *and* a Result-vs-Artifacts data-source mismatch:
+  - The **CLI** keeps resolving artifacts via `git_root / "workspace" / "raw"` —
+    no behavior change for non-standard layouts.
+  - The **Web Result endpoint** resolves artifacts the same way the existing Web
+    artifacts endpoint and the store do (`board_dir.parent / "raw"`), so the
+    Result and Artifacts panels never disagree.
+  - Add a test for a non-standard board layout (board dir not at
+    `<git_root>/workspace/board`) asserting CLI and Web each stay on their
+    respective root and neither 500s.
+  - (Reconciling the two roots project-wide is a separate cleanup, out of scope.)
 - Keep the endpoint read-only and available without `--enable-writes`.
 - Preserve the same state vocabulary as CLI: `none`, `not-git`, `active`,
   `detached`, `missing`.
-- Add tests that compare the Web result payload against CLI result semantics for
-  fresh, detached, missing, and transcript/artifact-bearing cards.
+- Add tests in `tests/test_web.py` (and extend `tests/test_cli_result.py`) that
+  assert the Web result payload carries the same field values as `kanban result
+  --json` for the same card — parametrize over fresh, detached, missing, and
+  transcript/artifact-bearing cards.
 
 ## P0: Card Detail Result Section
 
@@ -92,7 +137,11 @@ The Result section should show:
 - outputs count/list
 - artifacts count with jump link to Artifacts section
 - transcripts count with jump link to Transcripts section once implemented
-- next-step actions rendered as readable commands or buttons
+- next steps rendered as copyable command lines (the strings the summarizer
+  already returns). Read-only ones (`kanban worktree diff`, `kanban traces`) may
+  later become in-app buttons once those Web routes exist (P1); `git merge` /
+  `kanban worktree prune` stay copy-only — never one-click — because their blast
+  radius is larger than the read-only surface this plan ships.
 
 Worktree state copy:
 
@@ -125,33 +174,57 @@ GET /api/cards/{card_id}/traces
 GET /api/cards/{card_id}/traces/{trace_id}/file
 ```
 
+Note: the API path segment is `traces` (matching the CLI `kanban traces`); the
+UI labels this surface "Transcripts". Keep that mapping consistent — don't
+introduce a third term.
+
+The listing endpoint should reuse `store.list_traces(card_id)`, which returns
+`TraceInfo(card_id, role, at, path, size)` — but note `list_traces` only sorts
+by **filename glob**, and only the `latest=True` path picks `max(.. , key=at)`.
+So the endpoint must **explicitly sort the result by `TraceInfo.at` descending**
+before returning it; don't rely on glob order to define "latest transcript".
+Return absolute `path` plus a board-relative `display_path` (same convention as
+the Result API), and the per-file `size`.
+
 UI behavior:
 
 - Show latest transcript in card detail.
 - Support opening raw transcript in a new tab or inline read-only viewer.
 - Surface transcript count in Result.
-- Convert CLI next step `kanban traces <card-id> --latest` into a Web action
-  when traces exist.
+- Once this route exists, the `kanban traces <id> --latest` next-step line in the
+  Result section can become an in-app link instead of a copyable command.
 
 Security notes:
 
-- Use strict path validation, similar to artifacts file serving.
+- Mirror the artifacts file-serving validation in `web.py` (reject `..`,
+  absolute paths, leading slash, symlink leaves, intermediate symlinks that
+  escape the directory).
+- `trace_id` is a filename, not a directory — validate it against a
+  `TRACE_FILE_NAME_RE` (`<role>-<utc-stamp>.md`) **or**, simpler and safer,
+  resolve it by exact match against `store.list_traces()` output rather than
+  trusting the segment.
 - Do not serve arbitrary files from `workspace/raw`.
-- Add size cap for inline display.
+- Add a byte cap for inline display, same shape as `_ARTIFACT_FILE_MAX_BYTES`
+  (return 413 with the on-disk path when exceeded).
 
 ## P1: Read-Only Diff View
 
-Add:
+This is **independent of P0** — the Result section ships without it. It also
+touches the worktree layer, not just a Web route, so split it into two tasks:
+
+**P1a — worktree-layer prep (no Web change):** add a `timeout` to the `git`
+subprocess calls in `WorktreeManager.diff_summary` (`kanban/worktree/__init__.py`)
+and cover the timeout + existing error paths with tests. `diff_summary` shells
+out to `git diff --stat`, `git diff HEAD`, and `git ls-files`; a hung repo would
+otherwise tie up a FastAPI threadpool worker indefinitely.
+
+**P1b — Web route:**
 
 ```text
 GET /api/cards/{card_id}/diff
 ```
 
-Goal: Web equivalent of:
-
-```bash
-kanban worktree diff <card-id>
-```
+Web equivalent of `kanban worktree diff <card-id>`.
 
 UI behavior:
 
@@ -161,27 +234,23 @@ UI behavior:
 - Keep it read-only; no merge, checkout, branch delete, or prune operation in
   this phase.
 
+Implementation notes:
+
+- `WorktreeManager.diff_summary` only raises `WorktreeDiffError` (missing
+  `base_commit`, ref not found, `git diff` failure); it does **not** distinguish
+  `none` / `not-git` / `missing`. The handler must first compute the worktree
+  state via the shared summarizer and return the matching error before calling
+  `diff_summary` — don't rely on the exception text for classification.
+- Add an inline byte cap on the diff body (same shape as the artifacts/transcript
+  cap): a large change set produces a large `git diff --stat` + untracked listing.
+
 Testing:
 
 - Active branch with diff.
 - Detached branch with diff.
 - Missing branch returns actionable error.
 - Non-git board returns stable no-diff state, not 500.
-
-## P1: Dependency UX
-
-The Add Card modal now supports `depends_on`, but read-side dependency context is
-still thin.
-
-Improvements:
-
-- Render `depends_on` as clickable chips in card detail, not raw UUIDs.
-- Show reverse dependencies: cards this card unblocks.
-- On board cards, show compact blocked-by/unblocks indicators.
-- In Add Card, allow searching by title text, not only full UUID or unique id
-  prefix.
-- Keep DONE cards hidden from default dependency suggestions, but allow explicit
-  full-id paste.
+- Card with no worktree (`none`) returns a clean empty state, not an error.
 
 ## P2: Artifact Browser Polish
 
@@ -195,53 +264,100 @@ Improve the existing artifacts surface:
 - Preserve expanded snapshot state across detail refreshes, which the current UI
   already starts to do.
 
-## P2: Operator Actions
-
-Only after the read-only result surfaces are stable, consider small write
-actions under `--enable-writes`:
-
-- move
-- requeue
-- block
-- unblock
-
-Do not add merge, prune, branch deletion, checkout, or filesystem cleanup to the
-first write expansion. Those actions have a larger blast radius and should remain
-CLI-only until there is an explicit safety design.
-
 ## API Design Principles
 
-- Web result semantics should follow CLI result semantics.
-- Result aggregation should be shared code where practical.
-- Read endpoints must not require `--enable-writes`.
+- Web result semantics should follow CLI result semantics (same field values for
+  the same card).
+- Result aggregation should be shared code where practical (target: a
+  lightweight `kanban/result.py`); the refactor must not change CLI output.
+- Read endpoints must not require `--enable-writes`. This plan adds no write
+  endpoints.
 - File-serving endpoints must validate path segments and reject traversal,
   absolute paths, symlinks, and oversized inline payloads.
+- File-path arrays in API responses are absolute strings (matching the CLI
+  summarizer); the board/git-root-relative variants ride alongside as sibling
+  maps (`artifact_display_paths` / `transcript_display_paths`), Web-API-only.
+  Don't imply a fixed `workspace/raw/...` shape — the raw root is
+  `board_dir.parent / "raw"` by default and the board dir is `resolve()`d.
+- Any endpoint that shells out to `git` (diff) must pass a subprocess timeout —
+  web handlers run on the FastAPI threadpool and a hung repo would exhaust it.
 - Empty states are product behavior, not afterthoughts. They should explain the
   lifecycle: active directory, detached branch, saved artifacts, retained
   transcript.
 
 ## Suggested Implementation Order
 
-1. Extract shared result summarizer.
-2. Add `GET /api/cards/{card_id}/result`.
-3. Add Result section to card detail.
+P0 (one PR, read-only, self-contained):
+
+1. Extract a lightweight `kanban/result.py`: move `_summarize_card_result` /
+   `_worktree_state` / `_list_artifact_dirs` off `argparse.Namespace` onto
+   `board_dir: Path`. `kanban/cli/rendering.py` imports from it and produces
+   **identical** CLI output (add a regression test). Do **not** change the CLI
+   JSON shape, and do **not** change the CLI's artifacts root — see the
+   "Artifacts-root resolution rule for P0" above (CLI stays on
+   `git_root/workspace/raw`; the Web endpoint uses the store's
+   `board_dir.parent/raw`).
+2. Add `GET /api/cards/{card_id}/result` (read-only, no `--enable-writes`).
+3. Add the Result section to card detail (the new top section).
 4. Reframe Artifacts under Result and improve empty states.
-5. Add transcript listing/file serving.
-6. Add read-only diff endpoint and UI.
-7. Improve dependency read-side UX.
-8. Polish artifacts filtering/preview/copy affordances.
-9. Evaluate limited write actions under `--enable-writes`.
 
-## Acceptance Criteria
+P1 (separate PRs, each independent of P0):
 
-- A user can open a card in Web UI and answer:
+5. Transcript browser: `GET /api/cards/{card_id}/traces` +
+   `/traces/{trace_id}/file`, sorted by `TraceInfo.at` desc, with path
+   validation and a byte cap.
+6. P1a: add a `timeout` to `WorktreeManager.diff_summary` git calls + tests.
+   P1b: `GET /api/cards/{card_id}/diff` + Changes section in card detail.
+
+P2 (later, polish):
+
+7. Artifact browser filtering / preview / copyable paths.
+
+Anything else (CLI JSON restructure, dependency UX, write/operator actions, the
+safety design those need) is **out of scope** — see below.
+
+## Out of scope / follow-ups
+
+These were considered and deliberately split out so the Result work stays small
+and read-only:
+
+- **Structured `next_steps` + CLI JSON restructure** — making the summarizer
+  return `{kind, ...}` records and reshaping `kanban result --json` is a
+  pre-1.0 CLI break; do it in its own PR if/when the UI actually needs it.
+- **Dependency UX** — clickable `depends_on` chips, reverse dependencies (a new
+  `dependents` field on card detail computed from `list_cards()`), board
+  blocked-by/unblocks indicators, title-text search in Add Card. Its own plan.
+- **Operator write actions** (`move` / `requeue` / `block` / `unblock` over
+  HTTP) — reverses the deliberate decision in `kanban/web.py` (only `POST
+  /api/cards` mutates, because it doesn't race `.daemon.lock`). Needs a safety
+  design first: refuse with 409 when the daemon lock is held, no
+  `--force`-equivalent over HTTP, update the `web.py` module docstring. Not part
+  of this plan.
+- **Worktree mutations from the Web** (merge / prune / branch delete / checkout /
+  filesystem cleanup) — larger blast radius; CLI-only until there's an explicit
+  safety design.
+
+## Acceptance Criteria (P0)
+
+- A user can open a card in the Web UI and answer:
   - Did this card produce a result?
-  - Where are the code changes?
-  - Is the worktree active, detached, missing, absent, or unavailable?
+  - Where are the code changes? (branch, worktree path if active)
+  - Is the worktree `active` / `detached` / `missing` / `none` / `not-git`?
   - Are there saved artifacts?
   - Is there a transcript?
-  - What is the next review/debug command or Web action?
-- The Web result payload matches CLI `kanban result --json` semantics.
-- No read-only Web route requires `--enable-writes`.
-- Artifact and transcript file serving have path traversal and size-limit tests.
-- Detached worktree state is presented as preserved result, not as missing work.
+  - What is the next review/debug command (shown as a copyable line)?
+- The Web result payload carries the same field values as `kanban result --json`
+  for the same card — after normalizing the Web-only additions (the
+  `*_display_paths` maps) and on the standard board layout where both sides
+  resolve the same raw root. Verified by a test parametrized over fresh /
+  detached / missing / artifact- and transcript-bearing cards.
+- A non-standard board layout (board dir not at `<git_root>/workspace/board`):
+  CLI and Web each stay on their own artifacts root and neither 500s.
+- `kanban result` / `kanban show` output is unchanged by the `kanban/result.py`
+  extraction (regression test).
+- No Web route added by this plan requires `--enable-writes`.
+- Artifact file serving keeps its path-traversal and size-limit tests; the new
+  Result endpoint surfaces absolute-path arrays (`artifacts` / `transcripts`)
+  plus the relative `artifact_display_paths` / `transcript_display_paths` maps —
+  not object arrays, and never an implied `workspace/raw/...` literal.
+- Detached worktree state is presented as a preserved result, not as missing work.

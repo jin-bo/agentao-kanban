@@ -7,6 +7,33 @@
 ## [Unreleased]
 
 ### Added
+- **Web UI:卡片 Result 视图**。把 web 从"artifact 浏览器"提升成
+  `kanban result <card-id>` 的图形化入口。
+  - 新端点 `GET /api/cards/{card_id}/result`(只读,不需要 `--enable-writes`):
+    返回与 CLI `kanban result --json` 同语义的字段(`status` / `summary` /
+    `outputs` / `worktree`{branch,base_commit,state,path} / `artifacts` /
+    `transcripts` / `next_steps`),外加 web 专用的 `artifact_display_paths` /
+    `transcript_display_paths`(绝对路径 → board/git-root 相对路径 的 map,给
+    UI 展示)。`artifacts` / `transcripts` 仍是绝对路径字符串数组,不改 CLI
+    JSON 合约。worktree state 沿用 CLI 词汇:`none` / `not-git` / `active` /
+    `detached` / `missing`。
+  - 卡片详情模态框新增 **Result** 区(置顶),区块顺序改为
+    Result → Artifacts → Recent events → Metadata → Goal/Acceptance/Blocked:
+    展示 status、blocked reason、worker summary、worktree state badge + 解释
+    文案、branch / worktree path、outputs、artifacts 数量(带跳转到 Artifacts
+    区的链接)、transcripts 数量、next steps(渲染成可点击复制的命令行;
+    `git merge` / `kanban worktree prune` 这类只读不可一键执行的也只做可复制
+    展示,不做按钮)。
+  - Artifacts 面板空态文案改为依据 result/worktree state 解释*为什么*没有
+    产物(没挂 worktree / 不在 git 仓 / worktree 还 active / worker 没写
+    gitignored 文件),而不是一句干巴巴的 "(none)"。
+  - 重构:抽出 `kanban/result.py`(`summarize_card_result` / `worktree_state` /
+    `list_artifact_dirs`),CLI 和 web 共用;`kanban result` / `kanban show`
+    输出不变。CLI 的 artifact 根仍是 `<git_root>/workspace/raw`,web 端点用
+    store 的 `board_dir.parent/raw`(标准布局下两者一致,非标准布局下各守
+    各的根、都不 500)。`_find_git_root_optional` 挪进 dependency-free 的
+    `kanban/gitutil.py`。
+
 - **Web UI:Add Card 模态支持 `depends_on`**。新增"Depends on"区:
   chip 列表 + 搜索框 + native `<datalist>` 自动补全,候选来自最近一次
   `/api/board` 快照(过滤掉 DONE),按短 ID + 标题展示。输入接受全 UUID

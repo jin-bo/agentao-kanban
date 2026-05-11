@@ -28,6 +28,12 @@
   let detailArtifacts = null;
   let detailArtifactsState = "idle"; // idle | loading | loaded | error
   let detailArtifactsError = "";
+  // The unified "result" view (status, summary, worktree state, artifact
+  // & transcript counts, next steps) — same source the CLI `kanban result`
+  // reads. Fetched once per detail-modal open, like artifacts.
+  let detailResult = null;
+  let detailResultState = "idle"; // idle | loading | loaded | error
+  let detailResultError = "";
   // Tracks which artifact snapshots the user has expanded. The detail
   // modal re-renders on every 5s tick, so without this state any
   // <details> the user opened would collapse back to default.
@@ -629,13 +635,32 @@
       ]),
     ]);
 
+    // Result and Artifacts lead so the operator can answer "what did this
+    // card produce / where is it" before wading through metadata.
     const sections = [];
 
-    if (card.goal) {
+    sections.push(renderResultSection());
+    sections.push(renderArtifactsSection(card.id));
+
+    if (card.recent_events && card.recent_events.length) {
+      const ev = el("ol", { class: "events" });
+      for (const e of card.recent_events.slice().reverse()) {
+        ev.appendChild(
+          el("li", {}, [
+            el("span", { class: "event-time" }, fmtTime(e.at)),
+            el(
+              "span",
+              { class: "event-tag" + (e.role ? ` role-${e.role}` : "") },
+              e.display_tag || "info",
+            ),
+            el("span", { class: "event-message" }, e.message || ""),
+          ]),
+        );
+      }
       sections.push(
         el("div", { class: "card-detail-section" }, [
-          el("h3", {}, "Goal"),
-          el("p", { class: "hint" }, card.goal),
+          el("h3", {}, "Recent events"),
+          ev,
         ]),
       );
     }
@@ -665,6 +690,15 @@
       ]),
     );
 
+    if (card.goal) {
+      sections.push(
+        el("div", { class: "card-detail-section" }, [
+          el("h3", {}, "Goal"),
+          el("p", { class: "hint" }, card.goal),
+        ]),
+      );
+    }
+
     if (card.blocked_reason) {
       sections.push(
         el("div", { class: "card-detail-section" }, [
@@ -689,32 +723,150 @@
       );
     }
 
-    if (card.recent_events && card.recent_events.length) {
-      const ev = el("ol", { class: "events" });
-      for (const e of card.recent_events.slice().reverse()) {
-        ev.appendChild(
+    detailModalBody.replaceChildren(head, ...sections);
+  }
+
+  // Operator-facing copy for each worktree state, mirroring the table in
+  // docs/kanban-web-ui-result-improvement-plan.md and the CLI vocabulary.
+  const WORKTREE_STATE_COPY = {
+    active: "Worktree directory is still active; review in-progress changes.",
+    detached: "Directory released; result branch is preserved.",
+    missing:
+      "Recorded branch no longer resolves; stale metadata likely needs pruning.",
+    none: "No worktree was attached to this card.",
+    "not-git":
+      "Board is not inside a Git repository; worktree isolation is unavailable.",
+  };
+
+  function copyText(text) {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).catch(() => {});
+    }
+  }
+
+  function jumpToSection(id) {
+    const node = document.getElementById(id);
+    if (node) node.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+
+  function artifactsEmptyHint(result) {
+    // Explain *why* there are no artifacts based on the result state,
+    // rather than a flat "(none)".
+    const state = result && result.worktree && result.worktree.state;
+    if (state === "none")
+      return "(none — no worktree was attached, so no gitignored deliverables were captured)";
+    if (state === "not-git")
+      return "(none — board isn't a Git repo, so artifact capture is unavailable)";
+    if (state === "active")
+      return "(none yet — gitignored worker output is captured here when the worktree is detached)";
+    return "(none — the worker wrote no gitignored deliverables; this only covers files git ignores, not code changes)";
+  }
+
+  function renderResultSection() {
+    const wrap = el("div", {
+      class: "card-detail-section result-section",
+      id: "detail-result",
+    });
+    wrap.appendChild(el("h3", {}, "Result"));
+    if (detailResultState === "loading" || detailResultState === "idle") {
+      wrap.appendChild(el("p", { class: "hint" }, "Loading…"));
+      return wrap;
+    }
+    if (detailResultState === "error") {
+      wrap.appendChild(
+        el(
+          "p",
+          { class: "hint artifacts-error" },
+          `Failed to load result: ${detailResultError}`,
+        ),
+      );
+      return wrap;
+    }
+    const r = detailResult || {};
+    const wt = r.worktree || {};
+    const dl = el("dl", { class: "result-dl" });
+    const row = (k, v) => {
+      if (v === null || v === undefined || v === "") return;
+      dl.appendChild(el("dt", {}, k));
+      dl.appendChild(el("dd", {}, v));
+    };
+    row("status", el("span", { class: "badge" }, r.status || "–"));
+    if (r.blocked_reason)
+      row("blocked", el("span", { class: "blocked-reason" }, r.blocked_reason));
+    if (r.summary) row("summary", el("span", {}, r.summary));
+    const stateBadge = el(
+      "span",
+      { class: `badge wt-state wt-${wt.state || "none"}` },
+      wt.state || "none",
+    );
+    row(
+      "worktree",
+      el("span", {}, [
+        stateBadge,
+        " ",
+        el("span", { class: "hint" }, WORKTREE_STATE_COPY[wt.state] || ""),
+      ]),
+    );
+    if (wt.branch) row("branch", el("code", {}, wt.branch));
+    if (wt.path) row("worktree path", el("code", {}, wt.path));
+    const outputs = r.outputs || [];
+    if (outputs.length) {
+      const ul = el("ul", { class: "result-list" });
+      for (const o of outputs) ul.appendChild(el("li", {}, el("code", {}, o)));
+      row("outputs", ul);
+    }
+    const artCount = (r.artifacts || []).length;
+    row(
+      "artifacts",
+      artCount
+        ? el("button", {
+            class: "linklike",
+            type: "button",
+            onclick: () => jumpToSection("detail-artifacts"),
+          }, `${artCount} snapshot${artCount === 1 ? "" : "s"} →`)
+        : el("span", { class: "hint" }, "none"),
+    );
+    const traceCount = (r.transcripts || []).length;
+    row(
+      "transcripts",
+      el(
+        "span",
+        { class: traceCount ? "" : "hint" },
+        traceCount ? `${traceCount} retained` : "none",
+      ),
+    );
+    wrap.appendChild(dl);
+    // Next steps: copyable command lines (never one-click for merge/prune).
+    const steps = r.next_steps || [];
+    if (steps.length) {
+      const stepWrap = el("div", { class: "result-next" }, [
+        el("div", { class: "result-next-label" }, "Next steps"),
+      ]);
+      const ul = el("ul", { class: "next-steps" });
+      for (const s of steps) {
+        const isComment = s.trim().startsWith("(");
+        if (isComment) {
+          ul.appendChild(el("li", { class: "next-comment" }, s));
+          continue;
+        }
+        ul.appendChild(
           el("li", {}, [
-            el("span", { class: "event-time" }, fmtTime(e.at)),
             el(
-              "span",
-              { class: "event-tag" + (e.role ? ` role-${e.role}` : "") },
-              e.display_tag || "info",
+              "code",
+              {
+                class: "copyable",
+                title: "click to copy",
+                onclick: () => copyText(s),
+              },
+              s,
             ),
-            el("span", { class: "event-message" }, e.message || ""),
           ]),
         );
       }
-      sections.push(
-        el("div", { class: "card-detail-section" }, [
-          el("h3", {}, "Recent events"),
-          ev,
-        ]),
-      );
+      stepWrap.appendChild(ul);
+      wrap.appendChild(stepWrap);
     }
-
-    sections.push(renderArtifactsSection(card.id));
-
-    detailModalBody.replaceChildren(head, ...sections);
+    return wrap;
   }
 
   function fmtBytes(n) {
@@ -726,9 +878,10 @@
   }
 
   function renderArtifactsSection(cardId) {
-    const wrap = el("div", { class: "card-detail-section" }, [
-      el("h3", {}, "Artifacts"),
-    ]);
+    const wrap = el("div", {
+      class: "card-detail-section",
+      id: "detail-artifacts",
+    }, [el("h3", {}, "Artifacts")]);
     if (detailArtifactsState === "loading") {
       wrap.appendChild(el("p", { class: "hint" }, "Loading…"));
       return wrap;
@@ -753,7 +906,11 @@
         el(
           "p",
           { class: "hint" },
-          "(none — gitignored worker output is captured here when a worktree is detached)",
+          // Generic message until the result payload lands; then the
+          // worktree-state-aware explanation from artifactsEmptyHint.
+          detailResultState === "loaded"
+            ? artifactsEmptyHint(detailResult)
+            : "(none — gitignored worker output is captured here when a worktree is detached)",
         ),
       );
       return wrap;
@@ -837,6 +994,28 @@
     }
   }
 
+  async function loadResult(id) {
+    detailResultState = "loading";
+    detailResultError = "";
+    detailResult = null;
+    if (selectedCardId === id && detailLastCard) {
+      renderDetailInto(detailLastCard);
+    }
+    try {
+      const data = await fetchJSON(`/api/cards/${encodeURIComponent(id)}/result`);
+      if (selectedCardId !== id) return;
+      detailResult = data;
+      detailResultState = "loaded";
+    } catch (err) {
+      if (selectedCardId !== id) return;
+      detailResultState = "error";
+      detailResultError = err.message;
+    }
+    if (selectedCardId === id && detailLastCard) {
+      renderDetailInto(detailLastCard);
+    }
+  }
+
   async function fetchJSON(url) {
     const r = await fetch(url, {
       headers: { accept: "application/json" },
@@ -875,6 +1054,9 @@
     detailArtifacts = null;
     detailArtifactsState = "loading";
     detailArtifactsError = "";
+    detailResult = null;
+    detailResultState = "loading";
+    detailResultError = "";
     expandedSnapshots.clear();
     const modal = ensureDetailModal();
     modal.classList.remove("hidden");
@@ -887,6 +1069,7 @@
     // Show "Loading…" until the per-card fetch lands.
     renderDetailInto(null);
     refreshDetail();
+    loadResult(id);
     loadArtifacts(id);
   }
 
@@ -896,6 +1079,9 @@
     detailArtifacts = null;
     detailArtifactsState = "idle";
     detailArtifactsError = "";
+    detailResult = null;
+    detailResultState = "idle";
+    detailResultError = "";
     if (detailModal) detailModal.classList.add("hidden");
     if (detailKeydownHandler) {
       document.removeEventListener("keydown", detailKeydownHandler);

@@ -4,12 +4,12 @@ writability guards, and git-root probes shared by every subcommand."""
 from __future__ import annotations
 
 import argparse
-import subprocess
 import sys
 from pathlib import Path
 
 from ..daemon import DaemonLockError, assert_no_daemon
 from ..executors import CardExecutor, MockAgentaoExecutor
+from ..gitutil import find_git_root_optional as _find_git_root_optional
 from ..init import (
     DEFAULT_BOARD_REL as DEFAULT_BOARD,
     MARKER_DIR,
@@ -124,42 +124,6 @@ def _project_root_for(board: Path) -> Path:
     if git_root is not None:
         return git_root
     return current
-
-
-def _find_git_root_optional(board: Path) -> Path | None:
-    """Return the Git toplevel for a board path, or None if none exists.
-
-    Uses ``git rev-parse --show-toplevel`` which works for regular repos,
-    linked worktrees (``.git`` is a file), and boards nested inside repos.
-    When the board path does not yet exist, walk up to the first existing
-    ancestor so we bind to the correct repo even on fresh boards. Returns
-    None (rather than raising) when no existing ancestor or no repo can
-    be found, or when the ``git`` binary itself is unavailable — callers
-    decide whether that's a hard failure.
-    """
-    try:
-        start = board.resolve(strict=False)
-    except OSError:
-        start = board
-    probe = start
-    while not probe.exists():
-        parent = probe.parent
-        if parent == probe:
-            return None
-        probe = parent
-    try:
-        result = subprocess.run(
-            ["git", "rev-parse", "--show-toplevel"],
-            cwd=probe,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-    except OSError:
-        return None
-    if result.returncode != 0:
-        return None
-    return Path(result.stdout.strip())
 
 
 def _find_git_root(board: Path) -> Path:
@@ -313,12 +277,9 @@ def _detach_worktree_after_terminal_cli(
     from ..orchestrator import detach_worktree_on_terminal
     from ..worktree import WorktreeManager
 
-    wt_mgr = WorktreeManager(
-        project_root=project_root,
-        worktrees_root=project_root / "workspace" / "worktrees",
-        artifacts_root=project_root / "workspace" / "raw",
+    detach_worktree_on_terminal(
+        store, WorktreeManager.for_project(project_root), card_id, card.status
     )
-    detach_worktree_on_terminal(store, wt_mgr, card_id, card.status)
 
 
 def _resolve_worktree_mgr(args: argparse.Namespace):
@@ -346,11 +307,7 @@ def _resolve_worktree_mgr(args: argparse.Namespace):
         return None
     from ..worktree import WorktreeManager
 
-    return WorktreeManager(
-        project_root=project_root,
-        worktrees_root=project_root / "workspace" / "worktrees",
-        artifacts_root=project_root / "workspace" / "raw",
-    )
+    return WorktreeManager.for_project(project_root)
 
 
 def _make_orchestrator(
@@ -368,12 +325,7 @@ def _make_orchestrator(
 def _make_worktree_mgr(args: argparse.Namespace):
     from ..worktree import WorktreeManager
 
-    project_root = _find_git_root(args.board)
-    return WorktreeManager(
-        project_root=project_root,
-        worktrees_root=project_root / "workspace" / "worktrees",
-        artifacts_root=project_root / "workspace" / "raw",
-    )
+    return WorktreeManager.for_project(_find_git_root(args.board))
 
 
 def _require_writable(args: argparse.Namespace) -> None:

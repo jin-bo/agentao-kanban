@@ -9,9 +9,14 @@ import json as _json
 from pathlib import Path
 from typing import Any
 
-from ..models import Card, CardEvent, CardStatus, ContextRef
+from ..models import Card, CardEvent, ContextRef
+from ..result import (
+    cli_artifacts_root,
+    list_artifact_dirs,
+    summarize_card_result,
+    worktree_state,
+)
 from ..store_markdown import MarkdownBoardStore
-from .helpers import _find_git_root_optional
 
 
 def _iso_z(dt) -> str:
@@ -140,127 +145,25 @@ def _render_card(
     )
 
 
+# Thin ``argparse``-shaped adapters over ``kanban.result``. The CLI's
+# artifact snapshots live under ``<git_root>/workspace/raw`` (preserved
+# here for back-compat on non-standard layouts); transcripts come from
+# the store. The Web layer calls ``kanban.result`` directly with the
+# store's ``raw_root`` instead.
 def _worktree_state(args: argparse.Namespace, card: Card) -> tuple[str, Path | None]:
-    """Return ``(state, path)`` for the card's worktree directory.
-
-    ``state`` is one of:
-
-    - ``"none"`` — the card was never attached to a worktree (no branch
-      recorded).
-    - ``"not-git"`` — the board isn't inside a Git repo, so worktree
-      isolation is structurally impossible.
-    - ``"active"`` — branch and on-disk worktree directory both exist.
-    - ``"detached"`` — branch is preserved but the directory has been
-      released (terminal status, manual prune target).
-    - ``"missing"`` — branch metadata recorded on the card no longer
-      resolves (manual `git branch -D` or filesystem corruption).
-    """
-    if not card.worktree_branch:
-        return "none", None
-    git_root = _find_git_root_optional(args.board)
-    if git_root is None:
-        return "not-git", None
-    from ..worktree import WorktreeManager
-
-    mgr = WorktreeManager(
-        project_root=git_root,
-        worktrees_root=git_root / "workspace" / "worktrees",
-        artifacts_root=git_root / "workspace" / "raw",
-    )
-    info = mgr.get(card.id, base_commit=card.worktree_base_commit or "")
-    if info is None:
-        return "missing", None
-    if info.path is not None:
-        return "active", info.path
-    return "detached", None
+    return worktree_state(args.board, card)
 
 
 def _list_artifact_dirs(args: argparse.Namespace, card_id: str) -> list[Path]:
-    """Return the per-card artifact snapshot directories, newest first.
-
-    Empty list when artifacts capture is disabled, the board isn't git-backed,
-    or the card never produced ignored deliverables.
-    """
-    git_root = _find_git_root_optional(args.board)
-    if git_root is None:
-        return []
-    card_dir = git_root / "workspace" / "raw" / card_id
-    if not card_dir.exists():
-        return []
-    snapshots = sorted(card_dir.glob("artifacts-*"))
-    snapshots.reverse()
-    return [p for p in snapshots if p.is_dir()]
+    return list_artifact_dirs(cli_artifacts_root(args.board), card_id)
 
 
 def _summarize_card_result(
     args: argparse.Namespace, store: MarkdownBoardStore, card: Card
 ) -> dict[str, object]:
-    """Collect everything a user means by "the result of this card".
-
-    Pulls together status/summary, the worktree branch + its on-disk
-    state, artifact snapshots, retained transcripts, and the next-step
-    commands so callers don't have to know that results live in three
-    different directories.
-    """
-    state, path = _worktree_state(args, card)
-    artifacts = _list_artifact_dirs(args, card.id)
-    traces: list = []
-    try:
-        traces = store.list_traces(card.id)
-    except Exception:  # noqa: BLE001 — read-only enrichment, never fatal
-        traces = []
-    summary = ""
-    output_paths: list[str] = []
-    if isinstance(card.outputs, dict):
-        last = card.outputs.get("last")
-        if isinstance(last, dict):
-            cand = last.get("summary")
-            if isinstance(cand, str):
-                summary = cand
-            raw_outputs = last.get("output")
-            if isinstance(raw_outputs, list):
-                output_paths = [str(p) for p in raw_outputs]
-            elif isinstance(raw_outputs, str) and raw_outputs:
-                output_paths = [raw_outputs]
-    next_steps: list[str] = []
-    if state == "active":
-        next_steps.append(
-            f"kanban worktree diff {card.id[:8]}    # review the in-progress changes"
-        )
-    elif state == "detached":
-        next_steps.append(
-            f"kanban worktree diff {card.id[:8]}    # review changes on the preserved branch"
-        )
-        next_steps.append(
-            f"git merge {card.worktree_branch}     # merge the result into the main checkout"
-        )
-    elif state == "missing":
-        next_steps.append(
-            f"kanban worktree prune                # clear stale metadata for {card.worktree_branch}"
-        )
-    if traces:
-        next_steps.append(
-            f"kanban traces {card.id[:8]} --latest  # inspect the most recent transcript"
-        )
-    if state == "none" and card.status == CardStatus.DONE:
-        next_steps.append("(no worktree was ever attached to this card)")
-    return {
-        "card_id": card.id,
-        "title": card.title,
-        "status": card.status.value,
-        "blocked_reason": card.blocked_reason,
-        "summary": summary,
-        "outputs": output_paths,
-        "worktree": {
-            "branch": card.worktree_branch,
-            "base_commit": card.worktree_base_commit,
-            "state": state,
-            "path": str(path) if path is not None else None,
-        },
-        "artifacts": [str(p) for p in artifacts],
-        "transcripts": [t.path for t in traces],
-        "next_steps": next_steps,
-    }
+    return summarize_card_result(
+        args.board, store, card, artifacts_root=cli_artifacts_root(args.board)
+    )
 
 
 def _show_extras(

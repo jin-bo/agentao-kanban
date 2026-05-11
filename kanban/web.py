@@ -40,8 +40,10 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .daemon import daemon_status
+from .gitutil import find_git_root_optional
 from .mcp import card_to_dict, event_to_dict
 from .models import AgentRole, Card, CardPriority, CardStatus
+from .result import summarize_card_result
 from .store_markdown import MarkdownBoardStore
 from .worktree import ARTIFACT_DIR_NAME_RE
 
@@ -160,6 +162,36 @@ def _list_artifact_snapshots(
             record["truncated"] = True
         snapshots.append(record)
     return snapshots
+
+
+def _display_path(abs_path: str, *, board_dir: Path, git_root: Path | None) -> str:
+    """A human-friendly relative rendering of an absolute result path.
+
+    Tries the Git root first (so the standard layout yields
+    ``workspace/raw/<card>/...``), then the board's parent (yielding
+    ``raw/<card>/...`` for boards outside a repo). Falls back to the
+    absolute path if it lives under neither — callers should treat this
+    purely as a display aid, never as something to join against a root.
+    """
+    p = Path(abs_path)
+    roots = [board_dir.parent]
+    if git_root is not None:
+        roots.insert(0, git_root)
+    for root in roots:
+        try:
+            return str(p.relative_to(root))
+        except ValueError:
+            continue
+    return abs_path
+
+
+def _display_path_map(
+    abs_paths: list[str], *, board_dir: Path, git_root: Path | None
+) -> dict[str, str]:
+    return {
+        a: _display_path(a, board_dir=board_dir, git_root=git_root)
+        for a in abs_paths
+    }
 
 
 def _iso_now() -> str:
@@ -430,6 +462,36 @@ def create_app(
             _annotate_event(event_to_dict(e))
             for e in store.events_for_card(card.id)[-20:]
         ]
+        return payload
+
+    @app.get("/api/cards/{card_id}/result")
+    def api_card_result(card_id: str) -> dict[str, Any]:
+        # Web equivalent of `kanban result --json`: same field semantics,
+        # plus Web-only `*_display_paths` maps (absolute path -> relative
+        # rendering) for the UI. Read-only; no `--enable-writes` needed.
+        # Artifact snapshots resolve against the store's raw root
+        # (board_dir.parent/raw) so this and /api/cards/{id}/artifacts
+        # never disagree; transcripts come from the store.
+        store = _store()
+        card = _get_card_or_404(store, card_id)
+        payload = summarize_card_result(
+            board_path, store, card, artifacts_root=store.raw_root
+        )
+        artifacts = list(payload.get("artifacts") or [])
+        transcripts = list(payload.get("transcripts") or [])
+        # Only probe for the Git root when there's actually a path to
+        # render relative to it — a fresh card has none.
+        git_root = (
+            find_git_root_optional(board_path)
+            if (artifacts or transcripts)
+            else None
+        )
+        payload["artifact_display_paths"] = _display_path_map(
+            artifacts, board_dir=board_path, git_root=git_root
+        )
+        payload["transcript_display_paths"] = _display_path_map(
+            transcripts, board_dir=board_path, git_root=git_root
+        )
         return payload
 
     @app.get("/api/cards/{card_id}/artifacts")
