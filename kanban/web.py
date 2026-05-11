@@ -494,6 +494,88 @@ def create_app(
         )
         return payload
 
+    @app.get("/api/cards/{card_id}/traces")
+    def api_list_traces(card_id: str) -> dict[str, Any]:
+        # Web equivalent of `kanban traces` (the UI labels this surface
+        # "Transcripts"; the API path stays `traces` to match the CLI).
+        # `store.list_traces` only orders by filename glob, which mixes
+        # roles — sort explicitly by timestamp so the first entry is the
+        # true latest. Read-only; no `--enable-writes` needed.
+        store = _store()
+        _get_card_or_404(store, card_id)
+        traces = sorted(
+            store.list_traces(card_id), key=lambda t: t.at, reverse=True
+        )
+        git_root = find_git_root_optional(board_path) if traces else None
+        return {
+            "card_id": card_id,
+            "traces": [
+                {
+                    "trace_id": Path(t.path).name,
+                    "role": t.role.value,
+                    "at": t.at.isoformat(),
+                    "path": t.path,
+                    "display_path": _display_path(
+                        t.path, board_dir=board_path, git_root=git_root
+                    ),
+                    "size": t.size,
+                }
+                for t in traces
+            ],
+        }
+
+    @app.get("/api/cards/{card_id}/traces/{trace_id}/file")
+    def api_trace_file(card_id: str, trace_id: str):
+        if "\\" in card_id or ".." in card_id:
+            raise HTTPException(status_code=400, detail="invalid card id")
+        if "/" in trace_id or "\\" in trace_id or trace_id in ("", ".", ".."):
+            raise HTTPException(status_code=400, detail="invalid trace id")
+        store = _store()
+        _get_card_or_404(store, card_id)
+        # Resolve the trace by exact filename match against the store's own
+        # listing rather than trusting the path segment to point at a real
+        # file. `match.path` is then a known transcript under raw/<card>/.
+        match = next(
+            (t for t in store.list_traces(card_id) if Path(t.path).name == trace_id),
+            None,
+        )
+        if match is None:
+            raise HTTPException(status_code=404, detail="trace not found")
+        target = Path(match.path)
+        # Defence in depth: refuse symlinks and anything that resolves out
+        # of the per-card raw directory (mirrors the artifact file route).
+        if target.is_symlink():
+            raise HTTPException(status_code=403, detail="symlinks not served")
+        raw_card_dir = (store.raw_root / card_id).resolve()
+        try:
+            target.resolve().relative_to(raw_card_dir)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="path escapes trace dir")
+        try:
+            st = target.stat()
+        except FileNotFoundError:
+            raise HTTPException(status_code=404, detail="trace not found")
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail=f"stat failed: {exc}")
+        if not stat_mod.S_ISREG(st.st_mode):
+            raise HTTPException(status_code=400, detail="not a regular file")
+        if st.st_size > _ARTIFACT_FILE_MAX_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    f"transcript is {st.st_size} bytes; the inline cap is "
+                    f"{_ARTIFACT_FILE_MAX_BYTES}. Copy directly from {target}."
+                ),
+            )
+        # text/plain + inline so "open in new tab" renders the transcript
+        # in the browser instead of triggering a download.
+        return FileResponse(
+            target,
+            media_type="text/plain; charset=utf-8",
+            filename=target.name,
+            content_disposition_type="inline",
+        )
+
     @app.get("/api/cards/{card_id}/artifacts")
     def api_list_artifacts(card_id: str) -> dict[str, Any]:
         # Validate the card exists so a typo'd id surfaces as 404 instead

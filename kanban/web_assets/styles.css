@@ -868,3 +868,40 @@ body {
 .linklike:hover {
   text-decoration: underline;
 }
+
+/* --- Card detail: Transcripts section --- */
+.trace-files {
+  list-style: none;
+  margin: 0.4em 0 0;
+  padding: 0;
+}
+.trace-files li {
+  display: flex;
+  align-items: baseline;
+  gap: 0.6em;
+  flex-wrap: wrap;
+  padding: 0.15em 0;
+  font-size: 0.85em;
+}
+.trace-files a {
+  color: var(--accent);
+  text-decoration: none;
+  font-family: var(--mono);
+  word-break: break-all;
+}
+.trace-files a:hover {
+  text-decoration: underline;
+}
+.trace-meta {
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+.trace-latest {
+  font-size: 0.7em;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  border: 1px solid var(--ok);
+  color: var(--ok);
+  border-radius: 3px;
+  padding: 0 0.3em;
+}

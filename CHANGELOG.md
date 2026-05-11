@@ -7,6 +7,21 @@
 ## [Unreleased]
 
 ### Added
+- **Web UI:transcript(原始记录)浏览**。卡片详情新增 **Transcripts** 区
+  (排在 Artifacts 之后),列出该卡保留的原始 agent transcript,按时间倒序
+  (最新在前并标 `LATEST`),每条带角色、时间、字节数,点文件名在新标签页
+  内联打开(`text/plain`,不触发下载)。Result 区的 transcripts 行变成跳转
+  到该区的链接。
+  - 新端点 `GET /api/cards/{card_id}/traces`(只读):返回
+    `{trace_id, role, at, path, display_path, size}` 列表,**显式按 `TraceInfo.at`
+    倒序**(`store.list_traces` 只按文件名 glob 排,会把不同角色混在一起,
+    所以不能靠 glob 顺序判定"最新")。API 路径段沿用 CLI 的 `traces`,UI 标
+    "Transcripts"。
+  - 新端点 `GET /api/cards/{card_id}/traces/{trace_id}/file`(只读):按精确
+    文件名在 `store.list_traces()` 结果里匹配(不信任路径段),拒绝符号链接、
+    超出内联上限(沿用 `_ARTIFACT_FILE_MAX_BYTES`,8 MiB → 413)、解析后逃出
+    per-card raw 目录的路径;以 `inline` 方式返回,文件名仍带在
+    `Content-Disposition` 上方便另存。
 - **Web UI:卡片 Result 视图**。把 web 从"artifact 浏览器"提升成
   `kanban result <card-id>` 的图形化入口。
   - 新端点 `GET /api/cards/{card_id}/result`(只读,不需要 `--enable-writes`):

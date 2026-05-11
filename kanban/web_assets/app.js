@@ -34,6 +34,11 @@
   let detailResult = null;
   let detailResultState = "idle"; // idle | loading | loaded | error
   let detailResultError = "";
+  // Retained raw agent transcripts ("traces" on the API, "Transcripts" in
+  // the UI). Fetched once per detail-modal open, like artifacts.
+  let detailTraces = null;
+  let detailTracesState = "idle"; // idle | loading | loaded | error
+  let detailTracesError = "";
   // Tracks which artifact snapshots the user has expanded. The detail
   // modal re-renders on every 5s tick, so without this state any
   // <details> the user opened would collapse back to default.
@@ -641,6 +646,7 @@
 
     sections.push(renderResultSection());
     sections.push(renderArtifactsSection(card.id));
+    sections.push(renderTranscriptsSection(card.id));
 
     if (card.recent_events && card.recent_events.length) {
       const ev = el("ol", { class: "events" });
@@ -829,11 +835,17 @@
     const traceCount = (r.transcripts || []).length;
     row(
       "transcripts",
-      el(
-        "span",
-        { class: traceCount ? "" : "hint" },
-        traceCount ? `${traceCount} retained` : "none",
-      ),
+      traceCount
+        ? el(
+            "button",
+            {
+              class: "linklike",
+              type: "button",
+              onclick: () => jumpToSection("detail-transcripts"),
+            },
+            `${traceCount} retained →`,
+          )
+        : el("span", { class: "hint" }, "none"),
     );
     wrap.appendChild(dl);
     // Next steps: copyable command lines (never one-click for merge/prune).
@@ -965,6 +977,80 @@
     return wrap;
   }
 
+  function renderTranscriptsSection(cardId) {
+    const wrap = el(
+      "div",
+      { class: "card-detail-section", id: "detail-transcripts" },
+      [el("h3", {}, "Transcripts")],
+    );
+    if (detailTracesState === "loading" || detailTracesState === "idle") {
+      wrap.appendChild(el("p", { class: "hint" }, "Loading…"));
+      return wrap;
+    }
+    if (detailTracesState === "error") {
+      wrap.appendChild(
+        el(
+          "p",
+          { class: "hint artifacts-error" },
+          `Failed to load: ${detailTracesError}`,
+        ),
+      );
+      return wrap;
+    }
+    const traces = (detailTraces && detailTraces.traces) || [];
+    if (!traces.length) {
+      wrap.appendChild(
+        el(
+          "p",
+          { class: "hint" },
+          "(none — full agent transcripts are saved here when a worker runs; the most recent few per role are kept)",
+        ),
+      );
+      return wrap;
+    }
+    const list = el("ul", { class: "trace-files" });
+    traces.forEach((t, i) => {
+      const href = `/api/cards/${encodeURIComponent(cardId)}/traces/${encodeURIComponent(t.trace_id)}/file`;
+      list.appendChild(
+        el("li", {}, [
+          el("a", { href, target: "_blank", rel: "noopener" }, t.trace_id),
+          el(
+            "span",
+            { class: "trace-meta" },
+            `${t.role || "?"} · ${fmtTime(t.at)} · ${fmtBytes(t.size)}`,
+          ),
+          i === 0 ? el("span", { class: "trace-latest" }, "latest") : null,
+        ]),
+      );
+    });
+    wrap.appendChild(list);
+    return wrap;
+  }
+
+  async function loadTraces(id) {
+    detailTracesState = "loading";
+    detailTracesError = "";
+    detailTraces = null;
+    if (selectedCardId === id && detailLastCard) {
+      renderDetailInto(detailLastCard);
+    }
+    try {
+      const data = await fetchJSON(
+        `/api/cards/${encodeURIComponent(id)}/traces`,
+      );
+      if (selectedCardId !== id) return;
+      detailTraces = data;
+      detailTracesState = "loaded";
+    } catch (err) {
+      if (selectedCardId !== id) return;
+      detailTracesState = "error";
+      detailTracesError = err.message;
+    }
+    if (selectedCardId === id && detailLastCard) {
+      renderDetailInto(detailLastCard);
+    }
+  }
+
   async function loadArtifacts(id) {
     detailArtifactsState = "loading";
     detailArtifactsError = "";
@@ -1057,6 +1143,9 @@
     detailResult = null;
     detailResultState = "loading";
     detailResultError = "";
+    detailTraces = null;
+    detailTracesState = "loading";
+    detailTracesError = "";
     expandedSnapshots.clear();
     const modal = ensureDetailModal();
     modal.classList.remove("hidden");
@@ -1071,6 +1160,7 @@
     refreshDetail();
     loadResult(id);
     loadArtifacts(id);
+    loadTraces(id);
   }
 
   function closeDetailModal() {
@@ -1082,6 +1172,9 @@
     detailResult = null;
     detailResultState = "idle";
     detailResultError = "";
+    detailTraces = null;
+    detailTracesState = "idle";
+    detailTracesError = "";
     if (detailModal) detailModal.classList.add("hidden");
     if (detailKeydownHandler) {
       document.removeEventListener("keydown", detailKeydownHandler);
