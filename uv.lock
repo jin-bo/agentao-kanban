@@ -22,7 +22,7 @@ wheels = [
 
 [[package]]
 name = "agentao-kanban"
-version = "0.1.8.dev0"
+version = "0.1.8"
 source = { editable = "." }
 dependencies = [
     { name = "agentao" },

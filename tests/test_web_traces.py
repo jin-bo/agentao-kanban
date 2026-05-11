@@ -18,7 +18,8 @@ from fastapi.testclient import TestClient
 
 from kanban.models import Card, CardPriority
 from kanban.store_markdown import MarkdownBoardStore
-from kanban.web import _ARTIFACT_FILE_MAX_BYTES, create_app
+from kanban.web import create_app
+from kanban.web_artifacts import ARTIFACT_FILE_MAX_BYTES
 
 
 # Two transcript stamps. Note the *filename* glob order (planner < worker
@@ -146,7 +147,7 @@ def test_trace_file_413_when_over_cap(client: TestClient, card_with_traces) -> N
     card_id, card_dir = card_with_traces
     big = card_dir / "worker-20260404T040404000004Z.md"
     with big.open("wb") as fp:
-        fp.truncate(_ARTIFACT_FILE_MAX_BYTES + 1)
+        fp.truncate(ARTIFACT_FILE_MAX_BYTES + 1)
     r = client.get(f"/api/cards/{card_id}/traces/{big.name}/file")
     assert r.status_code == 413
 

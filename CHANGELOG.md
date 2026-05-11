@@ -6,7 +6,16 @@
 
 ## [Unreleased]
 
+## [0.1.8] — 2026-05-11
+
 ### Added
+- **`kanban result` 可发现性**。README / `docs/kanban-cli-guide.md` 把
+  `kanban result <id>` 提为"这张卡产出了什么"的第一落点,并明确说明
+  `kanban worktree list` 不列出某卡 ≠ 结果丢了;orchestrator 的 detach 事件
+  文案改为指向 `kanban result` 而不是干巴巴的 "Worktree detached"。
+- **Worker rework 引导**。`kanban-worker.md`:非空 `prior_outputs` 意味着
+  worktree 里已经有上一轮的产物,worker 应在该基线上只改当前不满足
+  acceptance 的部分,而不是从头重做。
 - **Web UI:artifact 浏览器增强**。Artifacts 区:顶部加文件名过滤框(纯
   客户端、即时,值存在 `artifactFilter` 里所以 5s 重渲染不丢);每个文件前面
   按扩展名标类型(image / json / text / code / binary);text/json/code 且
@@ -89,6 +98,23 @@
   - 0.1.6 引入 artifacts 抢救之后,events.log 里只有 `worktree.artifacts_saved`
     一行事件,产物本身需要打开终端 `ls workspace/raw/...` 才能看到。这次让
     web 直接可见,补齐了那次大改在 UI 上缺失的最后一截。
+
+### Changed
+- **大规模拆包,行为不变**。把几个长到难维护的单文件拆成包/模块:
+  `cli.py`(2863 行)、`store_markdown.py`(1218 行)、`daemon.py`(1026 行)、
+  `orchestrator`(981 行)、`mcp.py`(710 行)、`worktree.py`(698 行)各自拆成
+  同名包;`web.py` 抽出 `web_artifacts.py`(artifact 浏览/文件服务)+
+  `web_serializers.py`(API 序列化助手);前端 `app.js`(~1.4k 行)拆成
+  `dom` / `format` / `api` / `add_card_modal` / `board_view` / `artifact_browser` /
+  `detail_sections` / `detail_modal` 几个挂在 `window.KanbanWeb` 命名空间下的
+  模块,`index.html` 按固定顺序加载。公开 API、CLI 输出、wheel 内容均未变。
+
+### Fixed
+- detail 模态框关闭时没有重置 artifact 浏览器的 `previewCache` /
+  expanded 集合,切换卡片时上一张卡的 preview 缓存可能短暂闪现(`open()`
+  会在显示前清掉,所以影响很小);现在 `close()` 也一并重置。
+- Add Card 模态的 "Depends on" `<datalist>` 不再每 5s 轮询都重建一遍——
+  只在模态可见时随轮询刷新候选。
 
 ## [0.1.7] — 2026-05-07
 
@@ -295,7 +321,8 @@
   (planner / worker / reviewer / verifier)、本地 dispatcher daemon、基于
   `MockAgentaoExecutor` 的离线状态机。
 
-[Unreleased]: https://github.com/jin-bo/agentao-kanban/compare/v0.1.7...HEAD
+[Unreleased]: https://github.com/jin-bo/agentao-kanban/compare/v0.1.8...HEAD
+[0.1.8]: https://github.com/jin-bo/agentao-kanban/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/jin-bo/agentao-kanban/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/jin-bo/agentao-kanban/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/jin-bo/agentao-kanban/compare/v0.1.4-rc1...v0.1.5

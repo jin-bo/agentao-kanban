@@ -1,7 +1,12 @@
 # Kanban Web 只读看板实现计划
 
-> Status: implemented in v0.1.5. This document is retained as the design and
-> release checklist for the read-only `kanban web` board.
+> Status: implemented in v0.1.5; retained as the original design/checklist.
+> Since then the board gained an opt-in write surface (v0.1.6 — see
+> `kanban-cli-guide.md` §9) and the single `app.js` was split into
+> `dom/format/api/add_card_modal/board_view/artifact_browser/detail_sections/
+> detail_modal` modules under `window.KanbanWeb` (v0.1.8), plus `web.py` was
+> split into `web.py` + `web_artifacts.py` + `web_serializers.py` — so the
+> file layout below no longer matches the current tree verbatim.
 
 ## Context
 

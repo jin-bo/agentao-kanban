@@ -45,7 +45,6 @@ from .result import summarize_card_result, worktree_state
 from .store_markdown import MarkdownBoardStore
 from .worktree import ARTIFACT_DIR_NAME_RE, WorktreeDiffError, WorktreeManager
 from .web_artifacts import (
-    ARTIFACT_FILE_MAX_BYTES,
     artifacts_root_for,
     list_artifact_snapshots,
     serve_file_under_root,
@@ -105,12 +104,6 @@ _DIFF_STATE_MESSAGES = {
         "`kanban worktree prune` to clear the stale metadata."
     ),
 }
-
-# Backward-compatible private names used by the current tests and by any
-# local scripts that reached into ``kanban.web`` before the helpers moved.
-_ARTIFACT_FILE_MAX_BYTES = ARTIFACT_FILE_MAX_BYTES
-_artifacts_root_for = artifacts_root_for
-_list_artifact_snapshots = list_artifact_snapshots
 
 
 def _iso_now() -> str:

@@ -1,14 +1,14 @@
 # Kanban Web UI Result 改进计划
 
-> Status: proposed for `0.1.8-dev`. This plan follows the latest CLI
-> result/worktree/artifacts updates and defines how the Web UI should expose
-> the same operator model.
+> Status: implemented in v0.1.8 — the card-detail Result / Changes /
+> Transcripts sections, the result-state-aware empty hints, and the shared
+> `kanban/result.py` summarizer all shipped. Retained as the design record.
 >
-> **Scope note (post-review):** the goal is narrow — promote the Web UI from
+> **Scope note (post-review):** the goal was narrow — promote the Web UI from
 > "artifact browser" to "result entry point". Anything that changes the CLI
 > JSON contract, the worktree layer, the card-detail dependency surface, or adds
-> write actions is **out of scope here** and tracked in its own plan (see
-> "Out of scope / follow-ups" at the end). P0 is read-only and self-contained.
+> write actions was **out of scope here** and tracked in its own plan (see
+> "Out of scope / follow-ups" at the end). P0 was read-only and self-contained.
 
 ## Context
 

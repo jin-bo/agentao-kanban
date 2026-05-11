@@ -15,11 +15,11 @@ from fastapi.testclient import TestClient
 
 from kanban.models import Card, CardPriority
 from kanban.store_markdown import MarkdownBoardStore
-from kanban.web import (
-    _ARTIFACT_FILE_MAX_BYTES,
-    _artifacts_root_for,
-    _list_artifact_snapshots,
-    create_app,
+from kanban.web import create_app
+from kanban.web_artifacts import (
+    ARTIFACT_FILE_MAX_BYTES,
+    artifacts_root_for,
+    list_artifact_snapshots,
 )
 
 
@@ -39,7 +39,7 @@ def board(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def raw_root(board: Path) -> Path:
-    # Mirror WorktreeManager's layout so _artifacts_root_for picks it up.
+    # Mirror WorktreeManager's layout so artifacts_root_for picks it up.
     root = board.parent / "raw"
     root.mkdir(parents=True)
     return root
@@ -71,7 +71,7 @@ def card_with_snapshot(board: Path, raw_root: Path):
 
 def test_artifacts_root_follows_board_parent(tmp_path: Path) -> None:
     board = tmp_path / "workspace" / "board"
-    assert _artifacts_root_for(board) == tmp_path / "workspace" / "raw"
+    assert artifacts_root_for(board) == tmp_path / "workspace" / "raw"
 
 
 def test_list_empty_when_no_raw_dir(client: TestClient, board: Path) -> None:
@@ -273,7 +273,7 @@ def test_file_413_when_over_cap(
     # We don't want to actually allocate 8 MiB; truncate sets the
     # apparent size without writing real bytes on most filesystems.
     with big.open("wb") as fp:
-        fp.truncate(_ARTIFACT_FILE_MAX_BYTES + 1)
+        fp.truncate(ARTIFACT_FILE_MAX_BYTES + 1)
     r = client.get(
         f"/api/cards/{card_id}/artifacts/{SNAP_NEW}/file",
         params={"path": "big.bin"},
@@ -282,7 +282,7 @@ def test_file_413_when_over_cap(
 
 
 def test_helper_handles_missing_root(tmp_path: Path) -> None:
-    # _list_artifact_snapshots is the inner contract; make sure it
+    # list_artifact_snapshots is the inner contract; make sure it
     # short-circuits cleanly when the raw root isn't materialized at
     # all (the common case for fresh boards).
-    assert _list_artifact_snapshots("any-id", tmp_path / "raw") == []
+    assert list_artifact_snapshots("any-id", tmp_path / "raw") == []

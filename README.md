@@ -1,6 +1,6 @@
 # kanban
 
-**当前版本:v0.1.8-dev**(已发布最新版 v0.1.7)。完整变更见 [CHANGELOG.md](CHANGELOG.md)。
+**当前版本:v0.1.8**。完整变更见 [CHANGELOG.md](CHANGELOG.md)。
 
 一个最小可跑的多 Agent 看板,已经实现:
 
@@ -23,18 +23,23 @@ INFO 日志里打印当前使用哪个 executor。
 kanban/
   models.py                 # 卡片、状态、角色、AgentResult
   store.py                  # BoardStore Protocol + InMemoryBoardStore
-  store_markdown.py         # MarkdownBoardStore(TOML front-matter + events.log + raw transcripts)
-  orchestrator.py           # 调度与状态流转(唯一状态写入者)
+  store_markdown/            # MarkdownBoardStore(TOML front-matter + events.log + raw transcripts)
+  orchestrator/             # 调度与状态流转(唯一状态写入者)+ WIP / 依赖规则
+  worktree/                 # 每卡 Git worktree 隔离 + artifact 抢救快照
+  result.py                 # kanban result 的共享摘要器(CLI 与 web 共用)
   agents.py                 # ROLE_AGENTS 映射 + 定义文件加载器
-  daemon.py                 # 本地 dispatcher + .daemon.lock
+  daemon/                   # 本地 dispatcher + .daemon.lock
   executors/
     base.py                 # 执行器接口
     mock_agentao.py         # 离线状态机
     agentao_multi.py        # 按角色路由的 agentao 多 Agent 执行器
     multi_backend.py        # profile 路由 + subagent / acp 后端
-  cli.py                    # kanban CLI(含 daemon 子命令)
-  web.py                    # FastAPI 看板 web UI
-  mcp.py                    # stdio MCP server(kanban-mcp)
+  cli/                      # kanban CLI(含 daemon 子命令)
+  web.py                    # FastAPI 看板 web UI(只读 + 可选写)
+  web_artifacts.py          # artifact 浏览 / 受限文件服务
+  web_serializers.py        # web API 序列化助手
+  web_assets/               # 前端:index.html + styles.css + 按命名空间拆的 JS 模块
+  mcp/                      # stdio MCP server(kanban-mcp)
   defaults/                 # 打包的 sub-agent 定义与默认 agent_profiles.yaml
 docs/                       # 设计文档与运维指南(详见各分节链接)
 main.py                     # demo 入口
@@ -204,6 +209,14 @@ uv run kanban --board workspace/board web \
 非 loopback bind 同时启用写入需要显式 `--allow-remote-writes`,否则 server
 启动直接拒绝。Runtime 面板顶部展示 daemon 三态(running / stopped / stale
 lock)+ pid + 启动时间,数据来自 `GET /api/daemon`。
+
+卡片详情模态框是 `kanban result <id>` 的图形化入口:**Result**(状态 /
+摘要 / worktree 状态 / branch / outputs / 可复制的 next steps)、**Artifacts**
+(`workspace/raw/<card>/artifacts-*` 下抢救出的 gitignored 产物,带文件名
+过滤、按扩展名标类型、文本/代码/JSON 文件内联 preview、copy-path)、
+**Changes**(`active` / `detached` 分支的 `git diff --stat`)、**Transcripts**
+(保留的原始 agent 记录,新标签页内联打开)。Add Card 模态支持 `depends_on`
+(chip + `<datalist>` 自动补全)。这些读侧端点都不需要 `--enable-writes`。
 
 启动模式、写入面与 `.daemon.lock` 的串行化关系、artifact 在 web 上的可见性
 等运维细节,见 [`docs/kanban-cli-guide.md`](docs/kanban-cli-guide.md) §9。
