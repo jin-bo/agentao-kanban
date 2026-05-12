@@ -2,7 +2,8 @@
   "use strict";
 
   const ns = (window.KanbanWeb = window.KanbanWeb || {});
-  const { artifactBrowser, detailSections, el, fetchJSON, fmtTime } = ns;
+  const { artifactBrowser, detailSections, el, fetchJSON, fmtTime, transcriptViewer } =
+    ns;
 
   function createDetailModal(options) {
     const onClose = options && options.onClose ? options.onClose : () => {};
@@ -222,10 +223,15 @@
     }
 
     function renderTranscriptsSection(cardId) {
-      return detailSections.renderTranscriptsSection(cardId, {
+      return transcriptViewer.renderSection({
+        cardId,
         traces,
         tracesError,
         tracesState,
+        isCurrent: () => selectedCardId === cardId && !!lastCard,
+        rerender: () => {
+          if (lastCard) render(lastCard);
+        },
       });
     }
 
@@ -254,6 +260,7 @@
           tracesState = state;
           tracesError = error;
         },
+        onLoaded: transcriptViewer.expandNewest,
       },
       diff: {
         url: (id) => `/api/cards/${encodeURIComponent(id)}/diff`,
@@ -320,6 +327,7 @@
       diffState = stateValue;
       diffError = "";
       artifactBrowser.reset();
+      transcriptViewer.reset();
     }
 
     function open(id) {

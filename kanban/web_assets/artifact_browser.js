@@ -5,8 +5,10 @@
   const {
     copyText,
     el,
+    fetchTextWithCap,
     fileKind,
     fmtBytes,
+    fmtSnapshotStamp,
     isPreviewableKind,
     previewKey,
   } = ns;
@@ -42,24 +44,7 @@
     if (ctx.isCurrent()) ctx.rerender();
     const url = `/api/cards/${encodeURIComponent(ctx.cardId)}/artifacts/${encodeURIComponent(snapshot)}/file?path=${encodeURIComponent(path)}`;
     try {
-      const resp = await fetch(url);
-      if (!resp.ok) {
-        let detail = "";
-        try {
-          detail = (await resp.json()).detail || "";
-        } catch (_e) {
-          /* non-JSON error body */
-        }
-        previewCache.set(key, { state: "error", error: detail || `HTTP ${resp.status}` });
-      } else {
-        let text = await resp.text();
-        let truncated = false;
-        if (text.length > ARTIFACT_PREVIEW_MAX_CHARS) {
-          text = text.slice(0, ARTIFACT_PREVIEW_MAX_CHARS);
-          truncated = true;
-        }
-        previewCache.set(key, { state: "loaded", text, truncated });
-      }
+      previewCache.set(key, await fetchTextWithCap(url, ARTIFACT_PREVIEW_MAX_CHARS));
     } catch (err) {
       previewCache.set(key, { state: "error", error: err.message });
     }
@@ -138,11 +123,17 @@
         snap.truncated && snap.total_file_count
           ? `${snap.file_count} of ${snap.total_file_count} files`
           : `${snap.file_count} file${snap.file_count === 1 ? "" : "s"}`;
-      const summaryChildren = [
-        document.createTextNode(
-          `${snap.snapshot} - ${fileCountLabel} - ${fmtBytes(snap.total_bytes)}`,
-        ),
-      ];
+      // Human time label parsed from the `artifacts-<utc-stamp>` name,
+      // with the raw name kept as secondary text; null => raw name only.
+      const stampLabel = fmtSnapshotStamp(snap.snapshot);
+      const meta = ` - ${fileCountLabel} - ${fmtBytes(snap.total_bytes)}`;
+      const summaryChildren = stampLabel
+        ? [
+            el("span", { class: "snapshot-time" }, stampLabel),
+            el("span", { class: "snapshot-raw" }, snap.snapshot),
+            document.createTextNode(meta),
+          ]
+        : [document.createTextNode(`${snap.snapshot}${meta}`)];
       if (snap.abs_path)
         summaryChildren.push(
           el(

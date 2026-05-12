@@ -675,6 +675,14 @@ body {
   margin-bottom: 0.4em;
   color: var(--text);
 }
+.artifact-snap > summary .snapshot-time {
+  color: var(--text);
+}
+.artifact-snap > summary .snapshot-raw {
+  margin-left: 0.5em;
+  color: var(--text-dim);
+  font-size: 0.85em;
+}
 
 .artifact-files {
   list-style: none;
@@ -939,27 +947,68 @@ body {
 }
 
 /* --- Card detail: Transcripts section --- */
-.trace-files {
-  list-style: none;
-  margin: 0.4em 0 0;
-  padding: 0;
+.transcript-filter-row {
+  margin: 0.3em 0 0.5em;
+  font-size: 0.8em;
+  color: var(--text-dim);
 }
-.trace-files li {
+.transcript-role-filter {
+  margin-left: 0.4em;
+  background: var(--bg-elev-2);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  color: var(--text);
+  font: inherit;
+  font-size: 0.9em;
+  padding: 0.1em 0.3em;
+}
+.transcript-role-filter:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.transcript-list {
+  margin: 0.4em 0 0;
+}
+.transcript-row {
+  margin: 0.3em 0;
+  padding: 0.3em 0.5em;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.02);
+}
+.transcript-row > summary {
+  cursor: pointer;
   display: flex;
   align-items: baseline;
   gap: 0.6em;
   flex-wrap: wrap;
-  padding: 0.15em 0;
   font-size: 0.85em;
+  color: var(--text-dim);
 }
-.trace-files a {
-  color: var(--accent);
-  text-decoration: none;
+.transcript-row[open] > summary {
+  margin-bottom: 0.4em;
+  color: var(--text);
+}
+.transcript-row .trace-id {
   font-family: var(--mono);
   word-break: break-all;
 }
-.trace-files a:hover {
-  text-decoration: underline;
+.transcript-content {
+  padding-left: 0.2em;
+}
+.transcript-pre {
+  margin: 0.2em 0 0.4em;
+  padding: 0.5em 0.7em;
+  max-height: 24em;
+  overflow: auto;
+  background: var(--bg-elev-2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.4;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 .trace-meta {
   color: var(--text-dim);

@@ -2,7 +2,7 @@
   "use strict";
 
   const ns = (window.KanbanWeb = window.KanbanWeb || {});
-  const { copyText, el, fmtBytes, fmtTime, jumpToSection, sectionShell } = ns;
+  const { copyText, el, jumpToSection, sectionShell } = ns;
 
   const WORKTREE_STATE_COPY = {
     active: "Worktree directory is still active; review in-progress changes.",
@@ -168,47 +168,9 @@
     );
   }
 
-  function renderTranscriptsSection(cardId, state) {
-    return sectionShell(
-      {
-        title: "Transcripts",
-        id: "detail-transcripts",
-        state: state.tracesState,
-        error: state.tracesError,
-      },
-      () => {
-        const traces = (state.traces && state.traces.traces) || [];
-        if (!traces.length) {
-          return el(
-            "p",
-            { class: "hint" },
-            "(none - full agent transcripts are saved here when a worker runs; the most recent few per role are kept)",
-          );
-        }
-        const list = el("ul", { class: "trace-files" });
-        traces.forEach((t, i) => {
-          const href = `/api/cards/${encodeURIComponent(cardId)}/traces/${encodeURIComponent(t.trace_id)}/file`;
-          list.appendChild(
-            el("li", {}, [
-              el("a", { href, target: "_blank", rel: "noopener" }, t.trace_id),
-              el(
-                "span",
-                { class: "trace-meta" },
-                `${t.role || "?"} - ${fmtTime(t.at)} - ${fmtBytes(t.size)}`,
-              ),
-              i === 0 ? el("span", { class: "trace-latest" }, "latest") : null,
-            ]),
-          );
-        });
-        return list;
-      },
-    );
-  }
-
   ns.detailSections = {
     artifactsEmptyHint,
     renderChangesSection,
     renderResultSection,
-    renderTranscriptsSection,
   };
 })();
