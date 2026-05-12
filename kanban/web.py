@@ -5,12 +5,22 @@ By default it is read-only — no writes, no auth, no SSE. Run with::
 
     uv run kanban web --board workspace/board
 
-A narrow write opt-in (`--enable-writes`) exposes ``POST /api/cards`` so
-operators can drop new INBOX cards from the browser. Card creation is
-the only mutation served here intentionally: it doesn't race the daemon
-(new cards have fresh UUIDs and the daemon doesn't write them before
-claiming) and it doesn't participate in ``.daemon.lock``. State changes
-(``move``/``block``/``unblock``) stay on the CLI/MCP write paths.
+Write surface:
+
+- ``POST /api/cards`` — create a new INBOX card. Always available under
+  ``--enable-writes``; returns ``405`` when writes are off. Not gated on
+  ``.daemon.lock`` (fresh UUID, no overwrite race).
+- ``POST /api/cards/{id}/move`` — change a card's status.
+- ``POST /api/cards/{id}/requeue`` — return a card to ``inbox`` / ``ready``.
+- ``POST /api/cards/{id}/block`` — move a card to ``blocked`` with a reason.
+- ``POST /api/cards/{id}/unblock`` — move a blocked card back.
+
+The four existing-card actions require ``--enable-writes`` (``403`` otherwise),
+refuse to run while a live daemon holds ``.daemon.lock`` (``409``) or while
+the target card has a live execution claim (``409``), and call the shared
+``kanban.operations.transition_*`` functions so they behave exactly like
+the CLI/MCP equivalents. There is no ``--force``, no bulk mutation, no
+daemon control, and no worktree merge/prune/delete/checkout route here.
 
 Design notes:
 
@@ -32,15 +42,23 @@ from ipaddress import ip_address
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import HTMLResponse, Response
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from .daemon import daemon_status
 from .gitutil import find_git_root_optional
 from .mcp import card_to_dict, event_to_dict
 from .models import AgentRole, Card, CardPriority, CardStatus
+from .operations import (
+    OperationError,
+    transition_block,
+    transition_move,
+    transition_requeue,
+    transition_unblock,
+)
 from .result import summarize_card_result, worktree_state
 from .store_markdown import MarkdownBoardStore
 from .worktree import ARTIFACT_DIR_NAME_RE, WorktreeDiffError, WorktreeManager
@@ -145,6 +163,63 @@ class CardCreateRequest(BaseModel):
     priority: str = Field(default="MEDIUM")
     acceptance_criteria: list[str] = Field(default_factory=list)
     depends_on: list[str] = Field(default_factory=list)
+
+
+class CardMoveRequest(BaseModel):
+    """POST /api/cards/{id}/move body."""
+
+    status: str = Field(min_length=1)
+
+
+class CardRequeueRequest(BaseModel):
+    """POST /api/cards/{id}/requeue body. ``note`` is an optional history line."""
+
+    target: str = Field(default=CardStatus.INBOX.value, min_length=1)
+    note: str | None = Field(default=None, max_length=2000)
+
+
+class CardBlockRequest(BaseModel):
+    """POST /api/cards/{id}/block body."""
+
+    reason: str = Field(min_length=1, max_length=2000)
+
+
+class CardUnblockRequest(BaseModel):
+    """POST /api/cards/{id}/unblock body."""
+
+    target: str = Field(default=CardStatus.INBOX.value, min_length=1)
+
+
+class WriteRejected(Exception):
+    """A mutating Web request rejected with a stable JSON error envelope.
+
+    ``error`` is a short machine code; ``message`` is operator-facing;
+    ``retryable`` tells the UI whether the same request might succeed
+    later (daemon lock / live claim) or never (writes disabled, bad
+    input, missing card).
+    """
+
+    def __init__(
+        self, *, status_code: int, error: str, message: str, retryable: bool
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.error = error
+        self.message = message
+        self.retryable = retryable
+
+
+def _model_validate(model_cls: type[BaseModel], raw: object):
+    """Parse ``raw`` into ``model_cls``, on either Pydantic v1 or v2.
+
+    ``BaseModel.model_validate`` is v2-only; ``parse_obj`` is the v1 name
+    (still present, deprecated, on v2). FastAPI declares no pydantic
+    major, so support both. Raises :class:`pydantic.ValidationError`.
+    """
+    validate = getattr(model_cls, "model_validate", None)
+    if validate is not None:
+        return validate(raw)
+    return model_cls.parse_obj(raw)
 
 
 def create_app(
@@ -303,6 +378,200 @@ def create_app(
             )
         )
         return card_to_dict(card)
+
+    @app.exception_handler(WriteRejected)
+    async def _on_write_rejected(_request, exc: WriteRejected) -> JSONResponse:
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={
+                "error": exc.error,
+                "message": exc.message,
+                "retryable": exc.retryable,
+            },
+        )
+
+    def _require_writes_enabled() -> None:
+        """Reject every existing-card mutation when ``--enable-writes`` is off.
+
+        Checked before the request body is even parsed, so a read-only
+        server returns the same ``403`` envelope for any card id and any
+        body shape — it never echoes the action schema or reveals
+        daemon/claim state.
+        """
+        if not app.state.enable_writes:
+            raise WriteRejected(
+                status_code=403,
+                error="writes_disabled",
+                message=(
+                    "card writes are disabled; start the server with "
+                    "--enable-writes to allow this action"
+                ),
+                retryable=False,
+            )
+
+    def _guard_card_write(store: MarkdownBoardStore, card_id: str) -> None:
+        """Daemon-lock + live-claim guard for existing-card mutations.
+
+        Call :func:`_require_writes_enabled` first. No ``--force`` escape
+        hatch; neither check distinguishes existent from nonexistent cards.
+        """
+        status = daemon_status(board_path).get("status")
+        if status == "running":
+            raise WriteRejected(
+                status_code=409,
+                error="daemon_active",
+                message=(
+                    "a live daemon holds the board lock; stop the daemon "
+                    "before mutating cards over HTTP"
+                ),
+                retryable=True,
+            )
+        claim = store.get_claim(card_id)
+        if claim is not None:
+            worker_tag = (
+                f"worker={claim.worker_id}" if claim.worker_id else "unassigned"
+            )
+            raise WriteRejected(
+                status_code=409,
+                error="live_claim",
+                message=(
+                    f"card {card_id} has a live execution claim "
+                    f"{claim.claim_id} ({worker_tag}); wait for the worker "
+                    f"to finish or stop it, then retry"
+                ),
+                retryable=True,
+            )
+
+    def _web_worktree_mgr():
+        """WorktreeManager for terminal landings, or ``None`` off-repo."""
+        git_root = find_git_root_optional(board_path)
+        if git_root is None:
+            return None
+        return WorktreeManager.for_project(git_root)
+
+    def _transition_payload(result) -> dict[str, Any]:
+        return {"card": card_to_dict(result.card), "warnings": list(result.warnings)}
+
+    def _do_card_transition(card_id: str, raw_body, model_cls, run):
+        """Blocking half of an existing-card mutation (runs in the threadpool).
+
+        Order: daemon-lock / live-claim guard → body validation → card
+        existence → ``run(payload, store, card_id)``. The writes-enabled
+        gate has already fired in the async wrapper. The card id must be
+        the full id — these routes don't do the CLI's prefix expansion,
+        same as the read routes.
+        """
+        store = _store()
+        _guard_card_write(store, card_id)
+        try:
+            payload = _model_validate(model_cls, raw_body)
+        except ValidationError as exc:
+            details = "; ".join(
+                f"{'.'.join(str(p) for p in e['loc'])}: {e['msg']}"
+                for e in exc.errors()
+            )
+            raise WriteRejected(
+                status_code=400,
+                error="invalid_input",
+                message=details or "invalid request body",
+                retryable=False,
+            )
+        try:
+            store.get_card(card_id)
+        except KeyError:
+            raise WriteRejected(
+                status_code=404,
+                error="not_found",
+                message=f"card {card_id} not found",
+                retryable=False,
+            )
+        try:
+            result = run(payload, store, card_id)
+        except OperationError as exc:
+            raise WriteRejected(
+                status_code=400,
+                error="invalid_input",
+                message=str(exc),
+                retryable=False,
+            )
+        except KeyError:
+            # The card vanished between the existence check and the write
+            # (e.g. a concurrent delete). Treat as not found.
+            raise WriteRejected(
+                status_code=404,
+                error="not_found",
+                message=f"card {card_id} not found",
+                retryable=False,
+            )
+        return _transition_payload(result)
+
+    async def _run_card_transition(
+        card_id: str, request: Request, model_cls, run
+    ) -> dict[str, Any]:
+        """Guard, parse the body, run a ``transition_*`` call.
+
+        The ``--enable-writes`` gate fires *before* the request body is
+        read, so a read-only server can't be probed via a malformed body.
+        Everything blocking after that (store load, lock/claim guard,
+        transition) runs in the threadpool, matching the sync read routes.
+        """
+        _require_writes_enabled()
+        try:
+            raw_body = await request.json()
+        except Exception:
+            raise WriteRejected(
+                status_code=400,
+                error="invalid_input",
+                message="request body must be a JSON object",
+                retryable=False,
+            )
+        return await run_in_threadpool(
+            _do_card_transition, card_id, raw_body, model_cls, run
+        )
+
+    @app.post("/api/cards/{card_id}/move")
+    async def api_card_move(card_id: str, request: Request) -> dict[str, Any]:
+        return await _run_card_transition(
+            card_id,
+            request,
+            CardMoveRequest,
+            lambda p, store, cid: transition_move(
+                store, _web_worktree_mgr(), cid, p.status, note="Manual move via Web"
+            ),
+        )
+
+    @app.post("/api/cards/{card_id}/requeue")
+    async def api_card_requeue(card_id: str, request: Request) -> dict[str, Any]:
+        return await _run_card_transition(
+            card_id,
+            request,
+            CardRequeueRequest,
+            lambda p, store, cid: transition_requeue(
+                store, cid, p.target, (p.note or None)
+            ),
+        )
+
+    @app.post("/api/cards/{card_id}/block")
+    async def api_card_block(card_id: str, request: Request) -> dict[str, Any]:
+        return await _run_card_transition(
+            card_id,
+            request,
+            CardBlockRequest,
+            lambda p, store, cid: transition_block(
+                store, _web_worktree_mgr(), cid, p.reason
+            ),
+        )
+
+    @app.post("/api/cards/{card_id}/unblock")
+    async def api_card_unblock(card_id: str, request: Request) -> dict[str, Any]:
+        return await _run_card_transition(
+            card_id,
+            request,
+            CardUnblockRequest,
+            lambda p, store, cid: transition_unblock(
+                store, _web_worktree_mgr(), cid, p.target
+            ),
+        )
 
     @app.get("/api/cards/{card_id}")
     def api_card(card_id: str) -> dict[str, Any]:

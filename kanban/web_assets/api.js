@@ -38,6 +38,30 @@
     return { state: "loaded", text, truncated };
   }
 
+  // POST a JSON body and return `{ ok, status, data }`. `data` is the
+  // parsed JSON response (the success payload or the stable error
+  // envelope `{error, message, retryable}`), or `null` for a non-JSON
+  // body. Network failures throw; callers surface that themselves.
+  async function postJSON(url, body) {
+    const r = await fetch(url, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        accept: "application/json",
+      },
+      cache: "no-store",
+      body: JSON.stringify(body || {}),
+    });
+    let data = null;
+    try {
+      data = await r.json();
+    } catch (_e) {
+      /* non-JSON body */
+    }
+    return { ok: r.ok, status: r.status, data };
+  }
+
   ns.fetchJSON = fetchJSON;
   ns.fetchTextWithCap = fetchTextWithCap;
+  ns.postJSON = postJSON;
 })();

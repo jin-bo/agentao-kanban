@@ -31,7 +31,7 @@ def detach_worktree_on_terminal(
     worktree_mgr,
     card_id: str,
     target_status: CardStatus,
-) -> None:
+):
     """Detach the card's worktree if the transition is terminal.
 
     Mirrors the inline logic ``KanbanOrchestrator._apply_normal_result``
@@ -41,19 +41,22 @@ def detach_worktree_on_terminal(
     directories — once attached, ``worktree prune`` skips the branch
     because the directory still exists.
 
-    No-op when:
+    Returns the :class:`~kanban.worktree.types.DetachResult` from the
+    manager (``removed=False`` means the worktree was kept because
+    uncommitted changes couldn't be auto-committed), or ``None`` when
+    nothing was done:
 
     - ``worktree_mgr`` is ``None`` (board not git-backed),
     - ``target_status`` is not ``DONE`` / ``BLOCKED``, or
     - the card was never attached to a worktree.
     """
     if worktree_mgr is None:
-        return
+        return None
     if target_status not in (CardStatus.DONE, CardStatus.BLOCKED):
-        return
+        return None
     card = store.get_card(card_id)
     if card.worktree_branch is None:
-        return
+        return None
     result = worktree_mgr.detach(card_id)
     if getattr(result, "artifacts_path", None) is not None:
         store.append_runtime_event(
@@ -86,3 +89,4 @@ def detach_worktree_on_terminal(
             ),
             worktree_branch=card.worktree_branch,
         )
+    return result

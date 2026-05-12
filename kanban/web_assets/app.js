@@ -16,6 +16,7 @@
   });
   const detailModal = window.KanbanWeb.createDetailModal({
     onClose: () => boardView.clearSelected(),
+    onMutated: () => tick(),
   });
   const boardView = window.KanbanWeb.createBoardView({
     addCardModal,
@@ -39,6 +40,10 @@
       boardView.renderBoard(data, detailModal.selectedId());
       boardView.renderEvents(data.recent_events || []);
       boardView.renderRuntime(data.runtime || {}, data.daemon || null);
+      detailModal.setWritesEnabled(!!data.writes_enabled);
+      detailModal.setClaimedCardIds(
+        ((data.runtime && data.runtime.claims) || []).map((c) => c.card_id),
+      );
       if (detailModal.selectedId()) detailModal.refresh();
       updatedAtEl.textContent = fmtTime(data.generated_at);
     } catch (err) {

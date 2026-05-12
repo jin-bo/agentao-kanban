@@ -5,7 +5,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ..daemon import assert_no_daemon
-from ..models import CardStatus
 from ..store_markdown import MarkdownBoardStore
 
 
@@ -73,42 +72,24 @@ class ServerContext:
         )
 
 
-def _detach_worktree_after_terminal(
-    ctx: ServerContext, store: MarkdownBoardStore, card_id: str
-) -> None:
-    """MCP counterpart to ``cli._detach_worktree_after_terminal_cli``.
+def _terminal_worktree_mgr(ctx: ServerContext):
+    """WorktreeManager for the shared ``transition_*`` operations, or ``None``.
 
-    Called after every MCP write that can land a card in DONE/BLOCKED
-    (block, unblock-to-done, move-to-terminal). Without this, a card
-    transitioned to a terminal state via MCP keeps its
-    ``workspace/worktrees/<card-id>`` directory attached forever, and
-    ``worktree prune`` skips the branch because the directory still
-    exists.
+    Quiet counterpart to :func:`_resolve_worktree_mgr`: never prints,
+    never raises. Returns ``None`` when worktree isolation is disabled or
+    the board is not in a Git repo, so the detach step inside the
+    transition functions is then a no-op.
     """
     if ctx.worktree_mode is False:
-        return
-    try:
-        card = store.get_card(card_id)
-    except KeyError:
-        return
-    if card.worktree_branch is None:
-        return
-    if card.status not in (CardStatus.DONE, CardStatus.BLOCKED):
-        return
+        return None
     from ..cli import _find_git_root_optional
 
     project_root = _find_git_root_optional(ctx.board_dir)
     if project_root is None:
-        return
-    from ..orchestrator import detach_worktree_on_terminal
+        return None
     from ..worktree import WorktreeManager
 
-    wt_mgr = WorktreeManager(
-        project_root=project_root,
-        worktrees_root=project_root / "workspace" / "worktrees",
-        artifacts_root=project_root / "workspace" / "raw",
-    )
-    detach_worktree_on_terminal(store, wt_mgr, card_id, card.status)
+    return WorktreeManager.for_project(project_root)
 
 
 def _resolve_worktree_mgr(ctx: ServerContext):

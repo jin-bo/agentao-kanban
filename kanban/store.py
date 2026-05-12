@@ -5,6 +5,7 @@ from datetime import datetime
 from typing import Protocol, runtime_checkable
 
 from .models import (
+    UNSET,
     AgentResult,
     AgentRole,
     Card,
@@ -36,7 +37,15 @@ class BoardStore(Protocol):
     def get_card(self, card_id: str) -> Card: ...
     def list_cards(self) -> list[Card]: ...
     def list_by_status(self, status: CardStatus) -> list[Card]: ...
-    def move_card(self, card_id: str, status: CardStatus, note: str) -> Card: ...
+    def move_card(
+        self,
+        card_id: str,
+        status: CardStatus,
+        note: str,
+        *,
+        blocked_reason: object = ...,
+        owner_role: object = ...,
+    ) -> Card: ...
     def update_card(self, card_id: str, **updates: object) -> Card: ...
     def append_event(self, card_id: str, message: str) -> None: ...
     def append_execution_event(self, card_id: str, result: AgentResult) -> None: ...
@@ -144,7 +153,15 @@ class InMemoryBoardStore:
         cards = [card for card in self._cards.values() if card.status == status]
         return sorted(cards, key=lambda card: (-int(card.priority), card.created_at))
 
-    def move_card(self, card_id: str, status: CardStatus, note: str) -> Card:
+    def move_card(
+        self,
+        card_id: str,
+        status: CardStatus,
+        note: str,
+        *,
+        blocked_reason: object = UNSET,
+        owner_role: object = UNSET,
+    ) -> Card:
         card = self.get_card(card_id)
         previous = card.status
         card.status = status
@@ -152,6 +169,14 @@ class InMemoryBoardStore:
             card.blocked_at = utc_now()
         elif status != CardStatus.BLOCKED:
             card.blocked_at = None
+        if blocked_reason is not UNSET:
+            card.blocked_reason = blocked_reason  # type: ignore[assignment]
+        if owner_role is not UNSET:
+            card.owner_role = (
+                AgentRole(owner_role)
+                if isinstance(owner_role, str)
+                else owner_role  # type: ignore[assignment]
+            )
         card.add_history(note, role="system")
         self.append_event(card_id, note)
         return card

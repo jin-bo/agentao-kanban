@@ -28,7 +28,6 @@ from mcp.server.fastmcp import FastMCP
 from .context import (  # noqa: F401
     CardClaimedError,
     ServerContext,
-    _detach_worktree_after_terminal,
     _resolve_worktree_mgr,
 )
 from .serializers import card_to_dict, event_to_dict  # noqa: F401

@@ -387,3 +387,55 @@ def test_legacy_card_without_agent_profile_loads(tmp_path: Path):
     card = store.get_card("legacy")
     assert card.agent_profile is None
     assert card.agent_profile_source is None
+
+
+def test_move_card_persists_auxiliary_fields_in_one_write(tmp_path: Path):
+    store = MarkdownBoardStore(tmp_path)
+    card = store.add_card(Card(title="t", goal="g", owner_role=AgentRole.WORKER))
+    store.move_card(
+        card.id,
+        CardStatus.BLOCKED,
+        "Blocked: stuck",
+        blocked_reason="stuck",
+    )
+    fresh = MarkdownBoardStore(tmp_path).get_card(card.id)
+    assert fresh.status == CardStatus.BLOCKED
+    assert fresh.blocked_reason == "stuck"
+    assert fresh.blocked_at is not None
+    # Plain move (no kwargs) is unchanged: clears blocked_at on leaving BLOCKED.
+    store.move_card(card.id, CardStatus.READY, "Unblocked", blocked_reason=None)
+    fresh = MarkdownBoardStore(tmp_path).get_card(card.id)
+    assert fresh.status == CardStatus.READY
+    assert fresh.blocked_reason is None
+    assert fresh.blocked_at is None
+
+
+def test_move_card_failed_write_leaves_card_and_log_unchanged(tmp_path: Path):
+    store = MarkdownBoardStore(tmp_path)
+    card = store.add_card(Card(title="t", goal="g"))
+    events_before = len(store.list_events())
+
+    def boom(_card):
+        raise OSError("disk full")
+
+    store.card_store._write_card = boom  # type: ignore[method-assign]
+    try:
+        import pytest
+
+        with pytest.raises(OSError):
+            store.move_card(
+                card.id, CardStatus.BLOCKED, "Blocked: x", blocked_reason="x"
+            )
+    finally:
+        del store.card_store._write_card
+
+    # In-memory cache untouched...
+    cached = store.get_card(card.id)
+    assert cached.status == CardStatus.INBOX
+    assert cached.blocked_reason is None
+    assert cached.blocked_at is None
+    assert len(store.list_events()) == events_before
+    # ...and nothing landed on disk either.
+    fresh = MarkdownBoardStore(tmp_path).get_card(card.id)
+    assert fresh.status == CardStatus.INBOX
+    assert fresh.blocked_reason is None

@@ -15,14 +15,15 @@ import json as _json
 import sys
 
 from ...models import AgentRole, CardStatus
-from ...orchestrator import advance_inbox_dependents
+from ...operations import transition_block, transition_move, transition_unblock
 from ..helpers import (
     _apply_limit,
-    _detach_worktree_after_terminal_cli,
+    _detach_worktree_mgr,
     _make_store,
     _non_negative_int,
     _require_card_writable,
     _resolve_card_id,
+    _run_transition,
 )
 from ..rendering import (
     _event_to_json,
@@ -91,16 +92,19 @@ def cmd_move(args: argparse.Namespace) -> int:
     store = _make_store(args)
     args.card_id = _resolve_card_id(store, args.card_id)
     _require_card_writable(args, args.card_id)
-    try:
-        previous_status = store.get_card(args.card_id).status
-        card = store.move_card(args.card_id, CardStatus(args.status), "Manual move via CLI")
-    except KeyError:
-        print(f"No card with id {args.card_id}", file=sys.stderr)
-        return 1
-    if card.status == CardStatus.DONE and previous_status != CardStatus.DONE:
-        advance_inbox_dependents(store, card.id)
-    _detach_worktree_after_terminal_cli(args, store, card.id)
-    print(f"Moved {card.id} to {card.status.value}")
+    result, rc = _run_transition(
+        args.card_id,
+        lambda: transition_move(
+            store,
+            _detach_worktree_mgr(args),
+            args.card_id,
+            args.status,
+            note="Manual move via CLI",
+        ),
+    )
+    if rc:
+        return rc
+    print(f"Moved {result.card.id} to {result.card.status.value}")
     return 0
 
 
@@ -108,14 +112,15 @@ def cmd_block(args: argparse.Namespace) -> int:
     store = _make_store(args)
     args.card_id = _resolve_card_id(store, args.card_id)
     _require_card_writable(args, args.card_id)
-    try:
-        store.update_card(args.card_id, blocked_reason=args.reason)
-        card = store.move_card(args.card_id, CardStatus.BLOCKED, f"Blocked: {args.reason}")
-    except KeyError:
-        print(f"No card with id {args.card_id}", file=sys.stderr)
-        return 1
-    _detach_worktree_after_terminal_cli(args, store, card.id)
-    print(f"Blocked {card.id}: {args.reason}")
+    result, rc = _run_transition(
+        args.card_id,
+        lambda: transition_block(
+            store, _detach_worktree_mgr(args), args.card_id, args.reason
+        ),
+    )
+    if rc:
+        return rc
+    print(f"Blocked {result.card.id}: {result.card.blocked_reason}")
     return 0
 
 
@@ -123,20 +128,15 @@ def cmd_unblock(args: argparse.Namespace) -> int:
     store = _make_store(args)
     args.card_id = _resolve_card_id(store, args.card_id)
     _require_card_writable(args, args.card_id)
-    try:
-        target = CardStatus(args.target)
-        previous_status = store.get_card(args.card_id).status
-        store.update_card(args.card_id, blocked_reason=None)
-        card = store.move_card(args.card_id, target, f"Unblocked to {target.value}")
-    except KeyError:
-        print(f"No card with id {args.card_id}", file=sys.stderr)
-        return 1
-    if card.status == CardStatus.DONE and previous_status != CardStatus.DONE:
-        advance_inbox_dependents(store, card.id)
-    # Unblocking to DONE is the only terminal target here; INBOX/READY/etc.
-    # leave the worktree attached so the next worker dispatch can resume.
-    _detach_worktree_after_terminal_cli(args, store, card.id)
-    print(f"Unblocked {card.id} to {card.status.value}")
+    result, rc = _run_transition(
+        args.card_id,
+        lambda: transition_unblock(
+            store, _detach_worktree_mgr(args), args.card_id, args.target
+        ),
+    )
+    if rc:
+        return rc
+    print(f"Unblocked {result.card.id} to {result.card.status.value}")
     return 0
 
 

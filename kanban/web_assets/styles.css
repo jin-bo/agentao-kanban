@@ -1038,3 +1038,58 @@ body {
   line-height: 1.4;
   white-space: pre;
 }
+
+/* --- Card detail: Actions (operator write controls, --enable-writes) --- */
+.card-detail-actions .detail-action-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5em;
+  margin: 0.35em 0;
+  flex-wrap: wrap;
+}
+.detail-action-label {
+  min-width: 6.5em;
+  color: var(--text-dim);
+  font-size: 0.85em;
+}
+.detail-action-input {
+  background: var(--bg-elev-2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: inherit;
+  padding: 0.25em 0.4em;
+  font: inherit;
+  font-size: 0.85em;
+}
+.detail-action-grow {
+  flex: 1 1 12em;
+}
+.detail-action-btn {
+  background: var(--bg-elev-2);
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  border-radius: 4px;
+  padding: 0.25em 0.7em;
+  font: inherit;
+  font-size: 0.85em;
+  cursor: pointer;
+}
+.detail-action-btn:hover:not(:disabled) {
+  background: var(--accent);
+  color: #0b1220;
+}
+.detail-action-btn:disabled,
+.detail-action-input:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.detail-action-note {
+  color: var(--warn);
+}
+.detail-action-feedback {
+  margin: 0.4em 0 0;
+  font-size: 0.85em;
+}
+.feedback-ok { color: var(--ok); }
+.feedback-warn { color: var(--warn); }
+.feedback-error { color: var(--danger); }

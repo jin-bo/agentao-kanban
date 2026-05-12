@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 
 from ...executors import MockAgentaoExecutor
 from ...models import AgentRole, CardStatus
+from ...operations import transition_requeue
 from ...orchestrator import KanbanOrchestrator
 from ..helpers import (
     _make_orchestrator,
@@ -21,6 +22,7 @@ from ..helpers import (
     _require_card_writable,
     _require_writable,
     _resolve_card_id,
+    _run_transition,
 )
 from ..rendering import _format_age
 
@@ -197,24 +199,21 @@ def cmd_requeue(args: argparse.Namespace) -> int:
     args.card_id = _resolve_card_id(store, args.card_id)
     _require_card_writable(args, args.card_id)
     try:
-        card = store.get_card(args.card_id)
+        previous_status = store.get_card(args.card_id).status.value
     except KeyError:
-        print(f"No card with id {args.card_id}", file=sys.stderr)
-        return 1
-
-    previous_status = card.status
-    target = CardStatus(args.target)
-
-    # Clear blocked_reason and reset owner_role — both target statuses
-    # (INBOX, READY) expect no pending owner.
-    store.update_card(card.id, blocked_reason=None, owner_role=None)
-
-    suffix = f": {args.note}" if args.note else ""
-    history_note = (
-        f"Requeued from {previous_status.value} to {target.value}{suffix}"
+        previous_status = None  # _run_transition prints the not-found line
+    result, rc = _run_transition(
+        args.card_id,
+        lambda: transition_requeue(
+            store, args.card_id, args.target, args.note or None
+        ),
     )
-    store.move_card(card.id, target, history_note)
-    print(history_note)
+    if rc:
+        return rc
+    suffix = f": {args.note}" if args.note else ""
+    print(
+        f"Requeued from {previous_status} to {result.card.status.value}{suffix}"
+    )
     return 0
 
 

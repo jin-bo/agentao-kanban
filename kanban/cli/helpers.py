@@ -16,6 +16,7 @@ from ..init import (
     read_board_dir_override,
 )
 from ..models import CardStatus
+from ..operations import OperationError
 from ..orchestrator import KanbanOrchestrator
 from ..store_markdown import MarkdownBoardStore
 
@@ -280,6 +281,46 @@ def _detach_worktree_after_terminal_cli(
     detach_worktree_on_terminal(
         store, WorktreeManager.for_project(project_root), card_id, card.status
     )
+
+
+def _run_transition(card_id: str, thunk):
+    """Run a CLI ``transition_*`` call, mapping its failures to ``(result, rc)``.
+
+    ``thunk`` is a zero-arg callable returning a ``TransitionResult``. On
+    success returns ``(result, 0)`` after printing any post-commit warnings
+    to stderr; a missing card is ``(None, 1)``; bad input is ``(None, 2)``.
+    Callers own the success line.
+    """
+    try:
+        result = thunk()
+    except KeyError:
+        print(f"No card with id {card_id}", file=sys.stderr)
+        return None, 1
+    except OperationError as exc:
+        print(str(exc), file=sys.stderr)
+        return None, 2
+    for warning in result.warnings:
+        print(warning, file=sys.stderr)
+    return result, 0
+
+
+def _detach_worktree_mgr(args: argparse.Namespace):
+    """Worktree manager for manual transitions, or ``None``.
+
+    Quiet counterpart to :func:`_resolve_worktree_mgr` used by the shared
+    ``transition_*`` operations: never prints, never raises. Returns
+    ``None`` when ``--no-worktree`` was passed or the board is not in a
+    Git repo, so manual transitions on non-git boards stay silent (the
+    detach step itself is then a no-op).
+    """
+    if getattr(args, "worktree", None) is False:
+        return None
+    project_root = _find_git_root_optional(args.board)
+    if project_root is None:
+        return None
+    from ..worktree import WorktreeManager
+
+    return WorktreeManager.for_project(project_root)
 
 
 def _resolve_worktree_mgr(args: argparse.Namespace):

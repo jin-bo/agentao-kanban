@@ -2,12 +2,24 @@
   "use strict";
 
   const ns = (window.KanbanWeb = window.KanbanWeb || {});
-  const { artifactBrowser, detailSections, el, fetchJSON, fmtTime, transcriptViewer } =
+  const { artifactBrowser, detailSections, el, fetchJSON, fmtTime, postJSON, transcriptViewer } =
     ns;
+
+  const STATUSES = ["inbox", "ready", "doing", "review", "done", "blocked"];
+  const REQUEUE_TARGETS = ["inbox", "ready"];
 
   function createDetailModal(options) {
     const onClose = options && options.onClose ? options.onClose : () => {};
+    const onMutated =
+      options && options.onMutated ? options.onMutated : () => {};
     let selectedCardId = null;
+    let writesEnabled = false;
+    let claimedIds = new Set();
+    // Persisted across the 5s board-poll re-render so a half-typed block
+    // reason / picked dropdown isn't wiped under the operator.
+    let actionDrafts = {};
+    let actionFeedback = null; // { kind: "ok"|"warn"|"error", text }
+    let actionBusy = false;
     let modal = null;
     let body = null;
     let closeBtn = null;
@@ -100,6 +112,8 @@
       ]);
 
       const sections = [];
+      const actionsSection = renderActionsSection(card);
+      if (actionsSection) sections.push(actionsSection);
       sections.push(renderResultSection());
       sections.push(renderArtifactsSection(card.id));
       sections.push(renderChangesSection());
@@ -187,6 +201,237 @@
       }
 
       body.replaceChildren(head, ...sections);
+    }
+
+    function draft(key, fallback) {
+      return actionDrafts[key] !== undefined ? actionDrafts[key] : fallback;
+    }
+
+    function statusSelect(key, fallback, disabled, options) {
+      const opts = (options || STATUSES).map((s) =>
+        el(
+          "option",
+          { value: s, ...(s === draft(key, fallback) ? { selected: "selected" } : {}) },
+          s,
+        ),
+      );
+      return el(
+        "select",
+        {
+          class: "detail-action-input",
+          disabled: disabled ? "disabled" : null,
+          onchange: (ev) => {
+            actionDrafts[key] = ev.target.value;
+          },
+        },
+        opts,
+      );
+    }
+
+    function actionRow(label, control, button) {
+      return el("div", { class: "detail-action-row" }, [
+        el("label", { class: "detail-action-label" }, label),
+        control,
+        button,
+      ]);
+    }
+
+    function actionButton(text, disabled, onClick) {
+      return el(
+        "button",
+        {
+          type: "button",
+          class: "detail-action-btn",
+          disabled: disabled ? "disabled" : null,
+          onclick: onClick,
+        },
+        text,
+      );
+    }
+
+    async function submitAction(cardId, path, bodyFn, opts) {
+      if (actionBusy) return;
+      let body;
+      try {
+        body = bodyFn();
+      } catch (err) {
+        actionFeedback = { kind: "error", text: err.message };
+        if (lastCard) render(lastCard);
+        return;
+      }
+      actionBusy = true;
+      actionFeedback = { kind: "ok", text: "Working..." };
+      if (lastCard) render(lastCard);
+      let res;
+      try {
+        res = await postJSON(
+          `/api/cards/${encodeURIComponent(cardId)}/${path}`,
+          body,
+        );
+      } catch (err) {
+        actionBusy = false;
+        actionFeedback = { kind: "error", text: `Request failed: ${err.message}` };
+        if (lastCard) render(lastCard);
+        return;
+      }
+      actionBusy = false;
+      if (selectedCardId !== cardId) return;
+      if (!res.ok) {
+        // `message` is the route's stable error envelope; `detail` covers
+        // a FastAPI request-validation 422 (different body shape).
+        const msg =
+          (res.data && (res.data.message || res.data.detail)) ||
+          `HTTP ${res.status}`;
+        actionFeedback = { kind: "error", text: msg };
+        if (lastCard) render(lastCard);
+        return;
+      }
+      const warnings = (res.data && res.data.warnings) || [];
+      actionFeedback = warnings.length
+        ? { kind: "warn", text: warnings.join(" / ") }
+        : { kind: "ok", text: opts && opts.okText ? opts.okText : "Done." };
+      if (opts && opts.clearDrafts) {
+        for (const k of opts.clearDrafts) delete actionDrafts[k];
+      }
+      // Refresh the card, reload the lazy sections (a terminal landing may
+      // have detached the worktree / changed result/artifacts/diff state),
+      // and nudge the board since the status changed.
+      refresh();
+      for (const key of Object.keys(detailSectionsToLoad)) {
+        loadSection(cardId, key);
+      }
+      onMutated();
+    }
+
+    function renderActionsSection(card) {
+      if (!writesEnabled) return null;
+      const claimed = claimedIds.has(card.id);
+      const children = [];
+      if (claimed) {
+        children.push(
+          el(
+            "p",
+            { class: "hint detail-action-note" },
+            "This card has a live execution claim — actions are disabled until it finishes.",
+          ),
+        );
+      }
+      const disabled = claimed || actionBusy;
+
+      // Move
+      const moveSel = statusSelect("moveStatus", card.status || "inbox", disabled);
+      children.push(
+        actionRow(
+          "Move to",
+          moveSel,
+          actionButton("Move", disabled, () =>
+            submitAction(
+              card.id,
+              "move",
+              () => ({ status: moveSel.value }),
+              { okText: "Moved." },
+            ),
+          ),
+        ),
+      );
+
+      // Requeue
+      const requeueSel = statusSelect(
+        "requeueTarget",
+        "inbox",
+        disabled,
+        REQUEUE_TARGETS,
+      );
+      const requeueNote = el("input", {
+        type: "text",
+        class: "detail-action-input",
+        placeholder: "note (optional)",
+        value: draft("requeueNote", ""),
+        disabled: disabled ? "disabled" : null,
+        oninput: (ev) => {
+          actionDrafts.requeueNote = ev.target.value;
+        },
+      });
+      children.push(
+        el("div", { class: "detail-action-row" }, [
+          el("label", { class: "detail-action-label" }, "Requeue to"),
+          requeueSel,
+          requeueNote,
+          actionButton("Requeue", disabled, () =>
+            submitAction(
+              card.id,
+              "requeue",
+              () => ({
+                target: requeueSel.value,
+                note: requeueNote.value.trim() || null,
+              }),
+              { okText: "Requeued.", clearDrafts: ["requeueNote"] },
+            ),
+          ),
+        ]),
+      );
+
+      // Block
+      const blockReason = el("input", {
+        type: "text",
+        class: "detail-action-input detail-action-grow",
+        placeholder: "block reason",
+        value: draft("blockReason", ""),
+        disabled: disabled ? "disabled" : null,
+        oninput: (ev) => {
+          actionDrafts.blockReason = ev.target.value;
+        },
+      });
+      children.push(
+        actionRow(
+          "Block",
+          blockReason,
+          actionButton("Block", disabled, () =>
+            submitAction(
+              card.id,
+              "block",
+              () => {
+                const reason = blockReason.value.trim();
+                if (!reason) throw new Error("block reason must not be blank");
+                return { reason };
+              },
+              { okText: "Blocked.", clearDrafts: ["blockReason"] },
+            ),
+          ),
+        ),
+      );
+
+      // Unblock
+      const unblockSel = statusSelect("unblockTarget", "inbox", disabled);
+      children.push(
+        actionRow(
+          "Unblock to",
+          unblockSel,
+          actionButton("Unblock", disabled, () =>
+            submitAction(
+              card.id,
+              "unblock",
+              () => ({ target: unblockSel.value }),
+              { okText: "Unblocked." },
+            ),
+          ),
+        ),
+      );
+
+      if (actionFeedback) {
+        children.push(
+          el(
+            "p",
+            { class: `detail-action-feedback feedback-${actionFeedback.kind}` },
+            actionFeedback.text,
+          ),
+        );
+      }
+
+      return el("div", { class: "card-detail-section card-detail-actions" }, [
+        el("h3", {}, "Actions"),
+        ...children,
+      ]);
     }
 
     function renderResultSection() {
@@ -326,6 +571,9 @@
       diff = null;
       diffState = stateValue;
       diffError = "";
+      actionDrafts = {};
+      actionFeedback = null;
+      actionBusy = false;
       artifactBrowser.reset();
       transcriptViewer.reset();
     }
@@ -357,11 +605,29 @@
       onClose();
     }
 
+    function setWritesEnabled(value) {
+      const next = !!value;
+      if (next === writesEnabled) return;
+      writesEnabled = next;
+      if (lastCard) render(lastCard);
+    }
+
+    function setClaimedCardIds(ids) {
+      const next = new Set(ids || []);
+      // Only re-render if the open card's claim state actually flipped.
+      const wasClaimed = selectedCardId ? claimedIds.has(selectedCardId) : false;
+      const isClaimed = selectedCardId ? next.has(selectedCardId) : false;
+      claimedIds = next;
+      if (wasClaimed !== isClaimed && lastCard) render(lastCard);
+    }
+
     return {
       close,
       open,
       refresh,
       selectedId,
+      setWritesEnabled,
+      setClaimedCardIds,
     };
   }
 

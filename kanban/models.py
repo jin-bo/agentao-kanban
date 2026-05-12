@@ -192,6 +192,26 @@ class Card:
         self.updated_at = utc_now()
 
 
+class _Unset:
+    """Sentinel for "argument not supplied" where ``None`` is a real value."""
+
+    _instance: "_Unset | None" = None
+
+    def __new__(cls) -> "_Unset":
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __repr__(self) -> str:  # pragma: no cover - cosmetic
+        return "UNSET"
+
+    def __bool__(self) -> bool:
+        return False
+
+
+UNSET = _Unset()
+
+
 @dataclass(slots=True)
 class CardEvent:
     card_id: str

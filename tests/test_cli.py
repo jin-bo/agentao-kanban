@@ -256,7 +256,7 @@ class TestRequeue:
         assert card.blocked_reason is None
         assert any("Requeued from blocked to inbox" in h for h in card.history)
 
-    def test_to_ready_with_note(self, tmp_path: Path):
+    def test_to_ready_with_note(self, tmp_path: Path, capsys):
         board = tmp_path / "board"
         cid = _add_card(board)
         main([
@@ -268,6 +268,10 @@ class TestRequeue:
             "--to", "ready", "--note", "added dataset",
         ])
         assert rc == 0
+        # stdout still echoes the transition history note (old → new[: note]).
+        assert (
+            "Requeued from blocked to ready: added dataset" in capsys.readouterr().out
+        )
         card = MarkdownBoardStore(board).get_card(cid)
         assert card.status == CardStatus.READY
         assert card.blocked_reason is None

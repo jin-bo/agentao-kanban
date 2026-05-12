@@ -335,3 +335,166 @@ def test_daemon_endpoint_stale(board: Path) -> None:
     assert data["started_at"] == 1700000000.0
     # Read-only contract: probing the endpoint must not clear the lock.
     assert lock_path(board).exists()
+
+
+# ---------- existing-card write routes (move / requeue / block / unblock) ----------
+
+
+def _writes_client(board: Path) -> TestClient:
+    return TestClient(create_app(board, enable_writes=True))
+
+
+def _seed_inbox_card(board: Path) -> str:
+    return MarkdownBoardStore(board).add_card(Card(title="W", goal="g")).id
+
+
+def test_existing_card_writes_disabled_return_403(board: Path) -> None:
+    cid = _seed_inbox_card(board)
+    client = TestClient(create_app(board))  # writes off
+    for path, body in [
+        (f"/api/cards/{cid}/move", {"status": "ready"}),
+        (f"/api/cards/{cid}/requeue", {"target": "inbox"}),
+        (f"/api/cards/{cid}/block", {"reason": "x"}),
+        (f"/api/cards/{cid}/unblock", {"target": "inbox"}),
+    ]:
+        r = client.post(path, json=body)
+        assert r.status_code == 403, (path, r.text)
+        env = r.json()
+        assert env["error"] == "writes_disabled"
+        assert env["retryable"] is False
+    # An unknown card id must get the *same* 403 — the disabled-write
+    # surface can't be used to probe whether a card exists.
+    r = client.post("/api/cards/not-a-real-id/move", json={"status": "ready"})
+    assert r.status_code == 403
+    assert r.json()["error"] == "writes_disabled"
+
+
+def test_move_route_changes_status(board: Path) -> None:
+    cid = _seed_inbox_card(board)
+    client = _writes_client(board)
+    r = client.post(f"/api/cards/{cid}/move", json={"status": "ready"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["card"]["status"] == "ready"
+    assert body["warnings"] == []
+    assert MarkdownBoardStore(board).get_card(cid).status == CardStatus.READY
+
+
+def test_block_then_unblock_roundtrip(board: Path) -> None:
+    cid = _seed_inbox_card(board)
+    client = _writes_client(board)
+    r = client.post(f"/api/cards/{cid}/block", json={"reason": "waiting on dep"})
+    assert r.status_code == 200, r.text
+    assert r.json()["card"]["status"] == "blocked"
+    assert r.json()["card"]["blocked_reason"] == "waiting on dep"
+    r = client.post(f"/api/cards/{cid}/unblock", json={"target": "inbox"})
+    assert r.status_code == 200, r.text
+    assert r.json()["card"]["status"] == "inbox"
+    assert r.json()["card"]["blocked_reason"] is None
+
+
+def test_requeue_route(board: Path) -> None:
+    cid = _seed_inbox_card(board)
+    client = _writes_client(board)
+    client.post(f"/api/cards/{cid}/block", json={"reason": "stuck"})
+    r = client.post(f"/api/cards/{cid}/requeue", json={"target": "ready", "note": "fixed"})
+    assert r.status_code == 200, r.text
+    assert r.json()["card"]["status"] == "ready"
+    assert r.json()["card"]["blocked_reason"] is None
+
+
+def test_write_route_missing_card_404(board: Path) -> None:
+    client = _writes_client(board)
+    r = client.post("/api/cards/not-a-real-id/move", json={"status": "ready"})
+    assert r.status_code == 404
+    assert r.json()["error"] == "not_found"
+
+
+def test_write_route_bad_input_400(board: Path) -> None:
+    cid = _seed_inbox_card(board)
+    client = _writes_client(board)
+    r = client.post(f"/api/cards/{cid}/move", json={"status": "bogus"})
+    assert r.status_code == 400
+    assert r.json()["error"] == "invalid_input"
+    r = client.post(f"/api/cards/{cid}/requeue", json={"target": "done"})
+    assert r.status_code == 400
+    r = client.post(f"/api/cards/{cid}/block", json={"reason": "   "})
+    assert r.status_code == 400
+    # A malformed/missing body is the envelope's 400, not FastAPI's 422.
+    r = client.post(f"/api/cards/{cid}/move", json={"wrong_field": 1})
+    assert r.status_code == 400
+    assert r.json()["error"] == "invalid_input"
+    r = client.post(
+        f"/api/cards/{cid}/move",
+        content=b"not json",
+        headers={"content-type": "application/json"},
+    )
+    assert r.status_code == 400
+    # The rejected requests left the card untouched.
+    assert MarkdownBoardStore(board).get_card(cid).status == CardStatus.INBOX
+
+
+def test_write_route_disabled_beats_bad_body(board: Path) -> None:
+    # A read-only server returns the uniform 403 even for a malformed body —
+    # it never echoes the action schema or reveals card/daemon state.
+    cid = _seed_inbox_card(board)
+    client = TestClient(create_app(board))  # writes off
+    r = client.post(f"/api/cards/{cid}/move", json={"garbage": True})
+    assert r.status_code == 403
+    assert r.json()["error"] == "writes_disabled"
+    r = client.post(
+        f"/api/cards/{cid}/move",
+        content=b"not json",
+        headers={"content-type": "application/json"},
+    )
+    assert r.status_code == 403
+    assert r.json()["error"] == "writes_disabled"
+
+
+def test_write_route_409_under_daemon_lock(board: Path) -> None:
+    cid = _seed_inbox_card(board)
+    client = _writes_client(board)
+    with daemon_lock(board):
+        r = client.post(f"/api/cards/{cid}/move", json={"status": "ready"})
+    assert r.status_code == 409
+    env = r.json()
+    assert env["error"] == "daemon_active"
+    assert env["retryable"] is True
+    # No transition happened.
+    assert MarkdownBoardStore(board).get_card(cid).status == CardStatus.INBOX
+
+
+def test_write_route_409_under_live_claim(board: Path) -> None:
+    from datetime import timedelta
+
+    from kanban.models import AgentRole, ExecutionClaim, utc_now
+
+    store = MarkdownBoardStore(board)
+    card = store.add_card(Card(title="C", goal="g", status=CardStatus.READY))
+    now = utc_now()
+    store.create_claim(
+        ExecutionClaim(
+            card_id=card.id,
+            claim_id="claim-1",
+            role=AgentRole.WORKER,
+            status_at_claim=CardStatus.READY,
+            attempt=1,
+            claimed_at=now,
+            lease_expires_at=now + timedelta(minutes=10),
+            heartbeat_at=now,
+            timeout_s=600,
+            worker_id="worker-1",
+        )
+    )
+    client = _writes_client(board)
+    r = client.post(f"/api/cards/{card.id}/move", json={"status": "doing"})
+    assert r.status_code == 409
+    assert r.json()["error"] == "live_claim"
+
+
+def test_index_html_served_unchanged(client: TestClient) -> None:
+    # The Actions UI is gated client-side on writes_enabled; the static
+    # index is the same document regardless. Sanity-check it still loads.
+    r = client.get("/")
+    assert r.status_code == 200
+    assert "Kanban" in r.text

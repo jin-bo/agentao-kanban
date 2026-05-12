@@ -4,9 +4,19 @@ from pathlib import Path
 from typing import Any
 
 from ..models import AgentRole, Card, CardPriority, CardStatus, coerce_card_status
+from ..operations import (
+    TransitionResult,
+    transition_block,
+    transition_move,
+    transition_unblock,
+)
 from ..orchestrator import KanbanOrchestrator
 from ..store_markdown import MarkdownBoardStore
-from .context import ServerContext, _detach_worktree_after_terminal, _resolve_worktree_mgr
+from .context import (
+    ServerContext,
+    _resolve_worktree_mgr,
+    _terminal_worktree_mgr,
+)
 from .serializers import card_to_dict, event_to_dict
 
 _VALID_PRIORITIES = tuple(p.name for p in CardPriority)
@@ -128,24 +138,34 @@ def tool_card_show(ctx: ServerContext, card_id: str) -> dict[str, Any]:
     return card_to_dict(card)
 
 
+def _transition_response(result: TransitionResult) -> dict[str, Any]:
+    """Serialize a card transition, attaching ``warnings`` only when present.
+
+    Keeps the historical "tool returns the card dict" shape; the optional
+    ``warnings`` key is additive and non-breaking for existing clients.
+    """
+    payload = card_to_dict(result.card)
+    if result.warnings:
+        payload["warnings"] = list(result.warnings)
+    return payload
+
+
 def tool_card_move(
     ctx: ServerContext, card_id: str, status: str
 ) -> dict[str, Any]:
     ctx.guard_card_write(card_id)
     store = ctx.store()
     try:
-        previous_status = store.get_card(card_id).status
-        card = store.move_card(
-            card_id, _coerce_status(status), "Manual move via MCP"
+        result = transition_move(
+            store,
+            _terminal_worktree_mgr(ctx),
+            card_id,
+            status,
+            note="Manual move via MCP",
         )
     except KeyError as exc:
         raise ValueError(f"card {card_id} not found") from exc
-    if card.status == CardStatus.DONE and previous_status != CardStatus.DONE:
-        from ..orchestrator import advance_inbox_dependents
-
-        advance_inbox_dependents(store, card.id)
-    _detach_worktree_after_terminal(ctx, store, card.id)
-    return card_to_dict(card)
+    return _transition_response(result)
 
 
 def tool_card_block(
@@ -154,14 +174,12 @@ def tool_card_block(
     ctx.guard_card_write(card_id)
     store = ctx.store()
     try:
-        store.update_card(card_id, blocked_reason=reason)
-        card = store.move_card(
-            card_id, CardStatus.BLOCKED, f"Blocked: {reason}"
+        result = transition_block(
+            store, _terminal_worktree_mgr(ctx), card_id, reason
         )
     except KeyError as exc:
         raise ValueError(f"card {card_id} not found") from exc
-    _detach_worktree_after_terminal(ctx, store, card.id)
-    return card_to_dict(card)
+    return _transition_response(result)
 
 
 def tool_card_unblock(
@@ -169,21 +187,13 @@ def tool_card_unblock(
 ) -> dict[str, Any]:
     ctx.guard_card_write(card_id)
     store = ctx.store()
-    target = _coerce_status(to)
     try:
-        previous_status = store.get_card(card_id).status
-        store.update_card(card_id, blocked_reason=None)
-        card = store.move_card(
-            card_id, target, f"Unblocked to {target.value}"
+        result = transition_unblock(
+            store, _terminal_worktree_mgr(ctx), card_id, to
         )
     except KeyError as exc:
         raise ValueError(f"card {card_id} not found") from exc
-    if card.status == CardStatus.DONE and previous_status != CardStatus.DONE:
-        from ..orchestrator import advance_inbox_dependents
-
-        advance_inbox_dependents(store, card.id)
-    _detach_worktree_after_terminal(ctx, store, card.id)
-    return card_to_dict(card)
+    return _transition_response(result)
 
 
 def tool_events_tail(

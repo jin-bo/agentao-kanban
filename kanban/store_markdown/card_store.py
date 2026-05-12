@@ -6,6 +6,7 @@ from collections import defaultdict
 from pathlib import Path
 
 from ..models import (
+    UNSET,
     AgentRole,
     Card,
     CardEvent,
@@ -44,16 +45,50 @@ class CardStore(StoreComponent):
         cards = [c for c in self._cards.values() if c.status == status]
         return sorted(cards, key=lambda c: (-int(c.priority), c.created_at))
 
-    def move_card(self, card_id: str, status: CardStatus, note: str) -> Card:
+    def move_card(
+        self,
+        card_id: str,
+        status: CardStatus,
+        note: str,
+        *,
+        blocked_reason: object = UNSET,
+        owner_role: object = UNSET,
+    ) -> Card:
         card = self.get_card(card_id)
         previous = card.status
+        # Snapshot every field this single write touches so a failed
+        # `_write_card` leaves the in-memory card byte-for-byte unchanged
+        # (the disk side is already covered by the atomic tmp-then-rename).
+        prev_blocked_at = card.blocked_at
+        prev_blocked_reason = card.blocked_reason
+        prev_owner_role = card.owner_role
+        prev_updated_at = card.updated_at
+        prev_history_len = len(card.history)
+
         card.status = status
         if status == CardStatus.BLOCKED and previous != CardStatus.BLOCKED:
             card.blocked_at = utc_now()
         elif status != CardStatus.BLOCKED:
             card.blocked_at = None
+        if blocked_reason is not UNSET:
+            card.blocked_reason = blocked_reason  # type: ignore[assignment]
+        if owner_role is not UNSET:
+            card.owner_role = (
+                AgentRole(owner_role)
+                if isinstance(owner_role, str)
+                else owner_role  # type: ignore[assignment]
+            )
         card.add_history(note, role="system")
-        self._write_card(card)
+        try:
+            self._write_card(card)
+        except Exception:
+            card.status = previous
+            card.blocked_at = prev_blocked_at
+            card.blocked_reason = prev_blocked_reason
+            card.owner_role = prev_owner_role
+            card.updated_at = prev_updated_at
+            del card.history[prev_history_len:]
+            raise
         self.append_event(card_id, note)
         return card
 
