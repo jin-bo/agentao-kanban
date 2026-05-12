@@ -6,6 +6,8 @@
 
 ## [Unreleased]
 
+## [0.1.9] — 2026-05-12
+
 ### Added
 - **Web UI:transcript 内联查看 + artifact 时间标签(P3)**。Transcripts 区从
   "每条都是新标签页打开"改成内联:最新一条默认展开内联渲染,旧的折叠成带
@@ -342,7 +344,8 @@
   (planner / worker / reviewer / verifier)、本地 dispatcher daemon、基于
   `MockAgentaoExecutor` 的离线状态机。
 
-[Unreleased]: https://github.com/jin-bo/agentao-kanban/compare/v0.1.8...HEAD
+[Unreleased]: https://github.com/jin-bo/agentao-kanban/compare/v0.1.9...HEAD
+[0.1.9]: https://github.com/jin-bo/agentao-kanban/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/jin-bo/agentao-kanban/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/jin-bo/agentao-kanban/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/jin-bo/agentao-kanban/compare/v0.1.5...v0.1.6
