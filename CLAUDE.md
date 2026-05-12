@@ -20,6 +20,7 @@ uv run kanban <subcommand>    # run CLI
 - `kanban/store.py` — `BoardStore` Protocol + `InMemoryBoardStore`
 - `kanban/store_markdown.py` — `MarkdownBoardStore` (TOML front-matter + events.log + raw transcripts)
 - `kanban/orchestrator.py` — scheduler (`tick`, `run_until_idle`, WIP policy)
+- `kanban/operations.py` — shared state-transition functions (`transition_move/block/unblock/requeue`) used by the CLI, MCP tools, and web write routes
 - `kanban/agents.py` — `ROLE_AGENTS` mapping + agent definition loader
 - `kanban/executors/` — `CardExecutor` protocol, `MockAgentaoExecutor`, `AgentaoMultiAgentExecutor`
 - `kanban/daemon.py` — dispatcher loop + `.daemon.lock` single-writer guard

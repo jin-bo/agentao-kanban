@@ -10,6 +10,196 @@
 > write actions was **out of scope here** and tracked in its own plan (see
 > "Out of scope / follow-ups" at the end). P0 was read-only and self-contained.
 
+## Current Implementation Audit (2026-05-12)
+
+This design record has mostly moved from "planned" to "baseline":
+
+- P0 Result API and card-detail Result section are implemented via
+  `kanban/result.py`, `GET /api/cards/{card_id}/result`, and the Web detail
+  sections.
+- P1 Transcript and Diff surfaces are implemented via
+  `GET /api/cards/{card_id}/traces`,
+  `GET /api/cards/{card_id}/traces/{trace_id}/file`, and
+  `GET /api/cards/{card_id}/diff`.
+- P2 artifact polish is partially implemented: filename filtering, file-kind
+  hints, inline text preview, copyable paths, newest-snapshot expansion, and
+  refresh-stable expanded state exist.
+
+Remaining gaps are now mostly product-shape gaps, not missing primitives:
+
+- Card detail is still a long stacked document. The Result section already has
+  some jump links, so this does not justify a full navigation component; only
+  small in-context anchors are worth adding.
+- Transcripts open as raw text in a new tab. There is no inline latest-transcript
+  preview or role filter.
+- The old out-of-scope items are still out of scope for this document unless
+  they remain read-only. Operator writes and worktree mutations still need their
+  own safety design.
+
+## P3 Design: Focused Review Polish
+
+P3 should be a small follow-up, not a broad "review workspace" rewrite. The
+valuable work is to close the remaining workflow break in transcripts and finish
+the artifact label polish. It should not introduce a new Web-only action schema,
+and it should not add a dedicated detail navigation component.
+
+### Product Goal
+
+When a card has a result, the Web detail modal should make the existing read-only
+surfaces easier to inspect:
+
+1. Read the result summary and state.
+2. Inspect the diff.
+3. Read the latest transcript inline when the result is unclear.
+4. Open or preview saved artifacts with readable snapshot labels.
+
+The design remains read-only. Merge, prune, branch deletion, checkout,
+requeue/block/move, and any daemon-racing write action stay outside this phase.
+
+### P3a: Minimal In-Context Jump Links
+
+Do not build a full section navigator, tab system, or sticky state/count control.
+The current detail modal is a stacked document, and that structure is acceptable.
+Only add small jump links where they remove obvious friction:
+
+- Result should continue linking to Changes when the worktree state can produce
+  a diff.
+- Result should link to Artifacts when snapshots exist.
+- Result should link to Transcripts when retained transcripts exist.
+- Once the inline transcript viewer exists, the transcript link should land on
+  the expanded latest transcript.
+
+This is a JS/UI-only refinement. It should not add new API fields.
+
+### P3b: Inline Transcript Viewer
+
+Keep the existing raw transcript file endpoint, but add an inline viewer in the
+Transcripts section:
+
+- The newest transcript is expanded by default when present.
+- Older transcripts are collapsed rows with role, timestamp, size, and open/copy
+  controls.
+- Add a role filter when there is more than one role.
+- Inline content uses the existing file endpoint and the existing byte cap; 413
+  renders a "too large for inline view" state with the on-disk path and raw-open
+  link.
+- The viewer is read-only text. No transcript editing, deletion, or redaction in
+  this phase.
+
+Security stays identical to P1: resolve files by exact `store.list_traces()`
+match and serve through the same root/symlink/size validation path.
+
+### P3c: Artifact Time Labels
+
+Finish the remaining artifact polish by giving snapshot names a readable time
+label while keeping raw names visible:
+
+- Primary label: parsed timestamp, local time display.
+- Secondary label: raw snapshot directory name.
+- If parsing fails, fall back to the raw name without erroring.
+- Keep `snapshot` as the stable API identifier; do not introduce mutable display
+  names into file-serving routes.
+
+### Explicit Non-Goals
+
+- No full detail navigation component with section state/count badges.
+- No tabs that mount/unmount sections.
+- No Web-only `actions` field or action schema in `GET /api/cards/{card_id}/result`.
+- No changes to `kanban result --json`, `next_steps`, or the shared summarizer
+  contract.
+- No new write routes.
+
+### P3 Acceptance Criteria
+
+- The latest transcript can be read inline; oversized transcripts return a clear
+  inline state rather than breaking the modal.
+- The transcript section supports role filtering when multiple roles are present.
+- Result has minimal jump links to existing read-only sections where useful,
+  without adding an API schema for actions.
+- Existing `next_steps` and CLI JSON output remain unchanged.
+- Artifact snapshots show human-readable timestamps while preserving the raw
+  snapshot id.
+- All P3 routes remain available without `--enable-writes`; no new write route is
+  introduced.
+
+### P3 Test Plan
+
+- Transcript viewer expands the newest transcript, supports role filtering, and
+  handles 413 responses.
+- Result jump links render only when their target data exists or the target
+  section is meaningful for the current worktree state.
+- Artifact snapshot labels parse valid `artifacts-<utc-stamp>` names and fall
+  back cleanly for malformed names.
+
+## P4 Design: Dependency UX
+
+P4 should make card dependencies visible and navigable in the Web UI without
+adding write actions. This is the right follow-up after P3 because dependency
+context affects everyday planning/review work, stays mostly read-only, and does
+not introduce daemon or worktree mutation risk.
+
+### Product Goal
+
+When a card is blocked by or unblocks other cards, the Web UI should make that
+relationship obvious:
+
+- A reviewer can jump from a card to its dependencies.
+- A reviewer can see which cards depend on the current card.
+- The board view can distinguish ordinary blocked cards from dependency-blocked
+  cards.
+- Add Card can find dependency targets by title, not only by pasted card id.
+
+### P4a: Card Detail Dependency Links
+
+Enhance the card detail payload and modal:
+
+- Keep `depends_on` as the existing list of card ids.
+- Add a Web-only `dependents` field computed from `store.list_cards()`.
+- Render `depends_on` as clickable chips using card title + short id.
+- Render `dependents` as clickable chips in a separate "Unblocks" row.
+- Unknown/stale dependency ids should render as short id chips with a stale
+  marker, not break the modal.
+
+Implementation notes:
+
+- Compute `dependents` in the Web serialization layer, not in the markdown store.
+- Avoid changing the card file format.
+- Clicking a dependency chip should open that card's detail modal directly.
+
+### P4b: Board Dependency Indicators
+
+Add low-noise indicators on board cards:
+
+- Show a blocked-by count when `depends_on` is non-empty and unresolved.
+- Show an unblocks count when other cards depend on this card.
+- Keep this as compact metadata, not a second dependency graph view.
+- Use existing card status and dependency data; do not add a new scheduler rule
+  in this phase.
+
+### P4c: Add Card Dependency Search
+
+Improve the Add Card modal's `depends_on` input:
+
+- Support title-text search over existing cards.
+- Let users add multiple dependencies as chips.
+- Preserve manual card-id entry for copy/paste workflows.
+- Prevent duplicate selected dependencies in the UI.
+
+### P4 Acceptance Criteria
+
+- Card detail shows both dependencies and dependents with clickable chips.
+- Stale dependency ids are visible and do not cause 500s or JS render failures.
+- Board cards expose compact dependency-blocked and unblocks indicators.
+- Add Card can search by title and still accepts pasted ids.
+- No card mutation endpoints beyond the existing add-card flow are introduced.
+
+### P4 Test Plan
+
+- Web card detail includes `dependents` for cards with reverse dependencies.
+- Detail rendering handles known, unknown, and duplicate dependency ids.
+- Board serialization exposes enough dependency metadata for the indicators.
+- Add Card dependency selection serializes to the existing `depends_on` payload.
+
 ## Context
 
 最新 CLI 更新把“卡片结果”收敛为一等概念：
@@ -313,8 +503,8 @@ P2 (later, polish):
 
 7. Artifact browser filtering / preview / copyable paths.
 
-Anything else (CLI JSON restructure, dependency UX, write/operator actions, the
-safety design those need) is **out of scope** — see below.
+Anything else (CLI JSON restructure, write/operator actions, and the safety
+design those need) is **out of scope** — see below.
 
 ## Out of scope / follow-ups
 
@@ -323,19 +513,11 @@ and read-only:
 
 - **Structured `next_steps` + CLI JSON restructure** — making the summarizer
   return `{kind, ...}` records and reshaping `kanban result --json` is a
-  pre-1.0 CLI break; do it in its own PR if/when the UI actually needs it.
-- **Dependency UX** — clickable `depends_on` chips, reverse dependencies (a new
-  `dependents` field on card detail computed from `list_cards()`), board
-  blocked-by/unblocks indicators, title-text search in Add Card. Its own plan.
-- **Operator write actions** (`move` / `requeue` / `block` / `unblock` over
-  HTTP) — reverses the deliberate decision in `kanban/web.py` (only `POST
-  /api/cards` mutates, because it doesn't race `.daemon.lock`). Needs a safety
-  design first: refuse with 409 when the daemon lock is held, no
-  `--force`-equivalent over HTTP, update the `web.py` module docstring. Not part
-  of this plan.
-- **Worktree mutations from the Web** (merge / prune / branch delete / checkout /
-  filesystem cleanup) — larger blast radius; CLI-only until there's an explicit
-  safety design.
+  pre-1.0 CLI break. Defer until the UI has a real need that cannot be handled
+  with local JS links and copyable command strings.
+
+Operator write safety, operator write actions, and Web worktree mutations moved
+to `docs/kanban-web-write-actions-safety-plan.md`.
 
 ## Acceptance Criteria (P0)
 

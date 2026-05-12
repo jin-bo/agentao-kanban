@@ -6,6 +6,27 @@
 
 ## [Unreleased]
 
+### Added
+- **Web UI:transcript 内联查看 + artifact 时间标签(P3)**。Transcripts 区从
+  "每条都是新标签页打开"改成内联:最新一条默认展开内联渲染,旧的折叠成带
+  角色 / 时间 / 字节数的行,各带 open-raw + copy-path;出现多个角色时显示角色
+  过滤器;过大的 transcript 渲染 "too large for inline view" 态并给磁盘路径。
+  Artifact 快照行现在显示从 `artifacts-<utc-stamp>` 目录名解析出的本地可读
+  时间,原始名作为次要文本保留。artifact preview 与 transcript 共用的
+  fetch / 截断 / 错误详情逻辑抽成 `api.js` 的 `fetchTextWithCap`。
+- **共享状态流转层 `kanban/operations.py`**。`transition_move / block / unblock /
+  requeue` 是 CLI、MCP、web 写入面共用的唯一入口:第一次 `move_card` 写成功即
+  提交点(`move_card` 现在一次写入同时落 status + `blocked_reason` / `owner_role`,
+  写盘失败回滚内存态),提交后的副作用(DONE 落地推进 inbox 依赖、终态卸载
+  worktree)是 best-effort,失败收成 `warnings` 而非回滚。CLI / MCP 行为不变。
+- **Web 看板可选写入端点**。`kanban web --enable-writes` 现在除 `POST /api/cards`
+  外还开放 `POST /api/cards/{id}/move|requeue|block|unblock`,走上面的共享流转
+  函数;写入前做 daemon-lock(409 `daemon_active`)与活跃 claim(409 `live_claim`)
+  预检,关写入时统一 403 `writes_disabled`(不泄漏未知卡片存在性),错误响应是
+  稳定的 `{error, message, retryable}` 信封。卡片详情模态在写入开启时多出
+  Move / Requeue(+note)/ Block / Unblock 控件,执行中的卡片对应控件置灰,
+  提交后自动刷新受影响的详情区。详见 `docs/kanban-cli-guide.md` §9。
+
 ## [0.1.8] — 2026-05-11
 
 ### Added

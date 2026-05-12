@@ -34,15 +34,15 @@ Kanban 目前只能通过 `uv run kanban …` CLI 操作。要把它当成 Claud
 
 | Tool 名 | 参数 | 调用 | 说明 |
 |---|---|---|---|
-| `card_add` | `title:str, goal:str, priority="MEDIUM", acceptance:list[str]=[], depends:list[str]=[]` | `store.add_card(Card(...))` | 复刻 `cmd_card_add` (`kanban/cli.py:1006`)。返回 card dict。 |
-| `card_move` | `card_id:str, status:str` | `store.move_card(card_id, CardStatus(status), note)` | `status` 校验走 `CardStatus(...)`。返回 card dict。 |
-| `card_block` | `card_id:str, reason:str` | `store.update_card` + `move_card` 到 `BLOCKED` | 复刻 `cmd_block` (`kanban/cli.py:1071`)。 |
-| `card_unblock` | `card_id:str, to:str="INBOX"` | 清 `blocked_reason` + `move_card` | 复刻 `cmd_unblock` (`kanban/cli.py:1085`)。 |
+| `card_add` | `title:str, goal:str, priority="MEDIUM", acceptance:list[str]=[], depends:list[str]=[]` | `store.add_card(Card(...))` | 复刻 `cmd_card_add` (`kanban/cli/commands/`)。返回 card dict。 |
+| `card_move` | `card_id:str, status:str` | `operations.transition_move(...)` | 走共享流转层;`status` 校验在 `transition_move` 内。返回 card dict(`warnings` 非空时附 `warnings` 键)。 |
+| `card_block` | `card_id:str, reason:str` | `operations.transition_block(...)` | 一次 `move_card` 落 `BLOCKED` + `blocked_reason`。 |
+| `card_unblock` | `card_id:str, to:str="INBOX"` | `operations.transition_unblock(...)` | 清 `blocked_reason` + `move_card` 到目标态。 |
 | `tick` | — | `KanbanOrchestrator(store, executor).tick()` | 写守卫;executor 默认 mock(server 启动 flag 决定)。 |
 | `run` | `max_steps:int=100` | `orchestrator.run_until_idle(max_steps)` | 写守卫;返回执行步数。 |
 | `card_list` | `status:str|None=None` | `store.list_by_status` 或 `list_cards` | 读,无守卫。返回 `[card_dict]`。 |
 | `card_show` | `card_id:str` | `store.get_card(card_id)` | 读,`KeyError → ToolError "card not found"`。 |
-| `events_tail` | `limit:int=50, card_id:str|None=None, role:str|None=None, execution_only:bool=False` | 选择性调 `list_events` / `list_execution_events` | 复用 `BoardStore` 现成方法(`kanban/store.py:60-67`)。 |
+| `events_tail` | `limit:int=50, card_id:str|None=None, role:str|None=None, execution_only:bool=False` | 选择性调 `list_events` / `list_execution_events` | 复用 `BoardStore` 现成方法。 |
 
 ### Resources (读快照,可被 client 缓存)
 
@@ -54,20 +54,20 @@ Kanban 目前只能通过 `uv run kanban …` CLI 操作。要把它当成 Claud
 
 ### 序列化
 
-`Card` / `CardEvent` 都是 `@dataclass(slots=True)`(`kanban/models.py:150,246`)。在 `kanban/mcp.py` 写两个小 helper:
+`Card` / `CardEvent` 都是 `@dataclass(slots=True)`(见 `kanban/models.py`)。在 `kanban/mcp/` 写两个小 helper:
 ```python
 def _card_to_dict(c: Card) -> dict: ...   # 含 datetime → ISO8601
 def _event_to_dict(e: CardEvent) -> dict: ...
 ```
-不动 `cli.py` 的 `--json` 路径,以防互相耦合。
+不动 CLI 的 `--json` 路径,以防互相耦合。
 
 ## Lock policy & error mapping
 
 | 异常 | 触发场景 | MCP 响应 |
 |---|---|---|
-| `DaemonLockError` (`kanban/daemon.py:40`) | 写类 tool + daemon 在跑 | tool error,文案复刻 CLI |
+| `DaemonLockError` (`kanban/daemon/`) | 写类 tool + daemon 在跑 | tool error,文案复刻 CLI |
 | `KeyError` | `get_card` / `move_card` 找不到 id | tool error "card {id} not found" |
-| `ValueError` | `CardStatus("BAD")` / 依赖环 | tool error,原文案 |
+| `ValueError` / `OperationError` | 坏 status / 空 block reason / 依赖环 | tool error,原文案 |
 | 其它 `Exception` | 未预期 | tool error,带 traceback 摘要 |
 
 读类 tool / resource **不**调 `assert_no_daemon`,daemon 写盘是原子的(逐文件 + JSONL append),并发读不会脏读。

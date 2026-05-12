@@ -25,6 +25,7 @@ kanban/
   store.py                  # BoardStore Protocol + InMemoryBoardStore
   store_markdown/            # MarkdownBoardStore(TOML front-matter + events.log + raw transcripts)
   orchestrator/             # 调度与状态流转(唯一状态写入者)+ WIP / 依赖规则
+  operations.py             # 共享状态流转函数(CLI / MCP / web 写入面统一入口)
   worktree/                 # 每卡 Git worktree 隔离 + artifact 抢救快照
   result.py                 # kanban result 的共享摘要器(CLI 与 web 共用)
   agents.py                 # ROLE_AGENTS 映射 + 定义文件加载器
@@ -201,10 +202,18 @@ Resources:`kanban://board/snapshot`、`kanban://card/{card_id}`、
 
 ```bash
 uv run kanban --board workspace/board web                       # 只读
-uv run kanban --board workspace/board web --enable-writes       # +POST /api/cards
+uv run kanban --board workspace/board web --enable-writes       # +写入端点
 uv run kanban --board workspace/board web \
     --host 0.0.0.0 --enable-writes --allow-remote-writes        # 远程绑定+写入
 ```
+
+`--enable-writes` 打开 `POST /api/cards`(Add Card)以及四个卡片状态流转端点
+`POST /api/cards/{id}/move|requeue|block|unblock` —— 它们走和 CLI / MCP 同一套
+`kanban/operations.py` 流转函数,并在写入前做 daemon-lock(409 `daemon_active`)
+与活跃 claim(409 `live_claim`)预检;关写入时所有写端点统一返回 403
+`writes_disabled`(连未知卡片 id 也不泄漏存在性),错误响应是稳定的
+`{error, message, retryable}` 信封。卡片详情模态在 `--enable-writes` 下多出
+Move / Requeue(+note)/ Block / Unblock 控件,正在执行的卡片对应控件置灰。
 
 非 loopback bind 同时启用写入需要显式 `--allow-remote-writes`,否则 server
 启动直接拒绝。Runtime 面板顶部展示 daemon 三态(running / stopped / stale
