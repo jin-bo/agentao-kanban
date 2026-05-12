@@ -1,6 +1,6 @@
 # kanban
 
-**当前版本:v0.1.9**。完整变更见 [CHANGELOG.md](CHANGELOG.md)。
+**当前版本:v0.1.10-dev**(已发布最新版 v0.1.9)。完整变更见 [CHANGELOG.md](CHANGELOG.md)。
 
 一个最小可跑的多 Agent 看板,已经实现:
 
